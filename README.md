@@ -102,14 +102,15 @@ No data after 15:30 ET is ever used for trades entered at close(t).
 - Not derived from data vendors
 
 ### Liquidity filters
-Applied before training and trading:
-- Minimum price threshold (e.g. \$5)
-- Minimum dollar volume (e.g. \$20M/day)
+Applied **early** (before dataset construction) to ensure we only train on tradeable stocks:
+- Minimum price: **\$5**
+- Minimum 20-day average dollar volume: **\$10M/day**
 
 This ensures:
 - Tight spreads
 - Reliable MOC execution
 - Fee efficiency on IBKR
+- No wasted model capacity on untradeable names
 
 ---
 
@@ -117,12 +118,24 @@ This ensures:
 
 ### Fundamentals (numeric)
 - Quarterly financial statements
-- Ratios:
-  - Value (P/E, EV/EBITDA, FCF yield)
-  - Quality (ROE, margins)
-  - Growth (YoY revenue/earnings)
-  - Leverage (debt ratios)
+- Selected features (~15-20):
+  - **Value**: P/E, EV/EBITDA, price-to-book, FCF yield
+  - **Quality**: ROE, gross margin, operating margin
+  - **Growth**: revenue growth, earnings growth (YoY)
+  - **Leverage**: debt-to-equity, debt-to-assets
 - Lagged to **availability date**
+
+#### Point-in-time alignment (critical)
+FMP provides `date` = report period end (e.g., 2025-06-30 for Q2).
+This is **not** the filing date. To avoid lookahead:
+- Add **45-day lag** (conservative 10-Q filing deadline)
+- `available_date = period_end + 45 days`
+- For feature_date *t*, use most recent fundamental where `available_date <= t`
+
+#### Missing fundamentals
+Small-caps may lack data. Strategy:
+- Fill with **cross-sectional median** (neutral signal)
+- Add binary flag `has_fundamentals` as feature
 
 Fundamentals are used **directly as numeric features**, not embedded.
 
@@ -190,9 +203,10 @@ This enforces cross-sectional learning.
 
 ### News aggregation
 For each `(symbol, trade_date)`:
-- Mean embedding
-- Max embedding
-- Optional scalars: news_count, recency-weighted count
+- **Mean embedding** (768 dims)
+- `news_count` scalar
+
+Max embedding omitted initially — doubles dimensions with marginal benefit given α=0.3 cap.
 
 ---
 

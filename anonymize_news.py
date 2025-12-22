@@ -258,91 +258,126 @@ def _build_alternation_pattern(
     return "|".join(parts) if parts else None
 
 
+class Anonymizer:
+    """Pre-compiled anonymizer for batch processing. Build once, call many times."""
+
+    def __init__(
+        self,
+        name_map: dict[str, list[str]],
+        never_redact: tuple[str, ...] = (),
+        protect_urls: bool = True,
+        protect_emails: bool = True,
+        rewrite_urls: bool = True,
+        min_contextfree_len: int = 3,
+    ):
+        self.protect_urls = protect_urls
+        self.protect_emails = protect_emails
+        self.rewrite_urls = rewrite_urls
+
+        never = {x.casefold() for x in never_redact}
+
+        # Clean and normalize the name map once
+        self.clean_map: dict[str, list[str]] = {}
+        for sym, aliases in (name_map or {}).items():
+            sym_u = sym.upper().strip()
+            ali = _dedupe_keep_order([sym_u, *(aliases or [])])
+            ali = [a for a in ali if a and len(a) >= 2 and a.casefold() not in never and not TOKEN_RE.fullmatch(a)]
+            ali.sort(key=len, reverse=True)
+            self.clean_map[sym_u] = ali
+
+        self.sym_set = set(self.clean_map.keys())
+
+        # Pre-build URL rewrite rules for all "other" companies (target-agnostic part)
+        self.other_url_rules: list[tuple[str, str]] = [
+            (a.casefold(), "__OTHER__")
+            for sym, aliases in self.clean_map.items()
+            for a in aliases
+        ]
+
+        # Pre-compile the "other" pattern (same for all targets)
+        all_other_aliases = [a for aliases in self.clean_map.values() for a in aliases]
+        other_pattern = _build_alternation_pattern(all_other_aliases, never, min_contextfree_len)
+        self.other_re = re.compile(other_pattern, re.IGNORECASE) if other_pattern else None
+
+        # Cache for per-target compiled patterns
+        self._target_re_cache: dict[str, re.Pattern | None] = {}
+        self.never = never
+        self.min_contextfree_len = min_contextfree_len
+
+    def _get_target_re(self, target_sym: str) -> re.Pattern | None:
+        if target_sym not in self._target_re_cache:
+            tgt_aliases = self.clean_map.get(target_sym, [target_sym])
+            pat = _build_alternation_pattern(tgt_aliases, self.never, self.min_contextfree_len)
+            self._target_re_cache[target_sym] = re.compile(pat, re.IGNORECASE) if pat else None
+        return self._target_re_cache[target_sym]
+
+    def __call__(self, text: str, target_symbol: str) -> str:
+        if not isinstance(text, str) or not text:
+            return text
+
+        text = _norm(text)
+        target_sym = target_symbol.upper().strip()
+        tgt_aliases = self.clean_map.get(target_sym, [target_sym])
+
+        # URL rewrite rules: target first, then others
+        alias_rules_url = [(a.casefold(), "__TARGET__") for a in tgt_aliases] + self.other_url_rules
+
+        # Protect URLs/emails
+        urls: list[str] = []
+        emails: list[str] = []
+
+        if self.protect_urls:
+            text = URL_RE.sub(_make_stash_url(urls, self.rewrite_urls, alias_rules_url), text)
+
+        if self.protect_emails:
+            text = EMAIL_RE.sub(_make_stash_email(emails), text)
+
+        # Replace tickers in common contexts
+        def repl_exch(m: re.Match) -> str:
+            sym = m.group(1).upper()
+            if sym not in self.sym_set:
+                return m.group(0)
+            tok = "__TARGET__" if sym == target_sym else "__OTHER__"
+            return re.sub(re.escape(m.group(1)), tok, m.group(0), flags=re.IGNORECASE)
+
+        text = EXCH_TICKER_RE.sub(repl_exch, text)
+
+        def repl_ctx(m: re.Match) -> str:
+            sym = m.group(1).upper()
+            if sym not in self.sym_set:
+                return m.group(0)
+            tok = "__TARGET__" if sym == target_sym else "__OTHER__"
+            return m.group(0).replace(m.group(1), tok)
+
+        text = BARE_TICKER_CTX_RE.sub(repl_ctx, text)
+
+        # Apply target pattern first
+        target_re = self._get_target_re(target_sym)
+        if target_re:
+            text = target_re.sub(_make_token_sub("__TARGET__"), text)
+
+        # Apply other pattern (replaces target matches too, but target already done)
+        if self.other_re:
+            text = self.other_re.sub(_make_token_sub("__OTHER__"), text)
+
+        # De-dup weird repeats
+        text = re.sub(r"(__TARGET__)\s*(?:\1)+", r"\1", text)
+        text = re.sub(r"(__OTHER__)\s*(?:\1)+", r"\1", text)
+
+        return _restore_placeholders(text, urls, emails)
+
+
 def anonymize_text(text: str, cfg: AnonymizeConfig) -> str:
-    text = _norm(text)
-
-    target_sym = cfg.target_symbol.upper().strip()
-    never = {x.casefold() for x in cfg.never_redact}
-
-    # Ensure every symbol includes itself as alias and aliases are length-sorted
-    clean_map: dict[str, list[str]] = {}
-    for sym, aliases in (cfg.name_map or {}).items():
-        sym_u = sym.upper().strip()
-        ali = _dedupe_keep_order([sym_u, *(aliases or [])])
-        ali = [a for a in ali if a and len(a) >= 2 and a.casefold() not in never and not TOKEN_RE.fullmatch(a)]
-        ali.sort(key=len, reverse=True)
-        clean_map[sym_u] = ali
-
-    # URL rewrite rules (substring-based, conservative)
-    tgt_aliases = clean_map.get(target_sym, [target_sym])
-    alias_rules_url: list[tuple[str, str]] = [
-        (a.casefold(), "__TARGET__") for a in tgt_aliases
-    ] + [
-        (a.casefold(), "__OTHER__")
-        for sym, aliases in clean_map.items()
-        if sym != target_sym
-        for a in aliases
-    ]
-
-    # Protect URLs/emails
-    urls: list[str] = []
-    emails: list[str] = []
-
-    if cfg.protect_urls:
-        text = URL_RE.sub(_make_stash_url(urls, cfg.rewrite_urls, alias_rules_url), text)
-
-    if cfg.protect_emails:
-        text = EMAIL_RE.sub(_make_stash_email(emails), text)
-
-    # Replace tickers in common contexts (these work for any length)
-    sym_to_token = {
-        sym: ("__TARGET__" if sym == target_sym else "__OTHER__")
-        for sym in clean_map.keys()
-        if sym.casefold() not in never
-    }
-
-    def repl_exch(m: re.Match) -> str:
-        sym = m.group(1).upper()
-        tok = sym_to_token.get(sym)
-        if not tok:
-            return m.group(0)
-        return re.sub(re.escape(m.group(1)), tok, m.group(0), flags=re.IGNORECASE)
-
-    text = EXCH_TICKER_RE.sub(repl_exch, text)
-
-    def repl_ctx(m: re.Match) -> str:
-        sym = m.group(1).upper()
-        tok = sym_to_token.get(sym)
-        if not tok:
-            return m.group(0)
-        return m.group(0).replace(m.group(1), tok)
-
-    text = BARE_TICKER_CTX_RE.sub(repl_ctx, text)
-
-    # Build single alternation patterns for efficiency (one for target, one for others)
-    # Short aliases (< min_contextfree_len) are only matched via contextual patterns above
-    min_len = cfg.min_contextfree_len
-
-    target_pattern = _build_alternation_pattern(tgt_aliases, never, min_len)
-    other_aliases = [
-        a for sym, aliases in clean_map.items() if sym != target_sym for a in aliases
-    ]
-    other_pattern = _build_alternation_pattern(other_aliases, never, min_len)
-
-    # Apply target pattern first (longer matches take precedence within alternation)
-    if target_pattern:
-        target_re = re.compile(target_pattern, re.IGNORECASE)
-        text = target_re.sub(_make_token_sub("__TARGET__"), text)
-
-    if other_pattern:
-        other_re = re.compile(other_pattern, re.IGNORECASE)
-        text = other_re.sub(_make_token_sub("__OTHER__"), text)
-
-    # De-dup weird repeats
-    text = re.sub(r"(__TARGET__)\s*(?:\1)+", r"\1", text)
-    text = re.sub(r"(__OTHER__)\s*(?:\1)+", r"\1", text)
-
-    return _restore_placeholders(text, urls, emails)
+    """Convenience wrapper - creates Anonymizer per call. Use Anonymizer class for batch."""
+    anon = Anonymizer(
+        name_map=cfg.name_map,
+        never_redact=cfg.never_redact,
+        protect_urls=cfg.protect_urls,
+        protect_emails=cfg.protect_emails,
+        rewrite_urls=cfg.rewrite_urls,
+        min_contextfree_len=cfg.min_contextfree_len,
+    )
+    return anon(text, cfg.target_symbol)
 
 
 # ----------------------------

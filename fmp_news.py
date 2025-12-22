@@ -230,7 +230,14 @@ def download_news_backfill(
     symbols = universe_df["symbol"].dropna().astype(str).unique().tolist()
     windows = list(iter_date_windows(years=cfg.years, window_days=cfg.window_days, end_date=end_date))
 
-    for si, sym in enumerate(symbols):
+    # Pre-compute symbols to process (skip fully done)
+    symbols_to_process = [
+        sym for sym in symbols
+        if not all(progress.is_done(f"{sym}|{d_from}|{d_to}") for d_from, d_to in windows)
+    ]
+    n_skipped = len(symbols) - len(symbols_to_process)
+
+    for si, sym in enumerate(symbols_to_process):
         for wi, (d_from, d_to) in enumerate(windows):
             job = f"{sym}|{d_from}|{d_to}"
             if progress.is_done(job):
@@ -270,7 +277,7 @@ def download_news_backfill(
                 progress.save(progress_file)
 
             if progress_callback:
-                progress_callback(si + 1, len(symbols), sym, wi + 1, len(windows))
+                progress_callback(n_skipped + si + 1, len(symbols), sym, wi + 1, len(windows), n_skipped)
 
 
 def merge_news_parts(

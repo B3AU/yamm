@@ -36,9 +36,9 @@ export FMP_API_KEY="your_api_key"
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `k_short` | 10 | Number of stocks to short |
-| `hold_days` | 3 | Days between rebalances |
-| `max_position_pct` | 0.15 | Max 15% per position |
+| `k_short` | 5 | Number of stocks to short |
+| `hold_days` | 1 | Days between rebalances (daily) |
+| `max_position_pct` | 0.20 | Max 20% per position |
 | `max_portfolio_short` | 1.0 | Max 100% short exposure |
 | `min_market_cap` | $500M | Minimum market cap filter |
 | `min_price` | $5 | Minimum stock price |
@@ -111,6 +111,13 @@ python trading/main.py --status --log-level DEBUG
 Paper trading uses port **7497**, live uses **7496**. The code is identical - only the connection port differs.
 
 **Important**: Paper trading does NOT simulate short availability. In live trading, some stocks may be hard-to-borrow or unavailable.
+
+## Trading Schedule
+
+The bot is designed to trade at **15:30 ET** (30 minutes before market close). This matches the training data:
+- News cutoff: 15:30 ET
+- Returns: Close-to-close (today's close to tomorrow's close)
+- Rebalance: Daily
 
 ## Typical Workflow
 

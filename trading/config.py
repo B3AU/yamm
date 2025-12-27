@@ -25,11 +25,11 @@ class IBConfig:
 class StrategyConfig:
     """Trading strategy parameters.
 
-    Best backtest results (Simple K=5):
-    - Sharpe: 4.03
+    Best backtest results (DD-scaled K=5):
+    - Sharpe: 4.41
     - Total Return: 648.5% over 178 days
     - Win rate: 60.7%
-    - Max drawdown: -28.7%
+    - Max drawdown: -22.8% (improved from -28.7% with DD scaling)
     """
     # Position sizing (K=5 performed best)
     k_short: int = 5                     # Number of stocks to short
@@ -47,6 +47,15 @@ class StrategyConfig:
     # Risk limits
     max_portfolio_short: float = 1.0     # Max 100% short exposure
     stop_loss_pct: float = 0.15          # 15% stop loss per position
+
+    # Drawdown-based position scaling (from 3.1 advanced backtest)
+    use_dd_scaling: bool = True          # Enable drawdown scaling
+    dd_threshold: float = 0.10           # Start scaling at 10% DD
+    dd_max: float = 0.20                 # Max scaling at 20% DD
+    dd_min_scale: float = 0.25           # Min scale factor at max DD
+
+    # Confidence weighting (from 3.2 news confidence)
+    use_confidence: bool = False         # Enable confidence-weighted sizing
 
     # Fees (for tracking)
     fee_per_share: float = 0.005         # $0.005 per share

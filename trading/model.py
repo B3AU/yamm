@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,28 @@ from trading.config import DataConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelConfig:
+    """Model architecture configuration (must match training)."""
+    n_fundamental_features: int = 19
+    n_price_features: int = 9
+    n_embedding_dim: int = 768
+    fundamental_latent: int = 32
+    price_latent: int = 16
+    news_latent: int = 32
+    fundamental_dropout: float = 0.2
+    price_dropout: float = 0.2
+    news_dropout: float = 0.3
+    news_alpha: float = 0.8
+    # Training params (not used for inference)
+    batch_size: int = 512
+    learning_rate: float = 0.001
+    weight_decay: float = 0.001
+    n_epochs: int = 20
+    pairs_per_day: int = 5000
+    hard_fraction: float = 0.0
 
 
 class MultiBranchRanker(nn.Module):
@@ -97,7 +120,12 @@ class ModelInference:
         self.device = torch.device(device)
         self.model_path = Path(model_path)
 
-        # Load checkpoint
+        # Load checkpoint - handle ModelConfig from __main__ namespace
+        import sys
+        # Register ModelConfig in __main__ so unpickling works
+        if "ModelConfig" not in dir(sys.modules.get("__main__", {})):
+            import __main__
+            __main__.ModelConfig = ModelConfig
         self.checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
 
         # Extract config and column names

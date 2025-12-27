@@ -128,9 +128,11 @@ This ensures:
 #### Point-in-time alignment (critical)
 FMP provides `date` = report period end (e.g., 2025-06-30 for Q2).
 This is **not** the filing date. To avoid lookahead:
-- Add **45-day lag** (conservative 10-Q filing deadline)
-- `available_date = period_end + 45 days`
+- Use actual `filingDate` from FMP income-statement endpoint
+- Fallback: `period_end + 45 days` if filing date unavailable
 - For feature_date *t*, use most recent fundamental where `available_date <= t`
+
+Using actual SEC filing dates improves coverage vs. a fixed lag since many companies file within 2-3 weeks.
 
 #### Missing fundamentals
 Small-caps may lack data. Strategy:
@@ -283,8 +285,13 @@ r[i,t+1] = log(close[i,t+1] / close[i,t])
 - Sample pairs `(i, j)` from same day *t*
 - `y_ij = sign(r[i,t+1] − r[j,t+1])`
 - Logistic pairwise loss
+- **~2000 pairs per day** sampled each epoch for coverage
 
 This directly matches basket trading.
+
+#### Future investigation
+Batch by day and compute all-pairs loss within each day's batch for full coverage
+(more memory, theoretically cleaner).
 
 ---
 

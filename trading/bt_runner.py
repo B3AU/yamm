@@ -42,7 +42,12 @@ def run_backtest(
     initial_cash: float = 100_000,
     use_dd_scaling: bool = True,
     use_confidence: bool = False,
+    news_only: bool = True,
+    max_volatility: float | None = None,
+    min_dollar_volume: float | None = None,
+    use_inverse_vol: bool = False,
     max_symbols: int | None = None,
+    cheat_on_close: bool = True,
     plot: bool = False,
 ) -> BacktestResult:
     """Run backtest using backtrader.
@@ -56,7 +61,15 @@ def run_backtest(
         initial_cash: Starting capital
         use_dd_scaling: Enable drawdown-based position scaling
         use_confidence: Enable confidence-weighted sizing
+        news_only: Filter to stocks with news embeddings (default True)
+        max_volatility: Max realized volatility filter (e.g., 1.5 = 150% annualized)
+        min_dollar_volume: Min avg dollar volume filter (e.g., 1e6 = $1M)
+        use_inverse_vol: Enable inverse-volatility position sizing
         max_symbols: Limit number of symbols (for testing)
+        cheat_on_close: Execute orders at current bar's close (default True).
+            This is required for same-day execution to capture the overnight+next-day
+            return that the model predicts. Without this, orders execute on the next
+            bar causing a 1-day timing lag.
         plot: Generate plot after backtest
 
     Returns:
@@ -96,6 +109,7 @@ def run_backtest(
         symbols=symbols,
         start_date=start_date,
         end_date=end_date,
+        news_only=news_only,
     )
 
     if features_df.empty:
@@ -117,6 +131,10 @@ def run_backtest(
         dd_min_scale=0.25,
         # Confidence
         use_confidence=use_confidence,
+        # Volatility/liquidity filters
+        max_volatility=max_volatility,
+        min_dollar_volume=min_dollar_volume,
+        use_inverse_vol=use_inverse_vol,
         # Stop loss
         stop_loss_pct=config.strategy.stop_loss_pct,
         # Model and features
@@ -126,10 +144,25 @@ def run_backtest(
 
     # Set broker parameters
     cerebro.broker.setcash(initial_cash)
-    cerebro.broker.setcommission(commission=config.strategy.fee_per_share)
+
+    # Set per-share commission (COMM_FIXED = fixed $ per share, not percentage)
+    # Without commtype, backtrader interprets commission as percentage (0.003 = 0.3%)
+    cerebro.broker.setcommission(
+        commission=config.strategy.fee_per_share,
+        commtype=bt.CommInfoBase.COMM_FIXED,  # Fixed $ per share
+    )
 
     # Enable short selling
     cerebro.broker.set_shortcash(True)
+
+    # Cheat-on-close: execute orders at current bar's close
+    # This is critical for correct timing - without it, orders execute on next bar
+    # causing a 1-day lag that destroys the signal's predictive power
+    if cheat_on_close:
+        cerebro.broker.set_coc(True)  # Cheat-On-Close
+        logger.info("  Cheat-on-close ENABLED (same-day execution)")
+    else:
+        logger.info("  Cheat-on-close DISABLED (next-bar execution)")
 
     # Add analyzers
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", riskfreerate=0.0)
@@ -319,6 +352,7 @@ def main():
     parser.add_argument("--k", type=int, default=5, help="Number of shorts (K)")
     parser.add_argument("--no-dd-scale", action="store_true", help="Disable DD scaling")
     parser.add_argument("--confidence", action="store_true", help="Enable confidence weighting")
+    parser.add_argument("--no-news-filter", action="store_true", help="Disable news-only filtering")
     parser.add_argument("--plot", action="store_true", help="Plot results")
     parser.add_argument("--max-symbols", type=int, help="Limit symbols (for testing)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
@@ -345,6 +379,7 @@ def main():
             initial_cash=args.cash,
             use_dd_scaling=not args.no_dd_scale,
             use_confidence=args.confidence,
+            news_only=not args.no_news_filter,
             max_symbols=args.max_symbols,
             plot=args.plot,
         )

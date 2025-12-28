@@ -46,7 +46,7 @@ class StrategyConfig:
 
     # Risk limits
     max_portfolio_short: float = 1.0     # Max 100% short exposure
-    stop_loss_pct: float = 0.15          # 15% stop loss per position
+    stop_loss_pct: float | None = None   # Stop loss disabled by default
 
     # Drawdown-based position scaling (from 3.1 advanced backtest)
     use_dd_scaling: bool = True          # Enable drawdown scaling
@@ -58,7 +58,7 @@ class StrategyConfig:
     use_confidence: bool = False         # Enable confidence-weighted sizing
 
     # Fees (for tracking)
-    fee_per_share: float = 0.005         # $0.005 per share
+    fee_per_share: float = 0.0030        # $0.0030 per share (IB tiered)
     max_fee_pct: float = 0.01            # Max 1% of trade value
 
 

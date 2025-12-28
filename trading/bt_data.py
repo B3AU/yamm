@@ -218,15 +218,59 @@ def add_data_feeds(
     return added
 
 
+def compute_volatility_features(data_dir: Path) -> pd.DataFrame:
+    """Compute realized volatility and dollar volume from price data.
+
+    Returns DataFrame with columns: date, symbol, realized_vol, avg_dollar_vol
+    """
+    prices_path = data_dir / "prices.pqt"
+    if not prices_path.exists():
+        logger.warning("No prices.pqt for volatility computation")
+        return pd.DataFrame()
+
+    logger.info("Computing volatility features from prices...")
+    prices = pd.read_parquet(prices_path)
+    prices["date"] = pd.to_datetime(prices["date"])
+    prices = prices.sort_values(["symbol", "date"])
+
+    # Daily returns
+    prices["ret"] = prices.groupby("symbol")["close"].pct_change()
+
+    # 20-day realized volatility (annualized)
+    prices["realized_vol"] = prices.groupby("symbol")["ret"].transform(
+        lambda x: x.rolling(20, min_periods=10).std() * np.sqrt(252)
+    )
+
+    # Dollar volume (proxy for liquidity/market cap)
+    prices["dollar_volume"] = prices["close"] * prices["volume"]
+    prices["avg_dollar_vol"] = prices.groupby("symbol")["dollar_volume"].transform(
+        lambda x: x.rolling(20, min_periods=10).mean()
+    )
+
+    result = prices[["date", "symbol", "realized_vol", "avg_dollar_vol"]].copy()
+    logger.info(f"  Computed volatility for {result['symbol'].nunique():,} symbols")
+    return result
+
+
 def prepare_backtest_features(
     data_dir: Path,
     symbols: list[str],
     start_date: str | None = None,
     end_date: str | None = None,
+    news_only: bool = True,
+    add_vol_features: bool = True,
 ) -> pd.DataFrame:
     """Prepare features DataFrame for backtesting.
 
     Loads ml_dataset.pqt and filters to relevant symbols and dates.
+
+    Args:
+        data_dir: Path to data directory
+        symbols: List of symbols to include
+        start_date: Start date for filtering
+        end_date: End date for filtering
+        news_only: If True, filter to rows with news embeddings (default True)
+        add_vol_features: If True, add realized_vol and avg_dollar_vol columns
     """
     df = load_features_data(data_dir, start_date, end_date)
 
@@ -235,6 +279,25 @@ def prepare_backtest_features(
 
     # Filter to symbols we have price data for
     df = df[df["symbol"].isin(symbols)]
+
+    # Filter to news-only if requested
+    if news_only:
+        emb_cols = [c for c in df.columns if c.startswith("emb_")]
+        if emb_cols:
+            has_news = (df[emb_cols].abs().sum(axis=1) > 0)
+            n_before = len(df)
+            df = df[has_news]
+            logger.info(f"  Filtered to news-only: {len(df):,} rows ({len(df)/n_before*100:.1f}% of {n_before:,})")
+
+    # Add volatility features
+    if add_vol_features:
+        vol_df = compute_volatility_features(data_dir)
+        if not vol_df.empty:
+            df = df.merge(vol_df, on=["date", "symbol"], how="left")
+            # Fill missing with high values (conservative - will be filtered/down-weighted)
+            df["realized_vol"] = df["realized_vol"].fillna(df["realized_vol"].quantile(0.95))
+            df["avg_dollar_vol"] = df["avg_dollar_vol"].fillna(df["avg_dollar_vol"].quantile(0.05))
+            logger.info(f"  Added volatility features")
 
     logger.info(f"Prepared {len(df)} feature rows for backtest")
     return df

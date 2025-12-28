@@ -45,8 +45,13 @@ class ShortRankerStrategy(bt.Strategy):
         ("use_confidence", False),         # Enable confidence-weighted sizing
         ("confidence_col", "confidence"),  # Column name for confidence scores
 
+        # Volatility/liquidity filters
+        ("max_volatility", None),          # Max realized vol filter (e.g., 1.5 = 150% annualized)
+        ("min_dollar_volume", None),       # Min avg dollar volume filter (e.g., 1e6 = $1M)
+        ("use_inverse_vol", False),        # Enable inverse-volatility position sizing
+
         # Stop loss
-        ("stop_loss_pct", 0.15),           # 15% stop loss per position
+        ("stop_loss_pct", None),           # Stop loss disabled (None = no stop loss)
 
         # Fees
         ("commission", 0.001),             # 0.1% commission
@@ -142,6 +147,10 @@ class ShortRankerStrategy(bt.Strategy):
 
     def check_stop_losses(self):
         """Check and execute stop losses."""
+        # Skip if stop loss is disabled
+        if self.p.stop_loss_pct is None:
+            return
+
         for data in self.datas:
             symbol = data._name
             pos = self.getposition(data)
@@ -175,6 +184,18 @@ class ShortRankerStrategy(bt.Strategy):
             scores = self.p.model.score(df)
             df = df.copy()
             df["score"] = scores
+
+            # Compute confidence as |z-score| of scores
+            if len(scores) > 1:
+                mean_score = np.mean(scores)
+                std_score = np.std(scores)
+                if std_score > 0:
+                    df["confidence"] = np.abs((scores - mean_score) / std_score)
+                else:
+                    df["confidence"] = 1.0
+            else:
+                df["confidence"] = 1.0
+
         except Exception as e:
             logger.error(f"Model scoring failed: {e}")
             return pd.DataFrame()
@@ -188,29 +209,62 @@ class ShortRankerStrategy(bt.Strategy):
         """
         k = self.p.k_short
 
+        # Apply volatility filter if enabled
+        if self.p.max_volatility is not None and "realized_vol" in candidates.columns:
+            n_before = len(candidates)
+            candidates = candidates[candidates["realized_vol"] <= self.p.max_volatility]
+            if len(candidates) < n_before:
+                logger.debug(f"Vol filter: {n_before} -> {len(candidates)} candidates")
+
+        # Apply dollar volume filter if enabled
+        if self.p.min_dollar_volume is not None and "avg_dollar_vol" in candidates.columns:
+            n_before = len(candidates)
+            candidates = candidates[candidates["avg_dollar_vol"] >= self.p.min_dollar_volume]
+            if len(candidates) < n_before:
+                logger.debug(f"Dollar vol filter: {n_before} -> {len(candidates)} candidates")
+
+        if candidates.empty:
+            logger.warning("No candidates after filters")
+            return {}
+
         # Get bottom-K by score
         bottom_k = candidates.nsmallest(k, "score")
 
-        # Base weight (equal weight)
-        base_weight = self.p.max_portfolio_short / k
+        # Base weight (equal weight among selected)
+        n_selected = len(bottom_k)
+        if n_selected == 0:
+            return {}
 
         # Apply drawdown scaling
         dd_scale = self.get_dd_scale()
 
         targets = {}
 
-        for _, row in bottom_k.iterrows():
+        # Compute inverse-vol weights if enabled
+        if self.p.use_inverse_vol and "realized_vol" in bottom_k.columns:
+            # Inverse volatility weighting: w_i = (1/vol_i) / sum(1/vol_j)
+            vols = bottom_k["realized_vol"].values
+            # Clip to avoid division by zero and extreme weights
+            vols = np.clip(vols, 0.1, 5.0)  # 10% to 500% vol range
+            inv_vols = 1.0 / vols
+            inv_vol_weights = inv_vols / inv_vols.sum()
+        else:
+            inv_vol_weights = np.ones(n_selected) / n_selected
+
+        for i, (_, row) in enumerate(bottom_k.iterrows()):
             symbol = row["symbol"]
 
             # Skip if not in our data feeds
             if symbol not in self.data_map:
                 continue
 
-            weight = base_weight * dd_scale
+            # Base weight from inverse-vol or equal weight
+            weight = self.p.max_portfolio_short * inv_vol_weights[i] * dd_scale
 
-            # Apply confidence weighting if enabled
+            # Apply confidence weighting if enabled (scale by confidence)
             if self.p.use_confidence and self.p.confidence_col in row:
                 conf = row[self.p.confidence_col]
+                # Normalize confidence for weighting (higher confidence = more weight)
                 weight = weight * conf
 
             # Cap at max position size
@@ -331,7 +385,10 @@ class ShortRankerStrategyLive(ShortRankerStrategy):
         ("dd_min_scale", 0.25),
         ("use_confidence", False),
         ("confidence_col", "confidence"),
-        ("stop_loss_pct", 0.15),
+        ("max_volatility", None),
+        ("min_dollar_volume", None),
+        ("use_inverse_vol", False),
+        ("stop_loss_pct", None),
         ("commission", 0.001),
         ("model", None),
         ("features_df", None),

@@ -25,6 +25,11 @@ class ModelConfig:
     fundamental_latent: int = 32
     price_latent: int = 16
     news_latent: int = 32
+    # Hidden layer sizes (default to original values for backwards compat)
+    fund_hidden: int = 64
+    price_hidden: int = 32
+    news_hidden: int = 128
+    # Dropout rates
     fundamental_dropout: float = 0.2
     price_dropout: float = 0.2
     news_dropout: float = 0.3
@@ -36,6 +41,7 @@ class ModelConfig:
     n_epochs: int = 20
     pairs_per_day: int = 5000
     hard_fraction: float = 0.0
+    label_smoothing: float = 0.0
 
 
 class MultiBranchRanker(nn.Module):
@@ -53,34 +59,40 @@ class MultiBranchRanker(nn.Module):
         price_latent: int = 16,
         news_latent: int = 32,
         news_alpha: float = 0.8,
+        fund_hidden: int = 64,
+        price_hidden: int = 32,
+        news_hidden: int = 128,
+        fundamental_dropout: float = 0.2,
+        price_dropout: float = 0.2,
+        news_dropout: float = 0.3,
     ):
         super().__init__()
         self.news_alpha = news_alpha
 
         # Fundamentals encoder
         self.fund_encoder = nn.Sequential(
-            nn.Linear(n_fundamental_features, 64),
+            nn.Linear(n_fundamental_features, fund_hidden),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, fundamental_latent),
+            nn.Dropout(fundamental_dropout),
+            nn.Linear(fund_hidden, fundamental_latent),
             nn.ReLU(),
         )
 
         # Price encoder
         self.price_encoder = nn.Sequential(
-            nn.Linear(n_price_features, 32),
+            nn.Linear(n_price_features, price_hidden),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, price_latent),
+            nn.Dropout(price_dropout),
+            nn.Linear(price_hidden, price_latent),
             nn.ReLU(),
         )
 
         # News encoder
         self.news_encoder = nn.Sequential(
-            nn.Linear(n_embedding_dim, 128),
+            nn.Linear(n_embedding_dim, news_hidden),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, news_latent),
+            nn.Dropout(news_dropout),
+            nn.Linear(news_hidden, news_latent),
             nn.ReLU(),
         )
 
@@ -147,6 +159,14 @@ class ModelInference:
     def _build_model(self) -> MultiBranchRanker:
         """Build model with config from checkpoint."""
         if self.config is not None:
+            # Extract hidden sizes and dropout with defaults for backwards compat
+            fund_hidden = getattr(self.config, 'fund_hidden', 64)
+            price_hidden = getattr(self.config, 'price_hidden', 32)
+            news_hidden = getattr(self.config, 'news_hidden', 128)
+            fundamental_dropout = getattr(self.config, 'fundamental_dropout', 0.2)
+            price_dropout = getattr(self.config, 'price_dropout', 0.2)
+            news_dropout = getattr(self.config, 'news_dropout', 0.3)
+
             model = MultiBranchRanker(
                 n_fundamental_features=self.config.n_fundamental_features,
                 n_price_features=self.config.n_price_features,
@@ -155,6 +175,12 @@ class ModelInference:
                 price_latent=self.config.price_latent,
                 news_latent=self.config.news_latent,
                 news_alpha=self.config.news_alpha,
+                fund_hidden=fund_hidden,
+                price_hidden=price_hidden,
+                news_hidden=news_hidden,
+                fundamental_dropout=fundamental_dropout,
+                price_dropout=price_dropout,
+                news_dropout=news_dropout,
             )
         else:
             # Default config

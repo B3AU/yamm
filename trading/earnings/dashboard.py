@@ -35,6 +35,7 @@ load_dotenv(PROJECT_ROOT / '.env')
 from trading.earnings.logging import TradeLogger
 
 DB_PATH = PROJECT_ROOT / 'data' / 'earnings_trades.db'
+LOG_PATH = PROJECT_ROOT / 'logs' / 'daemon.log'
 
 # Global IB connection for live mode
 _ib = None
@@ -75,6 +76,38 @@ def reset_color() -> str:
 
 def bold(text: str) -> str:
     return f'\033[1m{text}\033[0m'
+
+
+def get_recent_warnings_errors(log_path: Path, max_lines: int = 1000, max_display: int = 8) -> list[tuple[str, str]]:
+    """Read recent WARNING and ERROR lines from log file.
+
+    Returns list of (level, message) tuples, most recent first.
+    """
+    if not log_path.exists():
+        return []
+
+    try:
+        with open(log_path, 'r') as f:
+            # Read last N lines efficiently
+            lines = f.readlines()[-max_lines:]
+
+        warnings_errors = []
+        for line in reversed(lines):
+            line = line.strip()
+            if ' - WARNING - ' in line or ' - ERROR - ' in line:
+                # Parse: "2025-01-07 10:30:45,123 - module - WARNING - message"
+                parts = line.split(' - ', 3)
+                if len(parts) >= 4:
+                    level = parts[2]
+                    message = parts[3][:60]  # Truncate long messages
+                    timestamp = parts[0].split(',')[0][-8:]  # Just HH:MM:SS
+                    warnings_errors.append((level, f"{timestamp} {message}"))
+                    if len(warnings_errors) >= max_display:
+                        break
+
+        return warnings_errors
+    except Exception:
+        return []
 
 
 def connect_ib(client_id: int = 20) -> Optional[object]:
@@ -349,6 +382,19 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
               f"Avg Slippage: {metrics.avg_slippage_bps:.1f} bps")
 
     print()
+
+    # === Recent Warnings/Errors ===
+    warnings_errors = get_recent_warnings_errors(LOG_PATH)
+    if warnings_errors:
+        print(bold("  RECENT WARNINGS/ERRORS"))
+        print("  " + "-" * 66)
+        for level, message in warnings_errors:
+            if level == 'ERROR':
+                color = '\033[91m'  # Red
+            else:
+                color = '\033[93m'  # Yellow
+            print(f"  {color}{level:<7}{reset_color()} {message}")
+        print()
 
     # === Non-Trades (Rejections) ===
     non_trades = logger.get_non_trades()

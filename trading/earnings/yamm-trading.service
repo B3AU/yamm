@@ -1,0 +1,25 @@
+[Unit]
+Description=YAMM Earnings Trading Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=beau
+WorkingDirectory=/home/beau/yamm
+ExecStart=/usr/bin/python3 -m trading.earnings.daemon
+Restart=always
+RestartSec=30
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=append:/home/beau/yamm/logs/daemon.log
+StandardError=append:/home/beau/yamm/logs/daemon.log
+
+# Resource limits
+MemoryMax=1G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

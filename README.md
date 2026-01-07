@@ -1,375 +1,204 @@
-# News + Fundamentals Cross-Sectional Trading System
+# YAMM - Earnings Volatility Options Strategy
 
-This document describes the **end-to-end design, assumptions, data alignment rules, model architecture,
-and execution plan** for a daily equity trading system based on **fundamentals and news**, with strict
-leakage control and cost awareness.
+Exploit volatility mispricing around earnings in US equities using options straddles.
 
-The goal is a **defensible, sellable, production-ready strategy**.
+**Core edge:** Vol + tails, not direction.
 
----
+## Strategy Overview
 
-## 1. High-level objective
+- **Events:** Earnings announcements only
+- **Instruments:** Listed equity options (straddles/strangles)
+- **Holding period:** T-1 close → T+1 close (overnight hold through earnings)
+- **Position sizing:** Fixed risk per trade, 0.25% NAV max loss
+- **Risk posture:** Long volatility, defined risk
 
-Build a system that:
-
-- Trades **once per trading day**
-- Selects a **basket of stocks** predicted to **outperform peers**
-- Uses **slow, persistent signals** from fundamentals
-- Uses **fast, transient signals** from news
-- Incorporates **recent price context** for timing and risk
-- Executes with **minimal transaction costs**
-- Avoids **information leakage**
-- Produces an **auditable live track record**
-
-This is a **cross-sectional strategy**, not a time-series predictor.
+See `CLAUDE.md` for the full V1 plan.
 
 ---
 
-## 2. Cross-sectional framing
+## Quick Start
 
-At each trading day *t*, the model learns:
+### Prerequisites
 
-> Which stocks will outperform other stocks from **close(t) to close(t+1)**?
+1. **IB Gateway** running (paper trading on port 4002)
+2. **IBKR Market Data Subscription** (~$15/mo for stocks + options)
+3. **FMP API Key** for earnings calendar (set in `.env`)
 
-The model does **not** attempt to predict absolute market direction.
+### Environment Setup
 
-Benefits:
-- Cancels market-wide noise
-- More stable statistically
-- Lower turnover
-- Standard in professional equity ML
+```bash
+# Install dependencies
+pip install ib_insync apscheduler pandas numpy python-dotenv pytz
 
----
+# Create .env file
+cat > .env << EOF
+FMP_API_KEY=your_key_here
+IB_HOST=127.0.0.1
+IB_PORT=4002
+DRY_RUN=false
+EOF
+```
 
-## 3. Trading cadence and execution (close→close)
+### Running the Trading Daemon
 
-### Decision frequency
-- **Once per trading day**
+**Option 1: Manual (for testing)**
+```bash
+# Dry run - logs but doesn't place orders
+DRY_RUN=true python3 -m trading.earnings.daemon
 
-### Execution mode (chosen)
-**Market-On-Close (MOC)**
+# Paper trading - places real orders
+python3 -m trading.earnings.daemon
+```
 
-- Signals computed **before market close**
-- Orders submitted as **MOC**
-- Entry: **close(t)**
-- Exit: **close(t+1)**
+**Option 2: Systemd (for production)**
+```bash
+# Install service
+sudo cp trading/earnings/yamm-trading.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable yamm-trading
+sudo systemctl start yamm-trading
 
-This aligns directly with the training target and avoids overnight execution uncertainty.
+# Check status
+sudo systemctl status yamm-trading
+journalctl -u yamm-trading -f
+```
 
----
+### Schedule (all times ET, Mon-Fri)
 
-## 4. Time alignment and cutoff rules (critical)
-
-### Timezone
-All timestamps are converted to **US/Eastern**.
-
-### Feature cutoff
-- **15:30 ET**
-
-This provides a safety buffer before the MOC cutoff (typically ~15:45 ET).
-
-### News assignment rule
-
-| News published | Assigned to trade date |
-|---------------|------------------------|
-| ≤ 15:30 ET on day *t* | Day *t* |
-| > 15:30 ET on day *t* | Day *t+1* |
-
-This rule is applied **consistently** in:
-- Training
-- Backtesting
-- Live trading
-
-No data after 15:30 ET is ever used for trades entered at close(t).
-
----
-
-## 5. Universe definition
-
-### Scope
-- **US common stocks only**
-  - NYSE
-  - NASDAQ
-  - NYSE American
-- Explicitly exclude:
-  - ETFs
-  - Warrants
-  - Preferred shares
-  - Illiquid symbols
-
-### Source of truth
-- Official **exchange listings** (NASDAQ symbol files)
-- Not derived from data vendors
-
-### Liquidity filters
-Applied **early** (before dataset construction) to ensure we only train on tradeable stocks:
-- Minimum price: **\$5**
-- Minimum 20-day average dollar volume: **\$10M/day**
-
-This ensures:
-- Tight spreads
-- Reliable MOC execution
-- Fee efficiency on IBKR
-- No wasted model capacity on untradeable names
+| Time | Task |
+|------|------|
+| 09:25 | Connect to IB Gateway |
+| 15:00 | Screen upcoming earnings |
+| 15:30 | Place straddle orders |
+| 15:45 | Exit previous day's positions |
+| 15:50 | Final fill check |
+| 16:05 | Disconnect |
 
 ---
 
-## 6. Data sources
+## Configuration
 
-### Fundamentals (numeric)
-- Quarterly financial statements
-- Selected features (~15-20):
-  - **Value**: P/E, EV/EBITDA, price-to-book, FCF yield
-  - **Quality**: ROE, gross margin, operating margin
-  - **Growth**: revenue growth, earnings growth (YoY)
-  - **Leverage**: debt-to-equity, debt-to-assets
-- Lagged to **availability date**
+Environment variables (set in `.env` or export):
 
-#### Point-in-time alignment (critical)
-FMP provides `date` = report period end (e.g., 2025-06-30 for Q2).
-This is **not** the filing date. To avoid lookahead:
-- Use actual `filingDate` from FMP income-statement endpoint
-- Fallback: `period_end + 45 days` if filing date unavailable
-- For feature_date *t*, use most recent fundamental where `available_date <= t`
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FMP_API_KEY` | (required) | FMP API key for earnings calendar |
+| `IB_HOST` | 127.0.0.1 | IB Gateway host |
+| `IB_PORT` | 4002 | IB Gateway port (4002=paper, 4001=live) |
+| `IB_CLIENT_ID` | 1 | IB client ID |
+| `SPREAD_THRESHOLD` | 15.0 | Max spread % to trade |
+| `MAX_CONTRACTS` | 1 | Contracts per leg |
+| `MAX_DAILY_TRADES` | 5 | Max trades per day |
+| `MAX_CANDIDATES_TO_SCREEN` | 50 | Candidates to screen |
+| `LIMIT_AGGRESSION` | 0.3 | How far above mid to place limit |
+| `DRY_RUN` | false | Log but don't place orders |
 
-Using actual SEC filing dates improves coverage vs. a fixed lag since many companies file within 2-3 weeks.
+### Paper Trading Settings (Recommended)
 
-#### Missing fundamentals
-Small-caps may lack data. Strategy:
-- Fill with **cross-sectional median** (neutral signal)
-- Add binary flag `has_fundamentals` as feature
-
-Fundamentals are used **directly as numeric features**, not embedded.
-
----
-
-### News (text)
-- Stock-level news
-- Titles and bodies
-- Embedded using a **local embedding model**
-- Aggregated per `(symbol, trade_date)`
+For faster data collection during paper trading:
+```bash
+MAX_DAILY_TRADES=10
+SPREAD_THRESHOLD=20
+MAX_CANDIDATES_TO_SCREEN=100
+```
 
 ---
 
-### Recent prices (numeric, lightweight)
+## Project Structure
 
-#### Same-day features (using close(t) as proxy for 15:30 price)
-The model runs at ~15:30 ET, so we have access to same-day price action.
-We use close(t) as a proxy for the 15:30 price in training (highly correlated, ~30 min apart).
-
-| Feature | Formula | Purpose |
-|---------|---------|---------|
-| `overnight_gap` | `open(t) / close(t-1) - 1` | Overnight reaction to news |
-| `intraday_ret` | `close(t) / open(t) - 1` | Same-day continuation/reversal |
-
-**Rationale**: If news causes a big gap up at open but price fades intraday, this signals possible overreaction.
-The model needs to know if news alpha has already been priced in.
-
-#### Historical features (up to close(t-1))
-- Short-term returns (1–5 days)
-- Short-term volatility
-- Distance from recent highs/lows
-
-Long-horizon technical indicators are explicitly avoided.
-
----
-
-## 7. Leakage prevention
-
-### Company anonymization
-To prevent memorization of historical winners:
-
-- Target company → `__TARGET__`
-- Other companies → `__OTHER__`
-- Mask:
-  - Tickers
-  - Company names
-- Preserve:
-  - Numbers
-  - Percentages
-  - Event language (beats, misses, guidance, lawsuits, etc.)
-
-This forces the model to learn **patterns**, not identities.
+```
+yamm/
+├── CLAUDE.md                 # V1 strategy plan
+├── README.md                 # This file
+├── .env                      # Configuration (not in git)
+│
+├── trading/
+│   └── earnings/
+│       ├── __init__.py
+│       ├── daemon.py         # Main trading daemon
+│       ├── screener.py       # Earnings screening
+│       ├── executor.py       # Order execution
+│       ├── logging.py        # Trade/non-trade logging
+│       ├── ib_options.py     # IBKR options client
+│       ├── run_daemon.sh     # Manual run script
+│       └── yamm-trading.service  # Systemd service
+│
+├── notebooks/
+│   ├── 0.1 options_data_validation.ipynb
+│   ├── 0.2 historical_earnings_moves.ipynb
+│   ├── 0.3 ibkr_connection_test.ipynb
+│   └── 0.4 phase0_execution.ipynb
+│
+├── data/
+│   ├── earnings_trades.db    # SQLite trade log
+│   └── earnings/             # Historical data
+│
+└── logs/
+    └── daemon.log            # Daemon logs
+```
 
 ---
 
-## 8. Feature construction
+## Phase 0: Execution Validation
 
-### Cross-sectional normalization
-All numeric features are normalized **per day**:
-z[i,t] = (x[i,t] − mean_j x[j,t]) / std_j x[j,t]
+Current phase focuses on validating execution before building ML models.
 
-This enforces cross-sectional learning.
+**Target metrics:**
+- [ ] 50+ paper trades logged
+- [ ] System runs reliably for 1 week
+- [ ] Strategy P&L positive (before slippage)
+- [ ] Identify optimal spread threshold
 
----
-
-### News aggregation
-For each `(symbol, trade_date)`:
-- **Mean embedding** (768 dims)
-- `news_count` scalar
-
-Max embedding omitted initially — doubles dimensions with marginal benefit given α=0.3 cap.
-
----
-
-### Final feature blocks
-F[i,t] = numeric fundamentals
-P[i,t] = recent price features
-E[i,t] = aggregated news embedding
+**After Phase 0:**
+- Analyze paper trading results
+- Switch to live with 1 contract, strict 15% spread gate
+- Collect 30+ real fills for execution model
+- Then proceed to ML model development
 
 ---
 
-## 9. Model architecture (multi-branch, influence-controlled)
+## Monitoring
 
-### Overview
-A **multi-branch neural model** where each data modality is projected into a small latent space
-before fusion.
+### View Logs
+```bash
+tail -f logs/daemon.log
+```
 
-This prevents the high-dimensional news embedding from dominating.
+### Check Trade Database
+```python
+from trading.earnings import TradeLogger
 
----
+logger = TradeLogger('data/earnings_trades.db')
+stats = logger.get_summary_stats()
+print(f"Trades: {stats['total_trades']}, P&L: ${stats['total_pnl']:.2f}")
+```
 
-### Branch encoders
-
-**Fundamentals encoder**
-- MLP → latent `h_f` (default 32 dims)
-- 1–2 layers max
-- Dropout ~0.1
-
-**Price encoder**
-- MLP → latent `h_p` (default 16 dims)
-- Dropout ~0.1
-
-**News encoder**
-- MLP → latent `h_n` (default 32 dims)
-- Stronger dropout ~0.2–0.3
-- Stronger regularization
+### Manual Screening (via notebook)
+Open `notebooks/0.4 phase0_execution.ipynb` for interactive screening and order placement.
 
 ---
 
-### Influence control (mandatory)
+## Troubleshooting
 
-Explicitly cap news impact:
-h = concat([h_f, h_p, α * h_n])
+**"Connection refused" on IB Gateway**
+- Check IB Gateway is running
+- Verify port (4002 for paper, 4001 for live)
+- Enable API connections in IB Gateway settings
 
-- `α` default: **0.3**
+**"Market data requires subscription"**
+- Subscribe to US Securities Snapshot Bundle (~$10/mo)
+- Subscribe to US Equity and Options Add-On (~$4.50/mo)
 
-Optional learned gating:
-g = sigmoid(w · h_n + b)
-h = concat([h_f, h_p, α * (g * h_n)])
-
-Latent dimension size is **not** used to control influence.
-
----
-
-### Output head
-- Small MLP or linear layer
-- Outputs scalar score `s[i,t]`
-
-Scores are used **only for ranking** within day *t*.
+**No candidates passing screening**
+- Check if market is open (screening needs live quotes)
+- Loosen `SPREAD_THRESHOLD` temporarily
+- Verify FMP API key is valid
 
 ---
 
-## 10. Training objective
+## Archive
 
-### Target (close→close)
-For stock *i* on day *t*:
-
-r[i,t+1] = log(close[i,t+1] / close[i,t])
-
----
-
-### Cross-sectional loss (preferred)
-**Pairwise ranking loss within each day**:
-
-- Sample pairs `(i, j)` from same day *t*
-- `y_ij = sign(r[i,t+1] − r[j,t+1])`
-- Logistic pairwise loss
-- **~2000 pairs per day** sampled each epoch for coverage
-
-This directly matches basket trading.
-
-#### Future investigation
-Batch by day and compute all-pairs loss within each day's batch for full coverage
-(more memory, theoretically cleaner).
-
----
-
-### Alternative (baseline)
-- Regression on demeaned returns:
-- y[i,t] = r[i,t+1] − mean_j r[j,t+1]
----
-
-## 11. Portfolio construction
-
-- Rank stocks by `s[i,t]`
-- Select **top-K** only (e.g. 10–30)
-- Equal-weight or softmax weights
-- Enforce **minimum order size** (e.g. \$2–3k)
-- Compress or drop tiny positions to avoid fee drag
-
----
-
-## 12. Execution and costs
-
-### Broker
-- Interactive Brokers (IBKR)
-
-### Orders
-- **Market-On-Close (MOC)** for entry
-- Exit at next day close
-
-### Cost control
-- US equities only
-- Few, large orders
-- No intraday churn
-- Tiered pricing
-
----
-
-## 13. Evaluation
-
-### Mandatory splits
-- Time-based split
-- Symbol holdout split
-
-### Metrics
-- Daily basket return
-- Excess return vs benchmark
-- Sharpe ratio
-- Max drawdown
-- Turnover-adjusted PnL
-- Rank IC (Spearman per day)
-
----
-
-## 14. Live proof and auditability
-
-To make results credible and sellable:
-
-- Broker execution logs
-- Monthly broker statements
-- Immutable signal snapshots (timestamped)
-- Logged feature cutoff times
-- Reproducible code + config hashes
-
-Target: **12 months of clean live performance**.
-
----
-
-## 15. Summary
-
-This system is:
-
-- Cross-sectional
-- News-aware
-- Fundamentally grounded
-- Price-aware (lightly)
-- Cost-efficient
-- Leakage-safe
-- Operationally simple
-- Institutionally defensible
-
-> **Fundamentals decide where to be invested.  
-> News decides when to tilt.**
-
+The previous news-ranking strategy was concluded as non-viable. Files are in:
+- `archive/news_ranking/` - notebooks
+- `trading/news_ranking/` - code
+- `PROJECT_REPORT_NEWS_RANKING.md` - analysis

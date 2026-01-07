@@ -63,6 +63,8 @@ def get_status_color(status: str) -> str:
         'submitted': '\033[93m',    # Yellow
         'filled': '\033[92m',       # Green
         'partial': '\033[91m',      # Red - partial fills are warnings
+        'exiting': '\033[96m',      # Cyan - exit orders placed
+        'exited': '\033[94m',       # Blue - completed
         'completed': '\033[94m',    # Blue
         'cancelled': '\033[90m',    # Gray
         'error': '\033[91m',        # Red
@@ -229,7 +231,7 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
         return
 
     # Categorize trades
-    open_trades = [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial')]
+    open_trades = [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
     completed_trades = [t for t in all_trades if t.status in ('completed', 'exited')]
 
     # === Open Positions ===
@@ -280,10 +282,12 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
                         if live_data['unrealized_pnl'] is not None:
                             total_unrealized_pnl += live_data['unrealized_pnl']
 
-            # Add warning indicator for partial fills
+            # Add warning indicator for partial fills and exiting status
             status_display = trade.status
             if trade.status == 'partial':
                 status_display = "PARTIAL!"
+            elif trade.status == 'exiting':
+                status_display = "EXITING"
 
             print(f"  {trade.ticker:<8} {trade.earnings_date:<12} "
                   f"{status_color}{status_display:<10}{reset_color()} "
@@ -292,6 +296,13 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
             # Show partial fill warning with details
             if trade.status == 'partial' and trade.notes:
                 print(f"           \033[91mWARNING: {trade.notes}\033[0m")
+
+            # Show exit order info for exiting positions
+            if trade.status == 'exiting' and trade.exit_limit_price:
+                exit_info = f"Exit limit: ${trade.exit_limit_price:.2f}"
+                if trade.exit_quoted_mid:
+                    exit_info += f" (mid: ${trade.exit_quoted_mid:.2f})"
+                print(f"           \033[96m{exit_info}\033[0m")
 
             # Show order details on second line
             if trade.structure:
@@ -411,7 +422,7 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
 def get_open_positions(logger: TradeLogger) -> list:
     """Get open positions that can be closed."""
     all_trades = logger.get_trades()
-    return [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial')]
+    return [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
 
 
 def close_position_interactive(logger: TradeLogger):

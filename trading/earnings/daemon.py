@@ -45,7 +45,9 @@ from trading.earnings.screener import (
     screen_all_candidates,
     ScreenedCandidate,
 )
-from trading.earnings.executor import Phase0Executor, close_position
+from trading.earnings.executor import (
+    Phase0Executor, close_position, ExitOrderPair, check_exit_fills
+)
 from trading.earnings.logging import TradeLogger
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
 
@@ -121,6 +123,7 @@ class TradingDaemon:
         self.todays_candidates: list[ScreenedCandidate] = []
         self.todays_trades: list[str] = []  # trade_ids
         self.positions_to_exit: list[dict] = []  # Positions from previous day
+        self.active_exit_orders: dict[str, ExitOrderPair] = {}  # Exit orders being tracked
 
         # Track connection state
         self.connected = False
@@ -403,6 +406,16 @@ class TradingDaemon:
                         if result.get('cancelled'):
                             logger.info(f"  {order_pair.symbol}: Cancelled unfilled orders")
 
+            # Check exit order fills
+            if self.active_exit_orders:
+                logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
+                exit_filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
+                logger.info(f"Exit fills: {len(exit_filled)} completed")
+
+                # Remove filled from tracking
+                for exit_pair in exit_filled:
+                    self.active_exit_orders.pop(exit_pair.trade_id, None)
+
             # Log metrics
             metrics = self.trade_logger.get_execution_metrics()
             logger.info(f"Execution metrics: fill_rate={metrics.fill_rate*100:.1f}%, "
@@ -433,7 +446,7 @@ class TradingDaemon:
             for pos in self.positions_to_exit:
                 logger.info(f"Exiting {pos['symbol']}...")
 
-                success = close_position(
+                exit_pair = close_position(
                     self.ib,
                     self.trade_logger,
                     trade_id=pos['trade_id'],
@@ -442,14 +455,18 @@ class TradingDaemon:
                     strike=pos['strike'],
                     contracts=pos['contracts'],
                     limit_aggression=CONFIG['limit_aggression'],
+                    entry_fill_price=pos.get('entry_fill_price'),
                 )
 
-                if success:
+                if exit_pair:
                     logger.info(f"  Exit order placed for {pos['symbol']}")
+                    self.active_exit_orders[pos['trade_id']] = exit_pair
                 else:
                     logger.error(f"  Exit failed for {pos['symbol']}")
 
                 self.ib.sleep(1)
+
+            logger.info(f"Tracking {len(self.active_exit_orders)} exit orders")
 
         except Exception as e:
             logger.exception(f"Position exit failed: {e}")
@@ -458,9 +475,24 @@ class TradingDaemon:
         """4:05 PM - Disconnect after market close."""
         logger.info("=== EVENING DISCONNECT ===")
 
-        # Final fill check
+        # Final entry fill check
         if self.executor:
             self.executor.check_fills()
+
+        # Final exit fill check
+        if self.active_exit_orders:
+            logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
+            filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
+            logger.info(f"Exit fills: {len(filled)} completed")
+
+            # Remove filled from tracking
+            for exit_pair in filled:
+                self.active_exit_orders.pop(exit_pair.trade_id, None)
+
+            # Log any unfilled exit orders as warning
+            unfilled = [ep for ep in self.active_exit_orders.values() if ep.status != 'filled']
+            if unfilled:
+                logger.warning(f"UNFILLED EXIT ORDERS: {[ep.symbol for ep in unfilled]}")
 
         # Log daily summary
         stats = self.trade_logger.get_summary_stats()
@@ -732,6 +764,7 @@ class TradingDaemon:
                     'expiry': trade.expiration,
                     'strike': float(trade.strikes.strip('[]')),
                     'contracts': trade.contracts,
+                    'entry_fill_price': trade.entry_fill_price,  # For P&L calculation
                 })
 
         if self.positions_to_exit:

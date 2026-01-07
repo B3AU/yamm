@@ -43,6 +43,29 @@ class OrderPair:
     status: str = 'pending'  # pending, partial, filled, cancelled
 
 
+@dataclass
+class ExitOrderPair:
+    """Tracks exit orders for a straddle position."""
+    trade_id: str
+    symbol: str
+    expiry: str
+    strike: float
+    contracts: int
+
+    call_order_id: Optional[int] = None
+    put_order_id: Optional[int] = None
+
+    call_trade: Optional[Trade] = None
+    put_trade: Optional[Trade] = None
+
+    call_fill_price: Optional[float] = None
+    put_fill_price: Optional[float] = None
+
+    entry_fill_price: Optional[float] = None  # For P&L calculation
+
+    status: str = 'pending'  # pending, partial, filled
+
+
 class Phase0Executor:
     """Executes Phase 0 validation trades."""
 
@@ -457,11 +480,13 @@ def close_position(
     strike: float,
     contracts: int,
     limit_aggression: float = 0.3,
-) -> bool:
+    entry_fill_price: Optional[float] = None,
+) -> Optional[ExitOrderPair]:
     """
     Close an existing straddle position.
 
     Places sell orders for both legs.
+    Returns ExitOrderPair for tracking, or None on failure.
     """
     # Create option contracts
     call = Option(symbol, expiry, strike, 'C', 'SMART', tradingClass=symbol)
@@ -471,7 +496,7 @@ def close_position(
         ib.qualifyContracts(call, put)
     except Exception as e:
         logger.error(f"Could not qualify options for close: {e}")
-        return False
+        return None
 
     # Get current quotes
     call_ticker = ib.reqMktData(call, '', False, False)
@@ -488,7 +513,7 @@ def close_position(
 
     if call_bid <= 0 or put_bid <= 0:
         logger.error(f"No valid bids for close")
-        return False
+        return None
 
     # Calculate limit prices (sell slightly below mid)
     call_mid = (call_bid + call_ask) / 2
@@ -508,7 +533,7 @@ def close_position(
         put_trade = ib.placeOrder(put, put_order)
     except Exception as e:
         logger.error(f"Exit order placement error: {e}")
-        return False
+        return None
 
     # Update trade log with exit info
     trade_logger.update_trade(
@@ -526,4 +551,91 @@ def close_position(
         f"Call {contracts}x @ ${call_limit:.2f}, Put {contracts}x @ ${put_limit:.2f}"
     )
 
-    return True
+    # Create exit order pair for tracking
+    exit_pair = ExitOrderPair(
+        trade_id=trade_id,
+        symbol=symbol,
+        expiry=expiry,
+        strike=strike,
+        contracts=contracts,
+        call_order_id=call_trade.order.orderId,
+        put_order_id=put_trade.order.orderId,
+        call_trade=call_trade,
+        put_trade=put_trade,
+        entry_fill_price=entry_fill_price,
+        status='pending',
+    )
+
+    return exit_pair
+
+
+def check_exit_fills(
+    exit_orders: dict[str, ExitOrderPair],
+    trade_logger: TradeLogger,
+) -> list[ExitOrderPair]:
+    """Check status of exit orders and update trade logs.
+
+    Returns list of fully filled exit order pairs.
+    """
+    filled = []
+
+    for trade_id, exit_pair in list(exit_orders.items()):
+        call_status = exit_pair.call_trade.orderStatus.status if exit_pair.call_trade else 'Unknown'
+        put_status = exit_pair.put_trade.orderStatus.status if exit_pair.put_trade else 'Unknown'
+
+        call_filled = call_status == 'Filled'
+        put_filled = put_status == 'Filled'
+
+        # Get fill prices
+        if call_filled and exit_pair.call_fill_price is None:
+            exit_pair.call_fill_price = exit_pair.call_trade.orderStatus.avgFillPrice
+            logger.info(f"{exit_pair.symbol}: Exit call filled @ ${exit_pair.call_fill_price:.2f}")
+
+        if put_filled and exit_pair.put_fill_price is None:
+            exit_pair.put_fill_price = exit_pair.put_trade.orderStatus.avgFillPrice
+            logger.info(f"{exit_pair.symbol}: Exit put filled @ ${exit_pair.put_fill_price:.2f}")
+
+        # Both legs filled - calculate P&L
+        if call_filled and put_filled:
+            exit_pair.status = 'filled'
+            filled.append(exit_pair)
+
+            exit_fill = exit_pair.call_fill_price + exit_pair.put_fill_price
+            exit_limit = (
+                exit_pair.call_trade.order.lmtPrice + exit_pair.put_trade.order.lmtPrice
+                if exit_pair.call_trade and exit_pair.put_trade else None
+            )
+
+            # Calculate P&L
+            premium_received = exit_fill * exit_pair.contracts * 100
+            exit_pnl = None
+            exit_pnl_pct = None
+
+            if exit_pair.entry_fill_price:
+                premium_paid = exit_pair.entry_fill_price * exit_pair.contracts * 100
+                exit_pnl = premium_received - premium_paid
+                exit_pnl_pct = (exit_fill / exit_pair.entry_fill_price - 1)
+
+            trade_logger.update_trade(
+                trade_id,
+                status='exited',
+                exit_fill_price=exit_fill,
+                exit_slippage=exit_fill - exit_limit if exit_limit else None,
+                exit_pnl=exit_pnl,
+                exit_pnl_pct=exit_pnl_pct,
+            )
+
+            logger.info(
+                f"{exit_pair.symbol}: EXIT COMPLETE - "
+                f"Fill: ${exit_fill:.2f}, P&L: ${exit_pnl:.2f}" if exit_pnl else
+                f"{exit_pair.symbol}: EXIT COMPLETE - Fill: ${exit_fill:.2f}"
+            )
+
+        elif call_filled or put_filled:
+            exit_pair.status = 'partial'
+            logger.warning(
+                f"{exit_pair.symbol}: PARTIAL EXIT - "
+                f"Call: {call_status}, Put: {put_status}"
+            )
+
+    return filled

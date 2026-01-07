@@ -32,6 +32,10 @@ from trading.earnings.ml_predictor import (
     EarningsPredictor,
     get_predictor,
 )
+from trading.earnings.counterfactual import (
+    backfill_counterfactuals,
+    get_recent_counterfactual_summary,
+)
 
 __all__ = [
     # Logging
@@ -62,4 +66,7 @@ __all__ = [
     "EdgePrediction",
     "EarningsPredictor",
     "get_predictor",
+    # Counterfactual
+    "backfill_counterfactuals",
+    "get_recent_counterfactual_summary",
 ]

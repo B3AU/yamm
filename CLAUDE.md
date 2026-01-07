@@ -101,10 +101,11 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 7. **Exit order monitoring** - Track exit fills and calculate P&L automatically.
 
+8. **Counterfactual logging** - After market close, backfill realized moves for non-traded candidates to measure what we missed.
+
 ### Current Limitations / TODO
 
 #### High Priority
-- [ ] Counterfactual logging not implemented
 - [ ] No position sizing logic (fixed 1 contract currently)
 
 #### Medium Priority
@@ -121,6 +122,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Exit order monitoring with P&L calculation
 - [x] Max daily trades limit enforcement
 - [x] Dashboard warnings/errors display
+- [x] Counterfactual logging for non-trades
 
 ### File Structure
 
@@ -131,6 +133,7 @@ trading/earnings/
 ├── ml_predictor.py    # ML model inference
 ├── executor.py        # Order placement + management
 ├── logging.py         # Trade/non-trade logging
+├── counterfactual.py  # Counterfactual backfill for non-trades
 ├── dashboard.py       # CLI dashboard
 └── live_news.py       # Live news embeddings
 

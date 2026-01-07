@@ -287,6 +287,45 @@ class TradeLogger:
             conn.commit()
         return non_trade.log_id
 
+    def update_non_trade(self, log_id: str, **updates) -> bool:
+        """Update specific fields of a non-trade record."""
+        if not updates:
+            return False
+
+        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                f"UPDATE non_trades SET {set_clause} WHERE log_id = ?",
+                list(updates.values()) + [log_id]
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_non_trades_pending_counterfactual(
+        self,
+        earnings_date: str,
+    ) -> list[NonTradeLog]:
+        """Get non-trades for a specific earnings date that need counterfactual backfill.
+
+        Returns non-trades where counterfactual_realized_move is NULL.
+        """
+        query = """
+            SELECT * FROM non_trades
+            WHERE earnings_date = ?
+            AND counterfactual_realized_move IS NULL
+            ORDER BY log_datetime DESC
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(query, (earnings_date,)).fetchall()
+            results = []
+            for row in rows:
+                row_dict = dict(row)
+                row_dict.pop('created_at', None)
+                results.append(NonTradeLog(**row_dict))
+            return results
+
     def get_trade(self, trade_id: str) -> Optional[TradeLog]:
         """Get a trade by ID."""
         with sqlite3.connect(self.db_path) as conn:

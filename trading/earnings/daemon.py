@@ -50,6 +50,7 @@ from trading.earnings.executor import (
 )
 from trading.earnings.logging import TradeLogger
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
+from trading.earnings.counterfactual import backfill_counterfactuals
 
 # Load environment
 load_dotenv(PROJECT_ROOT / '.env')
@@ -505,6 +506,32 @@ class TradingDaemon:
 
         self.disconnect()
 
+    def task_backfill_counterfactuals(self):
+        """4:30 PM - Backfill counterfactual data for yesterday's non-trades.
+
+        For each candidate we passed on yesterday, fetch the realized stock move
+        and calculate what our P&L would have been. This prevents survivorship bias.
+        """
+        logger.info("=== BACKFILLING COUNTERFACTUALS ===")
+
+        try:
+            # Backfill for yesterday's earnings (T-1)
+            # These are the earnings that happened today that we decided not to trade yesterday
+            yesterday = date.today() - timedelta(days=1)
+            today = date.today()
+
+            # Check both yesterday (for BMO that we passed on) and today (for AMC from yesterday)
+            for earnings_date in [yesterday, today]:
+                result = backfill_counterfactuals(self.trade_logger, earnings_date)
+                if result['updated'] > 0:
+                    logger.info(
+                        f"  {earnings_date}: Updated {result['updated']} non-trades "
+                        f"({result['failed']} failed)"
+                    )
+
+        except Exception as e:
+            logger.exception(f"Counterfactual backfill failed: {e}")
+
     def _log_account_summary(self):
         """Log extensive account information for monitoring."""
         logger.info("=" * 50)
@@ -821,6 +848,15 @@ class TradingDaemon:
             CronTrigger(day_of_week='mon-fri', hour=21, minute=5),
             id='evening_disconnect',
             name='Evening Disconnect (16:05 ET)',
+        )
+
+        # Backfill counterfactuals - 16:30 ET = 21:30 UTC
+        # Runs after market close to fetch realized moves for non-traded candidates
+        self.scheduler.add_job(
+            self.task_backfill_counterfactuals,
+            CronTrigger(day_of_week='mon-fri', hour=21, minute=30),
+            id='backfill_counterfactuals',
+            name='Backfill Counterfactuals (16:30 ET)',
         )
 
         logger.info("Schedule configured:")

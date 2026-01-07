@@ -46,7 +46,7 @@ from trading.earnings.screener import (
     ScreenedCandidate,
 )
 from trading.earnings.executor import (
-    Phase0Executor, close_position, ExitOrderPair, check_exit_fills
+    Phase0Executor, close_position, ExitComboOrder, check_exit_fills
 )
 from trading.earnings.logging import TradeLogger
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
@@ -123,7 +123,7 @@ class TradingDaemon:
         self.todays_candidates: list[ScreenedCandidate] = []
         self.todays_trades: list[str] = []  # trade_ids
         self.positions_to_exit: list[dict] = []  # Positions from previous day
-        self.active_exit_orders: dict[str, ExitOrderPair] = {}  # Exit orders being tracked
+        self.active_exit_orders: dict[str, ExitComboOrder] = {}  # Exit orders being tracked
 
         # Track connection state
         self.connected = False

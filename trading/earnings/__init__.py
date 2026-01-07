@@ -21,9 +21,11 @@ from trading.earnings.screener import (
     screen_all_candidates,
 )
 from trading.earnings.executor import (
-    OrderPair,
+    ComboOrder,
+    ExitComboOrder,
     Phase0Executor,
     close_position,
+    check_exit_fills,
 )
 from trading.earnings.ml_predictor import (
     EdgePrediction,
@@ -51,9 +53,11 @@ __all__ = [
     "screen_candidate_ibkr",
     "screen_all_candidates",
     # Executor
-    "OrderPair",
+    "ComboOrder",
+    "ExitComboOrder",
     "Phase0Executor",
     "close_position",
+    "check_exit_fills",
     # ML Predictor
     "EdgePrediction",
     "EarningsPredictor",

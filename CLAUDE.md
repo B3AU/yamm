@@ -115,7 +115,6 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 #### Low Priority
 - [ ] Early exit logic (profit taking, loss cutting)
-- [ ] Historical options backtest (no data source)
 
 #### Completed
 - [x] Combo (BAG) orders - eliminates orphan leg risk
@@ -177,6 +176,27 @@ python -m trading.earnings.dashboard --all
 FMP_API_KEY=xxx          # Financial Modeling Prep API
 IB_CLIENT_ID=1           # IBKR client ID (default: 1)
 ```
+
+---
+
+## Research Notes
+
+### Historical Options Data Sources (Jan 2025)
+
+| Source | Price | Coverage | Best For |
+|--------|-------|----------|----------|
+| **ORATS** | $99/mo | 2007-present | Best fit - EOD bid/ask, greeks, IV via API |
+| **Polygon/Massive** | $29-199/mo | 2-20 years | Stocks cheaper, options needs higher tier |
+| **CBOE DataShop** | Quote-based | 2012-present | Official OPRA data, pay-per-symbol |
+| **Theta Data** | ~$30-100/mo | Unknown | Popular retail option |
+
+**Current approach:** Synthetic backtest using stock prices + estimated IV (free). ORATS at $99/mo recommended if real options data needed.
+
+### Training Data
+
+- **Period:** 2024-03-30 to 2025-12-18 (~21 months)
+- **Samples:** 3,350 earnings events, 1,419 symbols
+- **Out-of-sample for backtest:** Re-train on earlier period to get true OOS
 
 ---
 

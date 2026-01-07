@@ -302,8 +302,15 @@ class TradingDaemon:
             else:
                 logger.warning("ML predictor not available - using liquidity-only screening")
 
+            # Apply max daily trades limit (accounting for already placed orders)
+            already_placed = len(self.todays_trades)
+            remaining_slots = max(0, CONFIG['max_daily_trades'] - already_placed)
+
+            if already_placed > 0:
+                logger.info(f"Already placed {already_placed} orders today, {remaining_slots} slots remaining")
+
             # Store passed candidates for order placement
-            self.todays_candidates = passed[:CONFIG['max_daily_trades']]
+            self.todays_candidates = passed[:remaining_slots]
 
             if self.todays_candidates:
                 logger.info("Final candidates for today:")
@@ -379,32 +386,29 @@ class TradingDaemon:
                        f"{self.executor.get_active_count()} still pending")
 
             for order in filled:
-                logger.info(f"  {order.symbol}: Call @ ${order.call_fill_price:.2f}, "
-                          f"Put @ ${order.put_fill_price:.2f}")
+                logger.info(f"  {order.symbol}: Straddle @ ${order.fill_price:.2f}")
 
-            # Check for partial fills - these are orphan risks
+            # Check for partial fills (rare with combo orders)
             partials = self.executor.get_partial_fills()
             if partials:
                 logger.warning(f"=== PARTIAL FILLS DETECTED: {len(partials)} ===")
                 for order in partials:
-                    call_qty = order.call_trade.orderStatus.filled if order.call_trade else 0
-                    put_qty = order.put_trade.orderStatus.filled if order.put_trade else 0
-                    call_total = order.call_trade.order.totalQuantity if order.call_trade else 0
-                    put_total = order.put_trade.order.totalQuantity if order.put_trade else 0
-                    logger.warning(
-                        f"  {order.symbol}: Call {int(call_qty)}/{int(call_total)}, "
-                        f"Put {int(put_qty)}/{int(put_total)}"
-                    )
+                    if order.trade:
+                        filled_qty = order.trade.orderStatus.filled
+                        total_qty = order.trade.order.totalQuantity
+                        logger.warning(
+                            f"  {order.symbol}: {int(filled_qty)}/{int(total_qty)} filled"
+                        )
 
-            # Cancel all unfilled orders near close to prevent orphans
+            # Cancel all unfilled orders near close
             pending_count = self.executor.get_active_count()
-            if pending_count > 0 or partials:
+            if pending_count > 0:
                 logger.warning("=== CANCELLING UNFILLED ORDERS (NEAR CLOSE) ===")
-                for trade_id, order_pair in list(self.executor.active_orders.items()):
-                    if order_pair.status in ('pending', 'partial'):
+                for trade_id, combo_order in list(self.executor.active_orders.items()):
+                    if combo_order.status == 'pending':
                         result = self.executor.cancel_unfilled_orders(trade_id)
                         if result.get('cancelled'):
-                            logger.info(f"  {order_pair.symbol}: Cancelled unfilled orders")
+                            logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
 
             # Check exit order fills
             if self.active_exit_orders:

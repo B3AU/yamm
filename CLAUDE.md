@@ -56,10 +56,11 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
   | News | FMP `/stable/news/stock` + live embedding | `data/news_ranking/news_embeddings.pqt` |
 
 #### Executor (`trading/earnings/executor.py`)
-- Places straddle orders (call + put) via IBKR
-- Limit pricing: `mid + aggression * spread`
-- Fill monitoring with partial fill detection
-- Order cancellation for unfilled/partial orders
+- **Combo (BAG) orders** - Both legs execute atomically, no orphan risk
+- Places straddle as single combo order via IBKR
+- Limit pricing: `mid + aggression * spread` (combined straddle price)
+- Fill monitoring (simplified - combo fills or doesn't)
+- Order cancellation for unfilled orders
 - Order recovery after daemon restart
 
 #### Trade Logging (`trading/earnings/logging.py`)
@@ -94,28 +95,33 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 4. **Order recovery** - Added IBKR order ID persistence and recovery on daemon restart.
 
-5. **Partial fill handling** - Added detection, warnings, and near-close cancellation of unfilled legs.
+5. **Combo orders** - Using IBKR BAG orders instead of separate call/put orders. Eliminates orphan leg risk entirely.
 
 6. **Interactive dashboard** - Added keyboard commands for manual position management.
+
+7. **Exit order monitoring** - Track exit fills and calculate P&L automatically.
 
 ### Current Limitations / TODO
 
 #### High Priority
-- [ ] Automated exit logic not fully tested
 - [ ] Kill switches not implemented (calibration drift, drawdown throttle)
 - [ ] Counterfactual logging not implemented
 - [ ] No position sizing logic (fixed 1 contract currently)
 
 #### Medium Priority
 - [ ] Strangle structure not implemented (straddles only)
-- [ ] No sector limits enforcement
 - [ ] No IV rank/percentile features
 - [ ] Model retraining pipeline not automated
 
 #### Low Priority
 - [ ] Early exit logic (profit taking, loss cutting)
 - [ ] Historical options backtest (no data source)
-- [ ] Multi-leg combo orders (currently separate call/put orders)
+
+#### Completed
+- [x] Combo (BAG) orders - eliminates orphan leg risk
+- [x] Exit order monitoring with P&L calculation
+- [x] Max daily trades limit enforcement
+- [x] Dashboard warnings/errors display
 
 ### File Structure
 

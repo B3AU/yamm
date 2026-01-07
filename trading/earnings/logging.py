@@ -101,6 +101,7 @@ class NonTradeLog:
     quoted_oi: Optional[int] = None
     spot_price: Optional[float] = None
     implied_move: Optional[float] = None
+    straddle_premium: Optional[float] = None  # Total cost per contract in dollars
 
     # What model said (if we got that far)
     predicted_q75: Optional[float] = None
@@ -226,6 +227,7 @@ class TradeLogger:
                     quoted_oi INTEGER,
                     spot_price REAL,
                     implied_move REAL,
+                    straddle_premium REAL,
                     predicted_q75 REAL,
                     predicted_edge REAL,
                     counterfactual_realized_move REAL,
@@ -235,6 +237,12 @@ class TradeLogger:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Add straddle_premium column if it doesn't exist (migration)
+            try:
+                conn.execute("ALTER TABLE non_trades ADD COLUMN straddle_premium REAL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Indexes for common queries
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)")

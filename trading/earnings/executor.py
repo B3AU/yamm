@@ -353,6 +353,16 @@ class Phase0Executor:
         """Log a candidate we passed on."""
         log_id = generate_log_id(candidate.symbol)
 
+        # Calculate straddle values
+        straddle_bid = candidate.call_bid + candidate.put_bid if candidate.call_bid else None
+        straddle_ask = candidate.call_ask + candidate.put_ask if candidate.call_ask else None
+
+        # Premium per contract = mid price * 100 (options multiplier)
+        straddle_premium = None
+        if straddle_bid is not None and straddle_ask is not None:
+            straddle_mid = (straddle_bid + straddle_ask) / 2
+            straddle_premium = straddle_mid * 100
+
         non_trade = NonTradeLog(
             log_id=log_id,
             ticker=candidate.symbol,
@@ -360,11 +370,12 @@ class Phase0Executor:
             earnings_timing=candidate.timing,
             log_datetime=datetime.now().isoformat(),
             rejection_reason=candidate.rejection_reason or 'unknown',
-            quoted_bid=candidate.call_bid + candidate.put_bid if candidate.call_bid else None,
-            quoted_ask=candidate.call_ask + candidate.put_ask if candidate.call_ask else None,
+            quoted_bid=straddle_bid,
+            quoted_ask=straddle_ask,
             quoted_spread_pct=candidate.spread_pct if candidate.spread_pct < 100 else None,
             spot_price=candidate.spot_price if candidate.spot_price > 0 else None,
             implied_move=candidate.implied_move_pct / 100 if candidate.implied_move_pct > 0 else None,
+            straddle_premium=straddle_premium,
         )
 
         self.logger.log_non_trade(non_trade)

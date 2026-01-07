@@ -46,27 +46,6 @@ class ComboOrder:
     status: str = 'pending'  # pending, filled, cancelled
 
 
-# Keep OrderPair for backwards compatibility with recovery logic
-@dataclass
-class OrderPair:
-    """Legacy: Tracks a straddle order (call + put) - for backwards compatibility."""
-    trade_id: str
-    symbol: str
-    expiry: str
-    strike: float
-
-    call_order_id: Optional[int] = None
-    put_order_id: Optional[int] = None
-
-    call_trade: Optional[Trade] = None
-    put_trade: Optional[Trade] = None
-
-    call_fill_price: Optional[float] = None
-    put_fill_price: Optional[float] = None
-
-    status: str = 'pending'  # pending, partial, filled, cancelled
-
-
 @dataclass
 class ExitComboOrder:
     """Tracks exit combo order for a straddle position."""
@@ -86,30 +65,6 @@ class ExitComboOrder:
     entry_fill_price: Optional[float] = None  # For P&L calculation
 
     status: str = 'pending'  # pending, filled
-
-
-# Keep ExitOrderPair for backwards compatibility
-@dataclass
-class ExitOrderPair:
-    """Legacy: Tracks exit orders for a straddle position."""
-    trade_id: str
-    symbol: str
-    expiry: str
-    strike: float
-    contracts: int
-
-    call_order_id: Optional[int] = None
-    put_order_id: Optional[int] = None
-
-    call_trade: Optional[Trade] = None
-    put_trade: Optional[Trade] = None
-
-    call_fill_price: Optional[float] = None
-    put_fill_price: Optional[float] = None
-
-    entry_fill_price: Optional[float] = None  # For P&L calculation
-
-    status: str = 'pending'  # pending, partial, filled
 
 
 class Phase0Executor:
@@ -621,96 +576,6 @@ def close_position(
     return exit_order
 
 
-# Keep legacy function for backwards compatibility
-def close_position_legacy(
-    ib: IB,
-    trade_logger: TradeLogger,
-    trade_id: str,
-    symbol: str,
-    expiry: str,
-    strike: float,
-    contracts: int,
-    limit_aggression: float = 0.3,
-    entry_fill_price: Optional[float] = None,
-) -> Optional[ExitOrderPair]:
-    """
-    Legacy: Close position with separate orders (for backwards compatibility).
-    """
-    call = Option(symbol, expiry, strike, 'C', 'SMART', tradingClass=symbol)
-    put = Option(symbol, expiry, strike, 'P', 'SMART', tradingClass=symbol)
-
-    try:
-        ib.qualifyContracts(call, put)
-    except Exception as e:
-        logger.error(f"Could not qualify options for close: {e}")
-        return None
-
-    call_ticker = ib.reqMktData(call, '', False, False)
-    put_ticker = ib.reqMktData(put, '', False, False)
-    ib.sleep(2)
-
-    call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
-    call_ask = call_ticker.ask if call_ticker.ask == call_ticker.ask else 0
-    put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
-    put_ask = put_ticker.ask if put_ticker.ask == put_ticker.ask else 0
-
-    ib.cancelMktData(call)
-    ib.cancelMktData(put)
-
-    if call_bid <= 0 or put_bid <= 0:
-        logger.error(f"No valid bids for close")
-        return None
-
-    call_mid = (call_bid + call_ask) / 2
-    put_mid = (put_bid + put_ask) / 2
-    call_spread = call_ask - call_bid
-    put_spread = put_ask - put_bid
-
-    call_limit = round(call_mid - limit_aggression * call_spread, 2)
-    put_limit = round(put_mid - limit_aggression * put_spread, 2)
-
-    call_order = LimitOrder('SELL', contracts, call_limit)
-    put_order = LimitOrder('SELL', contracts, put_limit)
-
-    try:
-        call_trade = ib.placeOrder(call, call_order)
-        put_trade = ib.placeOrder(put, put_order)
-    except Exception as e:
-        logger.error(f"Exit order placement error: {e}")
-        return None
-
-    trade_logger.update_trade(
-        trade_id,
-        exit_datetime=datetime.now().isoformat(),
-        exit_quoted_bid=call_bid + put_bid,
-        exit_quoted_ask=call_ask + put_ask,
-        exit_quoted_mid=call_mid + put_mid,
-        exit_limit_price=call_limit + put_limit,
-        status='exiting',
-    )
-
-    logger.info(
-        f"{symbol}: Placed exit orders - "
-        f"Call {contracts}x @ ${call_limit:.2f}, Put {contracts}x @ ${put_limit:.2f}"
-    )
-
-    exit_pair = ExitOrderPair(
-        trade_id=trade_id,
-        symbol=symbol,
-        expiry=expiry,
-        strike=strike,
-        contracts=contracts,
-        call_order_id=call_trade.order.orderId,
-        put_order_id=put_trade.order.orderId,
-        call_trade=call_trade,
-        put_trade=put_trade,
-        entry_fill_price=entry_fill_price,
-        status='pending',
-    )
-
-    return exit_pair
-
-
 def check_exit_fills(
     exit_orders: dict[str, ExitComboOrder],
     trade_logger: TradeLogger,
@@ -762,71 +627,5 @@ def check_exit_fills(
         elif status in ('Cancelled', 'Inactive'):
             exit_order.status = 'cancelled'
             logger.warning(f"{exit_order.symbol}: Exit order cancelled/inactive")
-
-    return filled
-
-
-# Keep legacy function for backwards compatibility with ExitOrderPair
-def check_exit_fills_legacy(
-    exit_orders: dict[str, ExitOrderPair],
-    trade_logger: TradeLogger,
-) -> list[ExitOrderPair]:
-    """Legacy: Check status of separate exit orders."""
-    filled = []
-
-    for trade_id, exit_pair in list(exit_orders.items()):
-        call_status = exit_pair.call_trade.orderStatus.status if exit_pair.call_trade else 'Unknown'
-        put_status = exit_pair.put_trade.orderStatus.status if exit_pair.put_trade else 'Unknown'
-
-        call_filled = call_status == 'Filled'
-        put_filled = put_status == 'Filled'
-
-        if call_filled and exit_pair.call_fill_price is None:
-            exit_pair.call_fill_price = exit_pair.call_trade.orderStatus.avgFillPrice
-            logger.info(f"{exit_pair.symbol}: Exit call filled @ ${exit_pair.call_fill_price:.2f}")
-
-        if put_filled and exit_pair.put_fill_price is None:
-            exit_pair.put_fill_price = exit_pair.put_trade.orderStatus.avgFillPrice
-            logger.info(f"{exit_pair.symbol}: Exit put filled @ ${exit_pair.put_fill_price:.2f}")
-
-        if call_filled and put_filled:
-            exit_pair.status = 'filled'
-            filled.append(exit_pair)
-
-            exit_fill = exit_pair.call_fill_price + exit_pair.put_fill_price
-            exit_limit = (
-                exit_pair.call_trade.order.lmtPrice + exit_pair.put_trade.order.lmtPrice
-                if exit_pair.call_trade and exit_pair.put_trade else None
-            )
-
-            premium_received = exit_fill * exit_pair.contracts * 100
-            exit_pnl = None
-            exit_pnl_pct = None
-
-            if exit_pair.entry_fill_price:
-                premium_paid = exit_pair.entry_fill_price * exit_pair.contracts * 100
-                exit_pnl = premium_received - premium_paid
-                exit_pnl_pct = (exit_fill / exit_pair.entry_fill_price - 1)
-
-            trade_logger.update_trade(
-                trade_id,
-                status='exited',
-                exit_fill_price=exit_fill,
-                exit_slippage=exit_fill - exit_limit if exit_limit else None,
-                exit_pnl=exit_pnl,
-                exit_pnl_pct=exit_pnl_pct,
-            )
-
-            pnl_str = f", P&L: ${exit_pnl:.2f}" if exit_pnl else ""
-            logger.info(
-                f"{exit_pair.symbol}: EXIT COMPLETE - Fill: ${exit_fill:.2f}{pnl_str}"
-            )
-
-        elif call_filled or put_filled:
-            exit_pair.status = 'partial'
-            logger.warning(
-                f"{exit_pair.symbol}: PARTIAL EXIT - "
-                f"Call: {call_status}, Put: {put_status}"
-            )
 
     return filled

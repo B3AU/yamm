@@ -743,46 +743,47 @@ class TradingDaemon:
         """Configure the job schedule."""
 
         # Market hours schedule (Monday-Friday)
-        # All times in ET
+        # US market: 09:30-16:00 ET = 14:30-21:00 UTC
+        # All times below in UTC (system timezone)
 
-        # Morning connect
+        # Morning connect - 09:25 ET = 14:25 UTC
         self.scheduler.add_job(
             self.task_morning_connect,
-            CronTrigger(day_of_week='mon-fri', hour=9, minute=25),
+            CronTrigger(day_of_week='mon-fri', hour=14, minute=25),
             id='morning_connect',
-            name='Morning Connect',
+            name='Morning Connect (09:25 ET)',
         )
 
-        # Exit positions BEFORE placing new ones
+        # Exit positions BEFORE placing new ones - 14:45 ET = 19:45 UTC
         self.scheduler.add_job(
             self.task_exit_positions,
-            CronTrigger(day_of_week='mon-fri', hour=14, minute=45),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=45),
             id='exit_positions',
-            name='Exit Positions',
+            name='Exit Positions (14:45 ET)',
         )
 
-        # Screen candidates AND place orders (after exits are done)
+        # Screen candidates AND place orders (after exits are done) - 15:00 ET = 20:00 UTC
         self.scheduler.add_job(
             self.task_screen_candidates,
-            CronTrigger(day_of_week='mon-fri', hour=15, minute=0),
+            CronTrigger(day_of_week='mon-fri', hour=20, minute=0),
             id='screen_and_place',
-            name='Screen & Place Orders',
+            name='Screen & Place Orders (15:00 ET)',
         )
 
-        # Final fill check
+        # Final fill check - 15:50 ET = 20:50 UTC
         self.scheduler.add_job(
             self.task_check_fills,
-            CronTrigger(day_of_week='mon-fri', hour=15, minute=50),
+            CronTrigger(day_of_week='mon-fri', hour=20, minute=50),
             id='check_fills',
-            name='Check Fills',
+            name='Check Fills (15:50 ET)',
         )
 
-        # Evening disconnect
+        # Evening disconnect - 16:05 ET = 21:05 UTC
         self.scheduler.add_job(
             self.task_evening_disconnect,
-            CronTrigger(day_of_week='mon-fri', hour=16, minute=5),
+            CronTrigger(day_of_week='mon-fri', hour=21, minute=5),
             id='evening_disconnect',
-            name='Evening Disconnect',
+            name='Evening Disconnect (16:05 ET)',
         )
 
         logger.info("Schedule configured:")

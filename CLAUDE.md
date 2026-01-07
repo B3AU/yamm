@@ -104,7 +104,6 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 ### Current Limitations / TODO
 
 #### High Priority
-- [ ] Kill switches not implemented (calibration drift, drawdown throttle)
 - [ ] Counterfactual logging not implemented
 - [ ] No position sizing logic (fixed 1 contract currently)
 

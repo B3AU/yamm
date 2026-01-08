@@ -29,9 +29,9 @@ class TradeLog:
     entry_quoted_bid: float
     entry_quoted_ask: float
     entry_quoted_mid: float
+    entry_limit_price: float
     entry_combo_bid: Optional[float] = None
     entry_combo_ask: Optional[float] = None
-    entry_limit_price: float
     entry_fill_price: Optional[float] = None
     entry_fill_time: Optional[str] = None
     entry_slippage: Optional[float] = None  # fill - mid

@@ -27,6 +27,35 @@ from trading.earnings.logging import (
 logger = logging.getLogger(__name__)
 
 
+def create_straddle_contract(
+    call: Option,
+    put: Option,
+    action: str = 'BUY',
+) -> Contract:
+    """Create a combo contract for a straddle (call + put)."""
+    combo = Contract()
+    combo.symbol = call.symbol
+    combo.secType = 'BAG'
+    combo.currency = 'USD'
+    combo.exchange = 'SMART'
+
+    combo.comboLegs = [
+        ComboLeg(
+            conId=call.conId,
+            ratio=1,
+            action=action,
+            exchange='SMART',
+        ),
+        ComboLeg(
+            conId=put.conId,
+            ratio=1,
+            action=action,
+            exchange='SMART',
+        ),
+    ]
+    return combo
+
+
 @dataclass
 class ComboOrder:
     """Tracks a straddle combo order (call + put as single atomic order)."""
@@ -90,28 +119,7 @@ class Phase0Executor:
         put: Option,
     ) -> Optional[Contract]:
         """Create a combo contract for a straddle (call + put)."""
-        combo = Contract()
-        combo.symbol = call.symbol
-        combo.secType = 'BAG'
-        combo.currency = 'USD'
-        combo.exchange = 'SMART'
-
-        combo.comboLegs = [
-            ComboLeg(
-                conId=call.conId,
-                ratio=1,
-                action='BUY',
-                exchange='SMART',
-            ),
-            ComboLeg(
-                conId=put.conId,
-                ratio=1,
-                action='BUY',
-                exchange='SMART',
-            ),
-        ]
-
-        return combo
+        return create_straddle_contract(call, put, 'BUY')
 
     async def place_straddle(
         self,
@@ -518,28 +526,7 @@ def _create_exit_combo(
     put: Option,
 ) -> Contract:
     """Create a combo contract for selling a straddle (call + put)."""
-    combo = Contract()
-    combo.symbol = call.symbol
-    combo.secType = 'BAG'
-    combo.currency = 'USD'
-    combo.exchange = 'SMART'
-
-    combo.comboLegs = [
-        ComboLeg(
-            conId=call.conId,
-            ratio=1,
-            action='SELL',
-            exchange='SMART',
-        ),
-        ComboLeg(
-            conId=put.conId,
-            ratio=1,
-            action='SELL',
-            exchange='SMART',
-        ),
-    ]
-
-    return combo
+    return create_straddle_contract(call, put, 'SELL')
 
 
 async def close_position(

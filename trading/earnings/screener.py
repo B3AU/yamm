@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import requests
 import asyncio
+import math
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -179,14 +180,14 @@ async def screen_candidate_ibkr(
         await asyncio.sleep(0.1)
 
     spot = ticker.marketPrice()
-    if spot != spot or spot <= 0:  # nan check
+    if math.isnan(spot) or spot <= 0:  # nan check
         spot = ticker.last
-    if spot != spot or spot <= 0:
+    if math.isnan(spot) or spot <= 0:
         spot = ticker.close
 
     ib.cancelMktData(stock)
 
-    if not spot or spot <= 0 or spot != spot:
+    if not spot or spot <= 0 or math.isnan(spot):
         return _rejected_candidate(symbol, earnings_date, timing, "No spot price")
 
     # Get option chain
@@ -240,10 +241,13 @@ async def screen_candidate_ibkr(
         await asyncio.sleep(0.1)
 
     # Extract bid/ask
-    call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
-    call_ask = call_ticker.ask if call_ticker.ask == call_ticker.ask else 0
-    put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
-    put_ask = put_ticker.ask if put_ticker.ask == put_ticker.ask else 0
+    def _valid(p) -> float:
+        return 0.0 if (p is None or math.isnan(p)) else float(p)
+
+    call_bid = _valid(call_ticker.bid)
+    call_ask = _valid(call_ticker.ask)
+    put_bid = _valid(put_ticker.bid)
+    put_ask = _valid(put_ticker.ask)
 
     # Get IV if available
     call_iv = None

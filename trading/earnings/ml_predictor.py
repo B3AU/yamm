@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+import concurrent.futures
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -677,24 +678,37 @@ class EarningsPredictor:
         Uses live FMP data first, falls back to parquet files.
         Returns dict of features or None if insufficient data.
         """
-        features = {}
+        # Fetch data in parallel to reduce latency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_hist = executor.submit(self._compute_historical_features, symbol, earnings_date)
+            future_prices = executor.submit(self._compute_price_features, symbol, earnings_date)
+            future_fund = executor.submit(self._fetch_fundamentals, symbol, earnings_date)
+            future_surprise = executor.submit(self._fetch_earnings_surprises, symbol, earnings_date)
+            future_news = executor.submit(self._compute_news_features, symbol, earnings_date)
 
-        # Historical earnings features (required - return None if missing)
-        hist_features = self._compute_historical_features(symbol, earnings_date)
+            # Retrieve results (will raise if any function raised, handled by caller or logged inside)
+            hist_features = future_hist.result()
+            price_features = future_prices.result()
+            fund_data = future_fund.result()
+            surprise_data = future_surprise.result()
+            news_features = future_news.result()
+
+        # Check required data
         if hist_features is None:
             logger.debug(f"{symbol}: No historical earnings data available")
             return None
+
+        # Build feature dict
+        features = {}
         features.update(hist_features)
-
-        # Price features
-        price_features = self._compute_price_features(symbol, earnings_date)
         features.update(price_features)
+        features.update(fund_data)
 
-        # Surprise features
-        surprise_data = self._fetch_earnings_surprises(symbol, earnings_date)
         features['surprise_pct_mean'] = surprise_data['surprise_pct_mean']
         features['beat_rate'] = surprise_data['beat_rate']
         features['surprise_streak'] = surprise_data['surprise_streak']
+
+        features.update(news_features)
 
         # Timing features
         earn_dt = datetime.combine(earnings_date, datetime.min.time())
@@ -702,14 +716,6 @@ class EarningsPredictor:
         features['month'] = earn_dt.month
         features['quarter'] = (earn_dt.month - 1) // 3 + 1
         features['is_earnings_season'] = 1 if earn_dt.month in [1, 2, 4, 5, 7, 8, 10, 11] else 0
-
-        # Fundamentals
-        fund_data = self._fetch_fundamentals(symbol, earnings_date)
-        features.update(fund_data)
-
-        # News features
-        news_features = self._compute_news_features(symbol, earnings_date)
-        features.update(news_features)
 
         # Timing encoded
         timing_map = {'BMO': 0, 'AMC': 1, 'unknown': 2}

@@ -34,6 +34,11 @@ class TradeLog:
     entry_fill_time: Optional[str] = None
     entry_slippage: Optional[float] = None  # fill - mid
 
+    # Advanced Execution Metrics (New)
+    decision_latency_ms: Optional[float] = None  # ms between quote snapshot and order submit
+    fill_latency_seconds: Optional[float] = None # Time from submit to full fill
+    spread_at_fill: Optional[float] = None # live spread when filled (if available)
+
     # Post-fill Markouts (price behavior after entry)
     markout_1min: Optional[float] = None  # Price 1 min after fill
     markout_5min: Optional[float] = None  # Price 5 min after fill
@@ -222,6 +227,13 @@ class TradeLogger:
 
             # Add markout columns (migration)
             for col in ['markout_1min', 'markout_5min', 'markout_30min']:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+                except sqlite3.OperationalError:
+                    pass
+
+            # Add advanced execution metrics (migration)
+            for col in ['decision_latency_ms', 'fill_latency_seconds', 'spread_at_fill']:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
                 except sqlite3.OperationalError:

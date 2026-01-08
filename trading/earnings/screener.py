@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import requests
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -145,7 +146,7 @@ def fetch_upcoming_earnings(days_ahead: int = 7) -> list[EarningsEvent]:
     return events
 
 
-def screen_candidate_ibkr(
+async def screen_candidate_ibkr(
     ib,  # IB connection
     symbol: str,
     earnings_date: date,
@@ -154,7 +155,7 @@ def screen_candidate_ibkr(
     min_oi: int = 50,  # minimum open interest (can't check via mkt data, skip for now)
 ) -> ScreenedCandidate:
     """
-    Screen a single candidate using IBKR for option quotes.
+    Screen a single candidate using IBKR for option quotes (Async).
 
     Returns ScreenedCandidate with passes_liquidity set appropriately.
     """
@@ -163,12 +164,19 @@ def screen_candidate_ibkr(
     # Get stock price
     stock = Stock(symbol, 'SMART', 'USD')
     try:
-        ib.qualifyContracts(stock)
+        await ib.qualifyContractsAsync(stock)
     except Exception as e:
         return _rejected_candidate(symbol, earnings_date, timing, f"Could not qualify stock: {e}")
 
     ticker = ib.reqMktData(stock, '', False, False)
-    ib.sleep(2)
+
+    # Wait for price (max 2s)
+    for _ in range(20):
+        if ticker.last == ticker.last and ticker.last > 0:
+            break
+        if ticker.close == ticker.close and ticker.close > 0:
+            break
+        await asyncio.sleep(0.1)
 
     spot = ticker.marketPrice()
     if spot != spot or spot <= 0:  # nan check
@@ -183,7 +191,9 @@ def screen_candidate_ibkr(
 
     # Get option chain
     try:
-        chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
+        # Check if async version exists, otherwise use reliable synchronous wrapper via to_thread?
+        # ib_insync usually provides Async methods.
+        chains = await ib.reqSecDefOptParamsAsync(stock.symbol, '', stock.secType, stock.conId)
     except Exception as e:
         return _rejected_candidate(symbol, earnings_date, timing, f"No option chain: {e}")
 
@@ -213,7 +223,7 @@ def screen_candidate_ibkr(
     put = Option(symbol, target_expiry, atm_strike, 'P', 'SMART', tradingClass=symbol)
 
     try:
-        qualified = ib.qualifyContracts(call, put)
+        qualified = await ib.qualifyContractsAsync(call, put)
         if len(qualified) < 2:
             return _rejected_candidate(symbol, earnings_date, timing, "Could not qualify options")
     except Exception as e:
@@ -221,7 +231,13 @@ def screen_candidate_ibkr(
 
     call_ticker = ib.reqMktData(call, '', False, False)
     put_ticker = ib.reqMktData(put, '', False, False)
-    ib.sleep(2)
+
+    # Wait for quotes (max 2s)
+    for _ in range(20):
+        if (call_ticker.bid > 0 and call_ticker.ask > 0 and
+            put_ticker.bid > 0 and put_ticker.ask > 0):
+            break
+        await asyncio.sleep(0.1)
 
     # Extract bid/ask
     call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
@@ -310,7 +326,7 @@ def _rejected_candidate(
     )
 
 
-def screen_all_candidates(
+async def screen_all_candidates(
     ib,
     events: list[EarningsEvent],
     spread_threshold: float = 15.0,
@@ -318,7 +334,7 @@ def screen_all_candidates(
     skip_symbols: set[str] = None,
 ) -> tuple[list[ScreenedCandidate], list[ScreenedCandidate]]:
     """
-    Screen all earnings events.
+    Screen all earnings events (Async).
 
     Returns:
         (passed, rejected) - lists of candidates
@@ -338,7 +354,7 @@ def screen_all_candidates(
 
         logger.info(f"Screening {event.symbol} ({i+1}/{total_to_screen})")
 
-        candidate = screen_candidate_ibkr(
+        candidate = await screen_candidate_ibkr(
             ib,
             event.symbol,
             event.earnings_date,

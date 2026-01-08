@@ -107,12 +107,10 @@ class Phase0Executor:
         self,
         ib: IB,
         trade_logger: TradeLogger,
-        max_contracts: int = 1,  # Start with 1 contract
         limit_aggression: float = 0.3,  # How much above mid to place limit
     ):
         self.ib = ib
         self.logger = trade_logger
-        self.max_contracts = max_contracts
         self.limit_aggression = limit_aggression
         self.active_orders: dict[str, ComboOrder] = {}
 
@@ -127,16 +125,19 @@ class Phase0Executor:
     async def place_straddle(
         self,
         candidate: ScreenedCandidate,
-        contracts: int = None,
+        target_entry_amount: float = None,
+        min_contracts: int = 1,
+        max_contracts: int = 5,
     ) -> Optional[ComboOrder]:
         """
         Place a straddle combo order (buy call + put atomically).
 
         Uses a single combo/BAG order to ensure both legs fill together,
         eliminating orphan leg risk.
-        """
-        contracts = contracts or self.max_contracts
 
+        Position sizing: If target_entry_amount is set, calculates contracts
+        to achieve approximately that dollar entry (premium * contracts * 100).
+        """
         # Calculate combined straddle limit price
         call_mid = (candidate.call_bid + candidate.call_ask) / 2
         put_mid = (candidate.put_bid + candidate.put_ask) / 2
@@ -149,6 +150,20 @@ class Phase0Executor:
 
         # Limit price: mid + aggression * spread
         straddle_limit = round(straddle_mid + self.limit_aggression * straddle_spread, 2)
+
+        # Position sizing: target equal dollar entry amounts
+        straddle_cost = straddle_mid * 100  # cost per contract in dollars
+        if target_entry_amount and target_entry_amount > 0:
+            contracts = int(target_entry_amount / straddle_cost)
+            contracts = max(min_contracts, min(contracts, max_contracts))
+        else:
+            contracts = min_contracts
+
+        if contracts < min_contracts:
+            logger.info(f"{candidate.symbol}: Straddle too expensive (${straddle_cost:.0f}/contract vs ${target_entry_amount:.0f} target) - skipping")
+            return None
+
+        logger.info(f"{candidate.symbol}: Position size = {contracts} contracts (${straddle_cost:.0f}/contract, target ${target_entry_amount:.0f})")
 
         # Create and qualify individual option contracts first
         call = Option(

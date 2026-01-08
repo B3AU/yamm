@@ -93,7 +93,10 @@ CONFIG = {
         'PAPER_MAX_DAILY_TRADES' if PAPER_MODE else 'MAX_DAILY_TRADES', '5'
     )),
 
-    'max_contracts': int(os.getenv('MAX_CONTRACTS', '1')),
+    # Position sizing: target equal dollar entry amounts
+    'target_entry_amount': float(os.getenv('TARGET_ENTRY_AMOUNT', '2000')),  # target $ per trade
+    'min_contracts': int(os.getenv('MIN_CONTRACTS', '1')),
+    'max_contracts': int(os.getenv('MAX_CONTRACTS', '5')),  # safety cap
     'limit_aggression': float(os.getenv('LIMIT_AGGRESSION', '0.3')),
     'max_candidates_to_screen': int(os.getenv('MAX_CANDIDATES_TO_SCREEN', '50')),
 
@@ -170,7 +173,6 @@ class TradingDaemon:
             self.executor = Phase0Executor(
                 ib=self.ib,
                 trade_logger=self.trade_logger,
-                max_contracts=CONFIG['max_contracts'],
                 limit_aggression=CONFIG['limit_aggression'],
             )
 
@@ -406,8 +408,13 @@ class TradingDaemon:
 
                 logger.info(f"Placing order for {candidate.symbol}...")
 
-                # Use async place_straddle
-                order_pair = await self.executor.place_straddle(candidate)
+                # Use async place_straddle with position sizing config
+                order_pair = await self.executor.place_straddle(
+                    candidate,
+                    target_entry_amount=CONFIG['target_entry_amount'],
+                    min_contracts=CONFIG['min_contracts'],
+                    max_contracts=CONFIG['max_contracts'],
+                )
 
                 if order_pair:
                     self.todays_trades.append(order_pair.trade_id)

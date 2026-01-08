@@ -182,6 +182,8 @@ class Phase0Executor:
             entry_quoted_bid=straddle_bid,
             entry_quoted_ask=straddle_ask,
             entry_quoted_mid=straddle_mid,
+            entry_combo_bid=straddle_bid,  # Capture at moment of decision
+            entry_combo_ask=straddle_ask,
             entry_limit_price=straddle_limit,
             structure='straddle_combo',
             strikes=str([candidate.atm_strike]),
@@ -202,6 +204,20 @@ class Phase0Executor:
 
         try:
             trade = self.ib.placeOrder(combo, order)
+
+            # Log initial placement event
+            self.logger.log_order_event(
+                trade_id=trade_id,
+                ib_order_id=trade.order.orderId,
+                event='placed',
+                status='PendingSubmit', # Initial IB status
+                filled=0,
+                remaining=contracts,
+                avg_fill_price=0.0,
+                limit_price=straddle_limit,
+                details={'type': 'entry', 'symbol': candidate.symbol}
+            )
+
         except Exception as e:
             logger.error(f"{candidate.symbol}: Combo order placement error: {e}")
             self.logger.update_trade(trade_id, status='error', notes=str(e))
@@ -246,9 +262,32 @@ class Phase0Executor:
             status = combo_order.trade.orderStatus.status
             filled_qty = combo_order.trade.orderStatus.filled
             total_qty = combo_order.trade.order.totalQuantity
+            remaining_qty = combo_order.trade.orderStatus.remaining
+            last_fill_price = combo_order.trade.orderStatus.lastFillPrice
+            avg_fill_price = combo_order.trade.orderStatus.avgFillPrice
+
+            # Log granular status update if status changed or filled qty increased
+            prev_status = getattr(combo_order, '_last_log_status', None)
+            prev_filled = getattr(combo_order, '_last_log_filled', 0)
+
+            if status != prev_status or filled_qty > prev_filled:
+                self.logger.log_order_event(
+                    trade_id=trade_id,
+                    ib_order_id=combo_order.trade.order.orderId,
+                    event='status_update' if filled_qty == prev_filled else 'fill',
+                    status=status,
+                    filled=filled_qty,
+                    remaining=remaining_qty,
+                    avg_fill_price=avg_fill_price,
+                    limit_price=combo_order.trade.order.lmtPrice,
+                    last_fill_price=last_fill_price,
+                    last_fill_qty=filled_qty - prev_filled if filled_qty > prev_filled else 0
+                )
+                combo_order._last_log_status = status
+                combo_order._last_log_filled = filled_qty
 
             if status == 'Filled' and combo_order.fill_price is None:
-                combo_order.fill_price = combo_order.trade.orderStatus.avgFillPrice
+                combo_order.fill_price = avg_fill_price
                 combo_order.status = 'filled'
                 filled.append(combo_order)
 
@@ -566,6 +605,20 @@ async def close_position(
 
     try:
         trade = ib.placeOrder(combo, order)
+
+        # Log initial placement
+        trade_logger.log_order_event(
+            trade_id=trade_id,
+            ib_order_id=trade.order.orderId,
+            event='placed',
+            status='PendingSubmit',
+            filled=0,
+            remaining=contracts,
+            avg_fill_price=0.0,
+            limit_price=straddle_limit,
+            details={'type': 'exit', 'symbol': symbol}
+        )
+
     except Exception as e:
         logger.error(f"Exit combo order placement error: {e}")
         return None
@@ -619,9 +672,34 @@ def check_exit_fills(
             continue
 
         status = exit_order.trade.orderStatus.status
+        filled_qty = exit_order.trade.orderStatus.filled
+        remaining_qty = exit_order.trade.orderStatus.remaining
+        avg_fill_price = exit_order.trade.orderStatus.avgFillPrice
+        last_fill_price = exit_order.trade.orderStatus.lastFillPrice # Note: IB doesn't always populate this for combos
+
+        # Log granular event
+        prev_status = getattr(exit_order, '_last_log_status', None)
+        prev_filled = getattr(exit_order, '_last_log_filled', 0)
+
+        if status != prev_status or filled_qty > prev_filled:
+            trade_logger.log_order_event(
+                trade_id=trade_id,
+                ib_order_id=exit_order.trade.order.orderId,
+                event='status_update' if filled_qty == prev_filled else 'fill',
+                status=status,
+                filled=filled_qty,
+                remaining=remaining_qty,
+                avg_fill_price=avg_fill_price,
+                limit_price=exit_order.trade.order.lmtPrice,
+                last_fill_price=last_fill_price,
+                last_fill_qty=filled_qty - prev_filled if filled_qty > prev_filled else 0,
+                details={'type': 'exit'}
+            )
+            exit_order._last_log_status = status
+            exit_order._last_log_filled = filled_qty
 
         if status == 'Filled' and exit_order.fill_price is None:
-            exit_order.fill_price = exit_order.trade.orderStatus.avgFillPrice
+            exit_order.fill_price = avg_fill_price
             exit_order.status = 'filled'
             filled.append(exit_order)
 

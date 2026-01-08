@@ -29,6 +29,8 @@ class TradeLog:
     entry_quoted_bid: float
     entry_quoted_ask: float
     entry_quoted_mid: float
+    entry_combo_bid: Optional[float] = None
+    entry_combo_ask: Optional[float] = None
     entry_limit_price: float
     entry_fill_price: Optional[float] = None
     entry_fill_time: Optional[str] = None
@@ -336,6 +338,38 @@ class TradeLogger:
             )
             conn.commit()
             return cursor.rowcount > 0
+
+    def log_order_event(
+        self,
+        trade_id: str,
+        ib_order_id: int,
+        event: str,
+        status: str,
+        filled: float,
+        remaining: float,
+        avg_fill_price: float,
+        limit_price: float,
+        last_fill_price: float = 0.0,
+        last_fill_qty: float = 0.0,
+        details: dict = None
+    ):
+        """Log a granular order event (placed, status update, fill, etc)."""
+        ts = datetime.now().isoformat()
+        details_json = json.dumps(details) if details else None
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO order_events (
+                    trade_id, ib_order_id, ts, event, status,
+                    filled, remaining, avg_fill_price,
+                    last_fill_price, last_fill_qty, limit_price, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade_id, ib_order_id, ts, event, status,
+                filled, remaining, avg_fill_price,
+                last_fill_price, last_fill_qty, limit_price, details_json
+            ))
+            conn.commit()
 
     def get_non_trades_pending_counterfactual(
         self,

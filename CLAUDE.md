@@ -24,17 +24,18 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 #### Trading Daemon (`trading/earnings/daemon.py`)
 - APScheduler-based daemon running on configurable schedule
 - **Schedule (all times ET):**
-  - 09:30 - Morning IBKR connection check
-  - 14:45 - Exit existing positions
-  - 15:00 - Screen candidates + place new orders (combined for more fill time)
-  - 15:50 - Check fills, cancel unfilled orders near close
+  - **09:25** - Morning IBKR connection check
+  - **14:00** - Screen candidates + place new orders (combined for more fill time)
+  - **14:45** - Exit existing positions
+  - **15:55** - Check fills, cancel unfilled orders near close
 - Order recovery on restart (persists IBKR order IDs to DB)
 - Graceful shutdown handling
 
 #### Screener (`trading/earnings/screener.py`)
-- Fetches earnings calendar from FMP API
+- Fetches earnings calendar from **Nasdaq API** (FMP was unreliable for calendar)
 - Gets live option chains from IBKR
-- Applies liquidity gates (spread %, OI, etc.)
+- Applies liquidity gates (mostly spread %)
+  - *Open interest check currently disabled/commented out*
 - Computes implied move from ATM straddle
 
 #### ML Predictor (`trading/earnings/ml_predictor.py`)
@@ -85,23 +86,29 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Anonymizes company names for cleaner embeddings
 - PCA projection to match training features
 
+#### IB Options Client (`trading/earnings/ib_options.py`)
+- Wrapper around `ib_insync` for option chains and market data
+- Handles connection maintenance and error recovery
+
 ### Changes from Original Plan
 
-1. **Combined screen + place orders** - Originally separate (15:00 screen, 15:30 place). Now combined at 15:00 for more fill time before close.
+1. **Combined screen + place orders** - Originally separate (15:00 screen, 15:30 place). Now combined at **14:00 ET** for maximum fill time before close.
 
-2. **Exit before new orders** - Exit moved to 14:45 ET (before 15:00 new orders) to avoid position conflicts.
+2. **Exit time** - Exit moved to **14:45 ET** to avoid position conflicts with new orders.
 
-3. **Live-first data** - Originally planned to use static parquet files. Now fetches live from FMP API with parquet as fallback only.
+3. **Data Sources** - Earnings calendar uses **Nasdaq API** instead of FMP (better accuracy).
 
-4. **Order recovery** - Added IBKR order ID persistence and recovery on daemon restart.
+4. **Live-first data** - Originally planned to use static parquet files. Now fetches live from FMP API with parquet as fallback only.
 
-5. **Combo orders** - Using IBKR BAG orders instead of separate call/put orders. Eliminates orphan leg risk entirely.
+5. **Order recovery** - Added IBKR order ID persistence and recovery on daemon restart.
 
-6. **Interactive dashboard** - Added keyboard commands for manual position management.
+6. **Combo orders** - Using IBKR BAG orders instead of separate call/put orders. Eliminates orphan leg risk entirely.
 
-7. **Exit order monitoring** - Track exit fills and calculate P&L automatically.
+7. **Interactive dashboard** - Added keyboard commands for manual position management.
 
-8. **Counterfactual logging** - After market close, backfill realized moves for non-traded candidates to measure what we missed.
+8. **Exit order monitoring** - Track exit fills and calculate P&L automatically.
+
+9. **Counterfactual logging** - After market close, backfill realized moves for non-traded candidates to measure what we missed.
 
 ### Current Limitations / TODO
 
@@ -136,7 +143,8 @@ trading/earnings/
 ├── logging.py         # Trade/non-trade logging
 ├── counterfactual.py  # Counterfactual backfill for non-trades
 ├── dashboard.py       # CLI dashboard
-└── live_news.py       # Live news embeddings
+├── live_news.py       # Live news embeddings
+└── ib_options.py      # IBKR options client wrapper
 
 models/
 ├── earnings_q50.txt   # LightGBM model files

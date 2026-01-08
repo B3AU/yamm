@@ -382,7 +382,8 @@ class TradingDaemon:
             for candidate in self.todays_candidates:
                 # Double check we haven't already traded this symbol today
                 # (Paranoid check for duplicate trades)
-                if any(t.startswith(candidate.symbol) for t in self.todays_trades):
+                # Parse ticker from trade_id to avoid substring matches (e.g. GO vs GOOG)
+                if any(t.split('_')[0] == candidate.symbol for t in self.todays_trades):
                     logger.warning(f"Skipping {candidate.symbol} - already traded today")
                     continue
 
@@ -930,21 +931,41 @@ class TradingDaemon:
     async def _run_screening_if_needed(self):
         """Run screening if started during window."""
         if not self.ib.isConnected():
+            logger.error("STARTUP CONNECTION FAILED - check IB Gateway is running")
+            logger.error("Daemon will continue and retry at scheduled times")
+            logger.info("Not connected - skipping startup screening")
             return
 
         now = datetime.now(ET)
+
+        # Original schedule: screen at 14:00.
+        # But we'll allow catch-up if restarted between 14:00 and 21:00 (market hours + after hours)
+        # to ensure we don't miss anything if daemon crashes.
+        # CRITICAL: Must rely on _load_todays_activity() to prevent duplicates!
+
         start = now.replace(hour=14, minute=0, second=0)
-        end = now.replace(hour=15, minute=0, second=0) # Window until 3 PM?
+        end = now.replace(hour=21, minute=0, second=0)
 
-        # If between 14:00 and 15:00 ET
+        # If between 14:00 and 21:00 ET on a weekday
         if now.weekday() < 5 and start <= now < end:
-            # Check if we already traded
+            # Check for existing trades loaded from DB
             if self.todays_trades:
-                logger.info("Already traded today, skipping startup screening")
-                return
+                logger.info(f"STARTUP: Already placed {len(self.todays_trades)} trades today.")
+                # If we've already hit the daily max, definitely skip
+                if len(self.todays_trades) >= CONFIG['max_daily_trades']:
+                     logger.info("STARTUP: Daily trade limit reached. Skipping startup screening.")
+                     return
+                else:
+                     logger.info("STARTUP: Partial trades placed. Checking for additional candidates...")
 
-            logger.info("Running missed screening...")
+            # Check for existing log entries to see if screening already ran?
+            # Ideally we check if we already have non_trades for this earnings date too.
+            # For now, relying on todays_trades matches + logic in task_screen_candidates is better.
+
+            logger.info(f"STARTUP: Running screening (missed 14:00 scheduled time)")
             await self.task_screen_candidates()
+        else:
+            logger.info("STARTUP: Outside screening window (14:00-21:00 ET), waiting for next schedule.")
 
     def run(self):
         """Entry point."""

@@ -20,9 +20,11 @@ import os
 import select
 import sys
 import time
+import asyncio
+import json
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 import pytz
@@ -48,6 +50,8 @@ def clear_screen():
 
 
 def format_currency(value: float) -> str:
+    if value is None:
+        return "N/A"
     if value >= 0:
         return f"${value:,.2f}"
     return f"-${abs(value):,.2f}"
@@ -88,6 +92,7 @@ def dim(text: str) -> str:
 
 # Timezone for market hours
 ET = pytz.timezone('US/Eastern')
+PT = pytz.timezone('Europe/Lisbon')  # Portugal time
 
 
 def get_market_status() -> tuple[str, str]:
@@ -125,8 +130,15 @@ def format_time_until(target_dt: datetime, now: datetime = None) -> str:
     if now is None:
         now = datetime.now()
 
-    if target_dt.tzinfo:
+    # Ensure consistent timezone awareness
+    if target_dt.tzinfo and not now.tzinfo:
         target_dt = target_dt.replace(tzinfo=None)
+    elif not target_dt.tzinfo and now.tzinfo:
+        now = now.replace(tzinfo=None)
+    elif target_dt.tzinfo != now.tzinfo:
+        # Convert target to now's timezone if practical, or strip both
+        target_dt = target_dt.replace(tzinfo=None)
+        now = now.replace(tzinfo=None)
 
     diff = target_dt - now
     total_seconds = diff.total_seconds()
@@ -147,15 +159,24 @@ def format_time_until(target_dt: datetime, now: datetime = None) -> str:
 
 
 def format_time_since(past_dt: datetime, now: datetime = None) -> str:
-    """Format time since a past datetime."""
+    """Format time since a past datetime.
+
+    Shows absolute time in Portugal timezone (Europe/Lisbon) if requested.
+    """
     if now is None:
         now = datetime.now()
 
     if isinstance(past_dt, str):
         past_dt = datetime.fromisoformat(past_dt)
 
-    if past_dt.tzinfo:
+    # Handle timezones for calculation
+    if past_dt.tzinfo and not now.tzinfo:
         past_dt = past_dt.replace(tzinfo=None)
+    elif not past_dt.tzinfo and now.tzinfo:
+        now = now.replace(tzinfo=None)
+    elif past_dt.tzinfo != now.tzinfo:
+        past_dt = past_dt.replace(tzinfo=None)
+        now = now.replace(tzinfo=None)
 
     diff = now - past_dt
     total_seconds = diff.total_seconds()
@@ -189,7 +210,6 @@ def get_next_screen_time() -> Optional[datetime]:
         screen_time += timedelta(days=1)
 
     # Return as naive datetime in local time for comparison
-    # Convert ET to local time
     return screen_time.astimezone().replace(tzinfo=None)
 
 
@@ -272,7 +292,7 @@ def get_recent_warnings_errors(log_path: Path, max_lines: int = 1000, max_displa
 
 
 def connect_ib(client_id: int = 20) -> Optional[object]:
-    """Connect to IB Gateway for live prices."""
+    """Connect to IB Gateway (Synchronous)."""
     global _ib
     if _ib is not None and _ib.isConnected():
         return _ib
@@ -280,7 +300,26 @@ def connect_ib(client_id: int = 20) -> Optional[object]:
     try:
         from ib_insync import IB
         _ib = IB()
+        # Note: If called within an async loop, this might be problematic if using run().
+        # But we use simple connect() which blocks.
         _ib.connect('127.0.0.1', 4002, clientId=client_id)
+        _ib.reqMarketDataType(1)  # Live data
+        return _ib
+    except Exception as e:
+        print(f"  [Could not connect to IBKR: {e}]")
+        return None
+
+
+async def connect_ib_async(client_id: int = 20) -> Optional[object]:
+    """Connect to IB Gateway for live prices (Async)."""
+    global _ib
+    if _ib is not None and _ib.isConnected():
+        return _ib
+
+    try:
+        from ib_insync import IB
+        _ib = IB()
+        await _ib.connectAsync('127.0.0.1', 4002, clientId=client_id)
         _ib.reqMarketDataType(1)  # Live data
         return _ib
     except Exception as e:
@@ -296,30 +335,46 @@ def disconnect_ib():
         _ib = None
 
 
-def get_live_option_price(ib, symbol: str, expiry: str, strike: float, right: str) -> Optional[dict]:
-    """Get live bid/ask for an option."""
+async def get_live_option_price_async(ib, symbol: str, expiry: str, strike: float, right: str) -> Optional[dict]:
+    """Get live bid/ask for an option (Async)."""
     if ib is None:
         return None
 
     try:
         from ib_insync import Option
-        opt = Option(symbol, expiry, strike, right, 'SMART', tradingClass=symbol)
-        qualified = ib.qualifyContracts(opt)
+        import asyncio
 
-        if not qualified or not opt.conId:
-            # Try without tradingClass
+        opt = Option(symbol, expiry, strike, right, 'SMART', tradingClass=symbol)
+
+        # Async qualification
+        try:
+            qualified = await ib.qualifyContractsAsync(opt)
+            if not qualified:
+                 # Try without tradingClass
+                opt = Option(symbol, expiry, strike, right, 'SMART')
+                qualified = await ib.qualifyContractsAsync(opt)
+                if not qualified:
+                    return {'error': 'contract not found'}
+        except Exception:
+             # Try without tradingClass
             opt = Option(symbol, expiry, strike, right, 'SMART')
-            qualified = ib.qualifyContracts(opt)
-            if not qualified or not opt.conId:
-                return {'error': 'contract not found'}
+            try:
+                qualified = await ib.qualifyContractsAsync(opt)
+                if not qualified:
+                    return {'error': 'contract not found'}
+            except Exception:
+                 return {'error': 'contract qualification failed'}
+
+        if not opt.conId:
+            return {'error': 'contract not found'}
 
         ticker = ib.reqMktData(opt, '', False, False)
 
         # Wait longer for data, check incrementally
-        for _ in range(4):
-            ib.sleep(0.3)
+        for _ in range(20): # 2 seconds max
             if ticker.bid and ticker.bid > 0:
                 break
+            await asyncio.sleep(0.1)
 
         # IBKR returns -1.0 when no quote is available (market closed, no liquidity)
         # Also check for NaN (value != value)
@@ -338,8 +393,8 @@ def get_live_option_price(ib, symbol: str, expiry: str, strike: float, right: st
         return {'error': str(e)}
 
 
-def get_position_live_value(ib, trade) -> Optional[dict]:
-    """Get live value for a position."""
+async def get_position_live_value_async(ib, trade) -> Optional[dict]:
+    """Get live value for a position (Async)."""
     if ib is None or not trade.strikes or not trade.expiration:
         return {'error': 'missing trade data'}
 
@@ -349,8 +404,12 @@ def get_position_live_value(ib, trade) -> Optional[dict]:
         strike = strikes[0] if isinstance(strikes, list) else float(strikes)
         expiry = trade.expiration.replace('-', '')
 
-        call_data = get_live_option_price(ib, trade.ticker, expiry, strike, 'C')
-        put_data = get_live_option_price(ib, trade.ticker, expiry, strike, 'P')
+        # Fetch in parallel
+        import asyncio
+        call_task = asyncio.create_task(get_live_option_price_async(ib, trade.ticker, expiry, strike, 'C'))
+        put_task = asyncio.create_task(get_live_option_price_async(ib, trade.ticker, expiry, strike, 'P'))
+
+        call_data, put_data = await asyncio.gather(call_task, put_task)
 
         # Check for errors from option price fetch
         if call_data and 'error' in call_data:
@@ -399,20 +458,55 @@ def get_position_live_value(ib, trade) -> Optional[dict]:
         return {'error': str(e)}
 
 
-def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = False, compact: bool = False):
+def render_dashboard(
+    logger: TradeLogger,
+    show_all: bool = False,
+    live: bool = False,
+    compact: bool = False,
+    live_data_map: Dict[str, Any] = None
+):
     """Render the dashboard.
 
     Args:
+        logger: TradeLogger instance
+        show_all: If True, show all trades including completed
+        live: If True, indicates live mode enabled (passed for info)
         compact: If True, show condensed 1-line per position format
+        live_data_map: Optional dict mapping trade_id to live data dict
     """
     now = datetime.now()
+    live_data_map = live_data_map or {}
 
     # Market status
     market_status, market_color = get_market_status()
 
+    # Time to market open/close (PT time display)
+    now_et = datetime.now(ET)
+    now_pt = datetime.now(PT)
+
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    time_info = ""
+    if market_status == "PRE-MARKET":
+        time_info = f" | Opens {format_time_until(market_open, now_et)}"
+    elif market_status == "OPEN":
+        time_info = f" | Closes {format_time_until(market_close, now_et)}"
+    elif market_status == "CLOSED":
+        # Next open logic
+        next_open = market_open
+        if now_et >= market_close:
+            next_open += timedelta(days=1)
+        while next_open.weekday() >= 5:
+            next_open += timedelta(days=1)
+        time_info = f" | Opens {format_time_until(next_open, now_et)}"
+
+    # Get PT timezone abbreviation (WET/WEST)
+    pt_tz_name = now_pt.strftime('%Z')
+
     print(bold("=" * 120))
-    print(bold(f"  EARNINGS TRADING DASHBOARD - {now.strftime('%Y-%m-%d %H:%M:%S')}"))
-    print(f"  Market: {market_color}{market_status}{reset_color()}")
+    print(bold(f"  EARNINGS TRADING DASHBOARD - {now_pt.strftime('%Y-%m-%d %H:%M:%S')} ({pt_tz_name})"))
+    print(f"  Market: {market_color}{market_status}{reset_color()}{time_info}")
     print(bold("=" * 120))
     print()
 
@@ -432,35 +526,13 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
     print(bold("  OPEN POSITIONS"))
     print("  " + "-" * 116)
 
-    # Connect to IB if live mode
-    ib = None
-    if live:
-        ib = connect_ib()
-        if ib:
-            print("  [Connected to IBKR for live prices]")
-
-            # Cross-check DB vs IBKR positions
-            ibkr_positions = ib.positions()
-            ibkr_symbols = set(p.contract.symbol for p in ibkr_positions if p.position != 0)
-            db_symbols = set(t.ticker for t in open_trades if t.status == 'filled')
-
-            # Check for mismatches
-            in_db_not_ibkr = db_symbols - ibkr_symbols
-            in_ibkr_not_db = ibkr_symbols - db_symbols
-
-            if in_db_not_ibkr or in_ibkr_not_db:
-                print(f"  \033[93m⚠ POSITION MISMATCH: DB={len(db_symbols)} symbols, IBKR={len(ibkr_symbols)} symbols\033[0m")
-                if in_db_not_ibkr:
-                    print(f"  \033[93m  In DB but not IBKR: {', '.join(sorted(in_db_not_ibkr))}\033[0m")
-        print()
-
     total_unrealized_pnl = 0
     has_live_data = False
 
     if open_trades:
         if compact:
             # Compact format: 1 line per position
-            print(f"  {'Symbol':<6} {'Status':<8} {'Strike':<8} {'Exp':<8} {'Time':<5} {'Entry':<9} {'Curr':<9} {'P&L':<9} {'Edge':<6} {'Impl':<6} {'Sprd':<5}")
+            print(f"  {'Sym':<5} {'Status':<7} {'Strike':<7} {'Exp':<5} {'Time':<4} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5}")
             print("  " + "-" * 116)
         else:
             print(f"  {'Symbol':<8} {'Earnings':<12} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<12}")
@@ -486,8 +558,8 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
             pnl_color = reset_color()
             live_error = None
 
-            if live and ib:
-                live_data = get_position_live_value(ib, trade)
+            if live_data_map and trade.trade_id in live_data_map:
+                live_data = live_data_map[trade.trade_id]
                 if live_data:
                     if 'error' in live_data:
                         live_error = live_data['error']
@@ -516,22 +588,26 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
                 import json
                 strikes = json.loads(trade.strikes) if trade.strikes else []
                 strike_str = f"{strikes[0]:.0f}" if strikes else "?"
-                expiry_short = trade.expiration[-5:] if trade.expiration else "?"  # MM-DD
+                expiry_short = trade.expiration[5:] if trade.expiration else "?"  # MM-DD (shorter)
                 timing = (trade.earnings_timing or "?")[:3]
-                edge_str = f"{trade.edge_q75*100:.0f}%" if trade.edge_q75 else "-"
-                impl_str = f"{trade.implied_move*100:.0f}%" if trade.implied_move else "-"
+                edge_str = f"{trade.edge_q75*100:.0f}%" if trade.edge_q75 else "."
+                impl_str = f"{trade.implied_move*100:.0f}%" if trade.implied_move else "."
 
                 # Calculate spread %
-                spread_str = "-"
+                spread_str = "."
                 if trade.entry_quoted_bid and trade.entry_quoted_ask and trade.entry_quoted_mid:
                     spread = trade.entry_quoted_ask - trade.entry_quoted_bid
                     spread_pct = (spread / trade.entry_quoted_mid) * 100
                     spread_str = f"{spread_pct:.0f}%"
 
-                print(f"  {trade.ticker:<6} {status_color}{status_display:<8}{reset_color()} "
-                      f"{strike_str:<8} {expiry_short:<8} {timing:<5} "
-                      f"{entry_price_short:<9} {current_price_short:<9} {pnl_color}{pnl_str:<9}{reset_color()} "
-                      f"{edge_str:<6} {impl_str:<6} {spread_str:<5}")
+                # Truncate symbol if too long
+                sym = trade.ticker[:5]
+
+                print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
+                      f"{strike_str:<7} {expiry_short:<5} {timing:<4} "
+                      f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
+                      f"{edge_str:<5} {impl_str:<5} {spread_str:<5}")
+
 
                 # Only show errors/warnings on second line if critical
                 if trade.status == 'partial' and trade.notes:
@@ -693,6 +769,8 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
         # Fetch upcoming earnings count
         try:
             tomorrow = date.today() + timedelta(days=1)
+            # Just do a quick check, don't fail if DB locked or API down
+            # Using 3 days ahead as in original
             events = fetch_upcoming_earnings(days_ahead=3)
 
             # Count tradeable candidates (BMO tomorrow + AMC today)
@@ -709,6 +787,35 @@ def render_dashboard(logger: TradeLogger, show_all: bool = False, live: bool = F
 
     if schedule_str:
         print(f"  {schedule_str}")
+
+    # Visual timeline of earnings candidates
+    if open_trades and 'events' in locals() and events:
+        try:
+             # Sort relevant events by time
+             timeline_events = []
+             today = date.today()
+             tomorrow = today + timedelta(days=1)
+
+             for e in events:
+                 if e.earnings_date == today and e.timing == 'AMC':
+                     timeline_events.append((f"{e.symbol} (Today AMC)", 0)) # 0 = today
+                 elif e.earnings_date == tomorrow and e.timing == 'BMO':
+                     timeline_events.append((f"{e.symbol} (Tmw BMO)", 1)) # 1 = tomorrow
+
+             if timeline_events:
+                 print(dim("  " + "-" * 116))
+                 print(bold("  EARNINGS TIMELINE"))
+
+                 # Group by day
+                 today_list = [e[0] for e in timeline_events if e[1] == 0]
+                 tomorrow_list = [e[0] for e in timeline_events if e[1] == 1]
+
+                 if today_list:
+                     print(f"  Today AMC:  {', '.join(today_list[:8])}" + (f" (+{len(today_list)-8} more)" if len(today_list) > 8 else ""))
+                 if tomorrow_list:
+                     print(f"  Tmw BMO:    {', '.join(tomorrow_list[:8])}" + (f" (+{len(tomorrow_list)-8} more)" if len(tomorrow_list) > 8 else ""))
+        except:
+            pass
 
     print()
 
@@ -908,6 +1015,7 @@ def close_position_interactive(logger: TradeLogger):
         trade = open_trades[idx]
 
         # Connect to IB if needed
+        # We need a synchronous connection here
         ib = connect_ib()
         if not ib:
             print("  Could not connect to IBKR.")
@@ -1128,35 +1236,107 @@ def main():
 
     logger = TradeLogger(db_path=DB_PATH)
 
-    if args.watch:
-        try:
-            while True:
-                clear_screen()
-                render_dashboard(logger, show_all=args.all, live=args.live, compact=args.compact)
-                mode = "LIVE" if args.live else "DB only"
-                compact_str = " | COMPACT" if args.compact else ""
-                print(f"  [{mode}{compact_str} | Refreshing every {args.interval}s | c=close, r=refresh, q=quit]")
+    async def run_dashboard():
+        if args.watch:
+            try:
+                # Use cached data for flickering prevention
+                live_data_cache = {}
 
-                # Wait for interval, checking for keyboard input
-                start = time.time()
-                while time.time() - start < args.interval:
-                    key = check_keyboard_input(0.1)
-                    if key:
-                        if key.lower() == 'q':
-                            raise KeyboardInterrupt
-                        elif key.lower() == 'c':
-                            close_position_interactive(logger)
-                            break  # Refresh after closing
-                        elif key.lower() == 'r':
-                            break  # Refresh now
+                while True:
+                    # In live mode with cached data, clear screen ONLY before new render
 
-        except KeyboardInterrupt:
+                    if args.live:
+                         # 1. Fetch data (async, parallel)
+                         trades = logger.get_trades()
+                         open_trades = [t for t in trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
+
+                         new_live_data = {}
+                         if open_trades:
+                             ib = await connect_ib_async()
+                             if ib:
+                                 tasks = []
+                                 for trade in open_trades:
+                                     if trade.status not in ('filled', 'partial', 'exiting'):
+                                         continue
+                                     tasks.append((trade.trade_id, get_position_live_value_async(ib, trade)))
+
+                                 if tasks:
+                                     results = await asyncio.gather(*(t[1] for t in tasks))
+                                     for i, res in enumerate(results):
+                                         new_live_data[tasks[i][0]] = res
+
+                         # Update cache
+                         live_data_cache.update(new_live_data)
+
+                         # 3. Clear and Render
+                         clear_screen()
+                         render_dashboard(logger, show_all=args.all, live=True, compact=args.compact, live_data_map=live_data_cache)
+
+                    else:
+                        clear_screen()
+                        render_dashboard(logger, show_all=args.all, live=False, compact=args.compact)
+
+                    mode = "LIVE" if args.live else "DB only"
+                    compact_str = " | COMPACT" if args.compact else ""
+                    print(f"  [{mode}{compact_str} | Refreshing every {args.interval}s | c=close, r=refresh, q=quit]")
+
+                    # Wait for interval...
+                    start = time.time()
+                    while time.time() - start < args.interval:
+                        key = check_keyboard_input(0.1)
+                        if key:
+                            if key.lower() == 'q':
+                                raise KeyboardInterrupt
+                            elif key.lower() == 'c':
+                                close_position_interactive(logger) # This is sync but interactive
+                                break  # Refresh after closing
+                            elif key.lower() == 'r':
+                                break  # Refresh now
+                        await asyncio.sleep(0.01) # Yield to event loop if needed
+
+            except KeyboardInterrupt:
+                disconnect_ib()
+                print("\n  Dashboard closed.")
+        else:
+            if args.live:
+                # One-shot live fetch
+                ib = await connect_ib_async()
+                live_data_cache = {}
+                if ib:
+                     trades = logger.get_trades()
+                     open_trades = [t for t in trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
+                     tasks = []
+                     for trade in open_trades:
+                         if trade.status not in ('filled', 'partial', 'exiting'):
+                             continue
+                         tasks.append((trade.trade_id, get_position_live_value_async(ib, trade)))
+                     if tasks:
+                         results = await asyncio.gather(*(t[1] for t in tasks))
+                         for i, res in enumerate(results):
+                             live_data_cache[tasks[i][0]] = res
+
+                render_dashboard(logger, show_all=args.all, live=True, compact=args.compact, live_data_map=live_data_cache)
+            else:
+                render_dashboard(logger, show_all=args.all, live=False, compact=args.compact)
             disconnect_ib()
-            print("\n  Dashboard closed.")
+
+
+    if args.live or args.watch:
+        try:
+             asyncio.run(run_dashboard())
+        except KeyboardInterrupt:
+            pass
     else:
-        render_dashboard(logger, show_all=args.all, live=args.live, compact=args.compact)
-        disconnect_ib()
+        # For non-watch, non-live mode, we can run sync or async.
+        # But since we wrapped logic in run_dashboard, use it.
+        try:
+             asyncio.run(run_dashboard())
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

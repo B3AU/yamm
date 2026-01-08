@@ -335,6 +335,7 @@ async def screen_all_candidates(
 ) -> tuple[list[ScreenedCandidate], list[ScreenedCandidate]]:
     """
     Screen all earnings events (Async).
+    Uses semaphores to parallelize IBKR requests without overloading.
 
     Returns:
         (passed, rejected) - lists of candidates
@@ -348,19 +349,31 @@ async def screen_all_candidates(
     events_to_screen = events if (max_candidates is None or max_candidates <= 0) else events[:max_candidates]
     total_to_screen = len(events_to_screen)
 
-    for i, event in enumerate(events_to_screen):
+    # Use semaphore to limit concurrent IB requests (IBKR Gateway can handle ~50 concurrent)
+    # Be conservative with 10 to avoid pacing violations
+    sem = asyncio.Semaphore(10)
+
+    async def _screen_safe(event):
         if event.symbol in skip_symbols:
+            return None
+
+        async with sem:
+            logger.info(f"Screening {event.symbol}...")
+            return await screen_candidate_ibkr(
+                ib,
+                event.symbol,
+                event.earnings_date,
+                event.timing,
+                spread_threshold=spread_threshold,
+            )
+
+    # Launch all tasks
+    tasks = [_screen_safe(event) for event in events_to_screen]
+    results = await asyncio.gather(*tasks)
+
+    for candidate in results:
+        if not candidate:
             continue
-
-        logger.info(f"Screening {event.symbol} ({i+1}/{total_to_screen})")
-
-        candidate = await screen_candidate_ibkr(
-            ib,
-            event.symbol,
-            event.earnings_date,
-            event.timing,
-            spread_threshold=spread_threshold,
-        )
 
         if candidate.passes_liquidity:
             passed.append(candidate)

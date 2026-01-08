@@ -78,20 +78,23 @@ class ComboOrder:
 
 @dataclass
 class ExitComboOrder:
-    """Tracks exit combo order for a straddle position."""
+    """Tracks exit orders for a straddle position (separate call/put legs)."""
     trade_id: str
     symbol: str
     expiry: str
     strike: float
     contracts: int
 
-    order_id: Optional[int] = None
-    trade: Optional[Trade] = None
+    order_id: Optional[int] = None  # Call order ID (primary)
+    trade: Optional[Trade] = None  # Call trade (primary)
+    put_trade: Optional[Trade] = None  # Put trade (secondary)
 
     call_conId: Optional[int] = None
     put_conId: Optional[int] = None
 
-    fill_price: Optional[float] = None
+    fill_price: Optional[float] = None  # Combined fill price
+    call_fill_price: Optional[float] = None
+    put_fill_price: Optional[float] = None
     entry_fill_price: Optional[float] = None  # For P&L calculation
 
     status: str = 'pending'  # pending, filled
@@ -541,9 +544,10 @@ async def close_position(
     entry_fill_price: Optional[float] = None,
 ) -> Optional[ExitComboOrder]:
     """
-    Close an existing straddle position using a combo order.
+    Close an existing straddle position using separate leg orders.
 
-    Places a single combo sell order for both legs atomically.
+    Places individual sell orders for call and put legs to avoid
+    IBKR's "riskless combination orders" rejection.
     Returns ExitComboOrder for tracking, or None on failure.
     """
     # Create option contracts
@@ -579,45 +583,62 @@ async def close_position(
         logger.error(f"No valid bids for close")
         return None
 
-    # Calculate combined straddle limit price (for selling: below mid)
+    # Calculate limit prices for each leg (slightly below mid)
+    call_mid = (call_bid + call_ask) / 2
+    call_spread = call_ask - call_bid
+    call_limit = round(call_mid - limit_aggression * call_spread, 2)
+
+    put_mid = (put_bid + put_ask) / 2
+    put_spread = put_ask - put_bid
+    put_limit = round(put_mid - limit_aggression * put_spread, 2)
+
+    # Combined values for logging
     straddle_bid = call_bid + put_bid
     straddle_ask = call_ask + put_ask
-    straddle_mid = (straddle_bid + straddle_ask) / 2
-    straddle_spread = straddle_ask - straddle_bid
+    straddle_mid = call_mid + put_mid
+    straddle_limit = call_limit + put_limit
 
-    # For selling, go slightly below mid
-    straddle_limit = round(straddle_mid - limit_aggression * straddle_spread, 2)
-
-    # Create combo contract for exit
-    combo = _create_exit_combo(call, put)
-
-    # Place combo sell order
-    order = LimitOrder('SELL', contracts, straddle_limit)
+    # Place separate orders for each leg (avoids "riskless combination" rejection)
+    call_order = LimitOrder('SELL', contracts, call_limit)
+    put_order = LimitOrder('SELL', contracts, put_limit)
 
     try:
-        trade = ib.placeOrder(combo, order)
+        call_trade = ib.placeOrder(call, call_order)
+        put_trade = ib.placeOrder(put, put_order)
 
         # Log initial placement
         trade_logger.log_order_event(
             trade_id=trade_id,
-            ib_order_id=trade.order.orderId,
+            ib_order_id=call_trade.order.orderId,
             event='placed',
             status='PendingSubmit',
             filled=0,
             remaining=contracts,
             avg_fill_price=0.0,
-            limit_price=straddle_limit,
-            details={'type': 'exit', 'symbol': symbol}
+            limit_price=call_limit,
+            details={'type': 'exit_call', 'symbol': symbol}
+        )
+        trade_logger.log_order_event(
+            trade_id=trade_id,
+            ib_order_id=put_trade.order.orderId,
+            event='placed',
+            status='PendingSubmit',
+            filled=0,
+            remaining=contracts,
+            avg_fill_price=0.0,
+            limit_price=put_limit,
+            details={'type': 'exit_put', 'symbol': symbol}
         )
 
-        # Save exit order ID for recovery
+        # Save exit order IDs for recovery
         trade_logger.update_trade(
             trade_id,
-            exit_call_order_id=trade.order.orderId
+            exit_call_order_id=call_trade.order.orderId,
+            exit_put_order_id=put_trade.order.orderId,
         )
 
     except Exception as e:
-        logger.error(f"Exit combo order placement error: {e}")
+        logger.error(f"Exit order placement error: {e}")
         return None
 
     # Update trade log with exit info
@@ -632,24 +653,27 @@ async def close_position(
     )
 
     logger.info(
-        f"{symbol}: Placed exit COMBO order - "
-        f"{contracts}x @ ${straddle_limit:.2f} (mid: ${straddle_mid:.2f})"
+        f"{symbol}: Placed exit orders - "
+        f"{contracts}x call @ ${call_limit:.2f}, put @ ${put_limit:.2f} "
+        f"(combined: ${straddle_limit:.2f}, mid: ${straddle_mid:.2f})"
     )
 
-    # Create exit combo order for tracking
+    # Create exit order for tracking (stores both trades)
     exit_order = ExitComboOrder(
         trade_id=trade_id,
         symbol=symbol,
         expiry=expiry,
         strike=strike,
         contracts=contracts,
-        order_id=trade.order.orderId,
-        trade=trade,
+        order_id=call_trade.order.orderId,  # Primary order ID (call)
+        trade=call_trade,  # Primary trade (call) - put tracked via put_trade
         call_conId=call.conId,
         put_conId=put.conId,
         entry_fill_price=entry_fill_price,
         status='pending',
     )
+    # Store put trade for monitoring
+    exit_order.put_trade = put_trade
 
     return exit_order
 
@@ -658,9 +682,9 @@ def check_exit_fills(
     exit_orders: dict[str, ExitComboOrder],
     trade_logger: TradeLogger,
 ) -> list[ExitComboOrder]:
-    """Check status of exit combo orders and update trade logs.
+    """Check status of exit orders (separate call/put legs) and update trade logs.
 
-    Returns list of filled exit orders.
+    Returns list of fully filled exit orders (both legs filled).
     """
     filled = []
 
@@ -668,39 +692,73 @@ def check_exit_fills(
         if not exit_order.trade:
             continue
 
-        status = exit_order.trade.orderStatus.status
-        filled_qty = exit_order.trade.orderStatus.filled
-        remaining_qty = exit_order.trade.orderStatus.remaining
-        avg_fill_price = exit_order.trade.orderStatus.avgFillPrice
-        last_fill_price = exit_order.trade.orderStatus.lastFillPrice # Note: IB doesn't always populate this for combos
+        # Check call leg status
+        call_status = exit_order.trade.orderStatus.status
+        call_filled = exit_order.trade.orderStatus.filled
+        call_avg_fill = exit_order.trade.orderStatus.avgFillPrice
 
-        # Log granular event
-        prev_status = getattr(exit_order, '_last_log_status', None)
-        prev_filled = getattr(exit_order, '_last_log_filled', 0)
+        # Check put leg status
+        put_status = 'Unknown'
+        put_filled = 0
+        put_avg_fill = 0.0
+        if exit_order.put_trade:
+            put_status = exit_order.put_trade.orderStatus.status
+            put_filled = exit_order.put_trade.orderStatus.filled
+            put_avg_fill = exit_order.put_trade.orderStatus.avgFillPrice
 
-        if status != prev_status or filled_qty > prev_filled:
+        # Log call leg events
+        prev_call_status = getattr(exit_order, '_last_call_status', None)
+        prev_call_filled = getattr(exit_order, '_last_call_filled', 0)
+
+        if call_status != prev_call_status or call_filled > prev_call_filled:
             trade_logger.log_order_event(
                 trade_id=trade_id,
                 ib_order_id=exit_order.trade.order.orderId,
-                event='status_update' if filled_qty == prev_filled else 'fill',
-                status=status,
-                filled=filled_qty,
-                remaining=remaining_qty,
-                avg_fill_price=avg_fill_price,
+                event='status_update' if call_filled == prev_call_filled else 'fill',
+                status=call_status,
+                filled=call_filled,
+                remaining=exit_order.trade.orderStatus.remaining,
+                avg_fill_price=call_avg_fill,
                 limit_price=exit_order.trade.order.lmtPrice,
-                last_fill_price=last_fill_price,
-                last_fill_qty=filled_qty - prev_filled if filled_qty > prev_filled else 0,
-                details={'type': 'exit'}
+                details={'type': 'exit_call'}
             )
-            exit_order._last_log_status = status
-            exit_order._last_log_filled = filled_qty
+            exit_order._last_call_status = call_status
+            exit_order._last_call_filled = call_filled
 
-        if status == 'Filled' and exit_order.fill_price is None:
-            exit_order.fill_price = avg_fill_price
+        # Log put leg events
+        if exit_order.put_trade:
+            prev_put_status = getattr(exit_order, '_last_put_status', None)
+            prev_put_filled = getattr(exit_order, '_last_put_filled', 0)
+
+            if put_status != prev_put_status or put_filled > prev_put_filled:
+                trade_logger.log_order_event(
+                    trade_id=trade_id,
+                    ib_order_id=exit_order.put_trade.order.orderId,
+                    event='status_update' if put_filled == prev_put_filled else 'fill',
+                    status=put_status,
+                    filled=put_filled,
+                    remaining=exit_order.put_trade.orderStatus.remaining,
+                    avg_fill_price=put_avg_fill,
+                    limit_price=exit_order.put_trade.order.lmtPrice,
+                    details={'type': 'exit_put'}
+                )
+                exit_order._last_put_status = put_status
+                exit_order._last_put_filled = put_filled
+
+        # Check if both legs are filled
+        both_filled = (call_status == 'Filled' and put_status == 'Filled')
+
+        if both_filled and exit_order.fill_price is None:
+            # Store individual fill prices
+            exit_order.call_fill_price = call_avg_fill
+            exit_order.put_fill_price = put_avg_fill
+            exit_order.fill_price = call_avg_fill + put_avg_fill
             exit_order.status = 'filled'
             filled.append(exit_order)
 
-            exit_limit = exit_order.trade.order.lmtPrice
+            call_limit = exit_order.trade.order.lmtPrice
+            put_limit = exit_order.put_trade.order.lmtPrice if exit_order.put_trade else 0
+            combined_limit = call_limit + put_limit
 
             # Calculate P&L
             premium_received = exit_order.fill_price * exit_order.contracts * 100
@@ -716,7 +774,7 @@ def check_exit_fills(
                 trade_id,
                 status='exited',
                 exit_fill_price=exit_order.fill_price,
-                exit_slippage=exit_order.fill_price - exit_limit if exit_limit else None,
+                exit_slippage=exit_order.fill_price - combined_limit if combined_limit else None,
                 exit_pnl=exit_pnl,
                 exit_pnl_pct=exit_pnl_pct,
             )
@@ -724,11 +782,13 @@ def check_exit_fills(
             pnl_str = f", P&L: ${exit_pnl:.2f}" if exit_pnl else ""
             logger.info(
                 f"{exit_order.symbol}: EXIT COMPLETE - "
-                f"Fill: ${exit_order.fill_price:.2f}{pnl_str}"
+                f"Call: ${call_avg_fill:.2f}, Put: ${put_avg_fill:.2f}, "
+                f"Combined: ${exit_order.fill_price:.2f}{pnl_str}"
             )
 
-        elif status in ('Cancelled', 'Inactive'):
+        # Handle cancellations
+        elif call_status in ('Cancelled', 'Inactive') or put_status in ('Cancelled', 'Inactive'):
             exit_order.status = 'cancelled'
-            logger.warning(f"{exit_order.symbol}: Exit order cancelled/inactive")
+            logger.warning(f"{exit_order.symbol}: Exit order cancelled/inactive (call={call_status}, put={put_status})")
 
     return filled

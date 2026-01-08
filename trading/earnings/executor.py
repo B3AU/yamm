@@ -207,6 +207,7 @@ class Phase0Executor:
             implied_move=candidate.implied_move_pct / 100,
             spot_at_entry=candidate.spot_price,
             status='pending',
+            news_count=candidate.news_count,
         )
         self.logger.log_trade(trade_log)
 
@@ -471,7 +472,10 @@ class Phase0Executor:
                 import json
                 strikes = json.loads(trade.strikes) if trade.strikes else []
                 strike = strikes[0] if strikes else 0.0
-            except (json.JSONDecodeError, IndexError):
+                if strike <= 0:
+                    logger.warning(f"{trade.ticker}: No valid strike in DB record: {trade.strikes}")
+            except (json.JSONDecodeError, IndexError) as e:
+                logger.warning(f"{trade.ticker}: Failed to parse strikes from DB: {trade.strikes} - {e}")
                 strike = 0.0
 
             if not ib_trade:

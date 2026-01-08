@@ -49,6 +49,7 @@ class EdgePrediction:
     hist_move_mean: float
     edge_q75: float  # pred_q75 - hist_move_mean
     edge_q90: float  # pred_q90 - hist_move_mean
+    news_count: int = 0  # number of FMP news articles found
 
 
 class EarningsPredictor:
@@ -617,7 +618,7 @@ class EarningsPredictor:
         return result
 
     def _compute_news_features(self, symbol: str, earnings_date: date) -> dict:
-        """Compute news PCA features. Live first, parquet fallback."""
+        """Compute news PCA features from live FMP data only (no stale parquet fallback)."""
         defaults = {'pre_earnings_news_count': 0}
         for i in range(10):
             defaults[f'news_pca_{i}'] = 0.0
@@ -625,46 +626,14 @@ class EarningsPredictor:
         if self.news_pca is None:
             return defaults
 
-        # Try live FMP first
+        # Try live FMP only (no parquet fallback - stale data not useful)
         live_result = self._fetch_news_features(symbol, earnings_date, lookback_days=7)
         if live_result['pre_earnings_news_count'] > 0:
             return live_result
 
-        # Fallback to parquet
-        logger.warning(f"{symbol}: FMP news fetch returned no articles, using parquet fallback")
-        news_embeddings = self._get_news_embeddings_fallback()
-        if news_embeddings is None:
-            return defaults
-
-        lookback_days = 7
-        earn_dt = pd.Timestamp(earnings_date)
-        start_dt = earn_dt - timedelta(days=lookback_days)
-        end_dt = earn_dt - timedelta(days=1)
-
-        symbol_news = news_embeddings[
-            (news_embeddings['symbol'] == symbol) &
-            (news_embeddings['trading_date'] >= start_dt) &
-            (news_embeddings['trading_date'] <= end_dt)
-        ]
-
-        if len(symbol_news) == 0:
-            return defaults
-
-        result = {'pre_earnings_news_count': len(symbol_news)}
-
-        # Get embedding columns and compute mean
-        emb_cols = [c for c in symbol_news.columns if c.startswith('emb_')]
-        if not emb_cols:
-            return defaults
-
-        mean_emb = symbol_news[emb_cols].mean().values.reshape(1, -1)
-
-        # Apply PCA
-        pca_features = self.news_pca.transform(mean_emb)[0]
-        for i, val in enumerate(pca_features):
-            result[f'news_pca_{i}'] = float(val)
-
-        return result
+        # No news available - use zero features
+        logger.info(f"{symbol}: No FMP news available, using zero features")
+        return defaults
 
     def compute_features(
         self,
@@ -758,6 +727,7 @@ class EarningsPredictor:
 
         # Compute edge
         hist_move_mean = features.get('hist_move_mean', 0.0)
+        news_count = int(features.get('pre_earnings_news_count', 0))
 
         return EdgePrediction(
             symbol=symbol,
@@ -768,6 +738,7 @@ class EarningsPredictor:
             hist_move_mean=hist_move_mean,
             edge_q75=predictions.get(0.75, 0.0) - hist_move_mean,
             edge_q90=predictions.get(0.90, 0.0) - hist_move_mean,
+            news_count=news_count,
         )
 
     def get_prediction_status(
@@ -843,3 +814,14 @@ def get_predictor() -> EarningsPredictor:
             if _predictor is None:
                 _predictor = EarningsPredictor()
     return _predictor
+
+
+def reset_predictor() -> None:
+    """Reset the singleton predictor instance.
+
+    Use this to recover from corrupted state or to force model reload.
+    """
+    global _predictor
+    with _predictor_lock:
+        _predictor = None
+        logger.info("Predictor singleton reset - will reload on next get_predictor() call")

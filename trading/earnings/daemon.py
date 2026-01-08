@@ -66,6 +66,11 @@ load_dotenv(PROJECT_ROOT / '.env')
 # Timezone
 ET = pytz.timezone('US/Eastern')
 
+
+def today_et() -> date:
+    """Get today's date in Eastern Time."""
+    return datetime.now(ET).date()
+
 # Check if paper trading mode
 PAPER_MODE = os.getenv('PAPER_MODE', 'true').lower() == 'true'
 
@@ -268,7 +273,7 @@ class TradingDaemon:
             events = await loop.run_in_executor(None, lambda: fetch_upcoming_earnings(days_ahead=3))
 
             # Filter to events happening tomorrow or day after
-            tomorrow = date.today() + timedelta(days=1)
+            tomorrow = today_et() + timedelta(days=1)
 
             # For BMO earnings, we enter day before (today for tomorrow's BMO)
             # For AMC earnings, we enter same day (today for today's AMC)
@@ -276,7 +281,7 @@ class TradingDaemon:
             for e in events:
                 if e.earnings_date == tomorrow and e.timing == 'BMO':
                     relevant_events.append(e)  # Enter today for tomorrow BMO
-                elif e.earnings_date == date.today() and e.timing == 'AMC':
+                elif e.earnings_date == today_et() and e.timing == 'AMC':
                     relevant_events.append(e)  # Enter today for today AMC
 
             logger.info(f"Found {len(relevant_events)} earnings events to consider")
@@ -332,6 +337,7 @@ class TradingDaemon:
                     candidate.pred_q75 = prediction.pred_q75
                     candidate.hist_move_mean = prediction.hist_move_mean
                     candidate.edge_q75 = prediction.edge_q75
+                    candidate.news_count = prediction.news_count
 
                     if prediction.edge_q75 >= edge_threshold:
                         candidate.passes_edge = True
@@ -540,6 +546,8 @@ class TradingDaemon:
 
     async def _fetch_straddle_price(self, symbol: str, expiry: str, strike: float) -> Optional[float]:
         """Fetch current mid price for a straddle (Async)."""
+        call = None
+        put = None
         try:
             from ib_insync import Option
 
@@ -567,9 +575,6 @@ class TradingDaemon:
             call_mid = get_mid(call_ticker)
             put_mid = get_mid(put_ticker)
 
-            self.ib.cancelMktData(call)
-            self.ib.cancelMktData(put)
-
             if call_mid is not None and put_mid is not None:
                 return call_mid + put_mid
 
@@ -578,6 +583,18 @@ class TradingDaemon:
         except Exception as e:
             logger.error(f"Error fetching straddle price for {symbol}: {e}")
             return None
+        finally:
+            # Always cancel market data subscriptions to prevent leaks
+            if call is not None:
+                try:
+                    self.ib.cancelMktData(call)
+                except Exception:
+                    pass
+            if put is not None:
+                try:
+                    self.ib.cancelMktData(put)
+                except Exception:
+                    pass
 
     async def task_improve_prices(self, aggression: float = 0.5):
         """Walk up limit prices (Async)."""
@@ -754,7 +771,7 @@ class TradingDaemon:
         trades = filled_trades + partial_trades
 
         self.positions_to_exit = []
-        yesterday = date.today() - timedelta(days=1)
+        yesterday = today_et() - timedelta(days=1)
 
         for trade in trades:
             try:
@@ -806,7 +823,7 @@ class TradingDaemon:
     def _load_todays_activity(self):
         """Load trades placed today to prevent duplicates on restart."""
         self.todays_trades = []
-        today_str = date.today().isoformat()
+        today_str = today_et().isoformat()
 
         # Get all trades from today
         try:
@@ -1010,25 +1027,35 @@ class TradingDaemon:
         logger.info("Starting daily counterfactual backfill...")
         try:
             # Backfill for today (handles BMO earnings today)
-            stats_today = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, date.today())
+            stats_today = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, today_et())
             logger.info(f"Backfill (Today): {stats_today}")
 
             # Backfill for yesterday (handles AMC earnings yesterday which exit today)
-            yesterday = date.today() - timedelta(days=1)
+            yesterday = today_et() - timedelta(days=1)
             stats_yesterday = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, yesterday)
             logger.info(f"Backfill (Yesterday): {stats_yesterday}")
 
         except Exception as e:
             logger.exception(f"Backfill task failed: {e}")
 
+    def _handle_signal(self):
+        """Signal handler that safely triggers shutdown."""
+        async def safe_shutdown():
+            try:
+                await self.shutdown()
+            except Exception as e:
+                logger.exception(f"Error during shutdown: {e}")
+                asyncio.get_running_loop().stop()
+        asyncio.create_task(safe_shutdown())
+
     async def run_async(self):
         """Async entry point."""
         logger.info("DAEMON STARTING (Async)...")
 
-        # Setup signals
+        # Setup signals with safe handler
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+            loop.add_signal_handler(sig, self._handle_signal)
 
         self.setup_schedule()
 

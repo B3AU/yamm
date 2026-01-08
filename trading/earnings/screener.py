@@ -71,6 +71,7 @@ class ScreenedCandidate:
     pred_q75: Optional[float] = None
     hist_move_mean: Optional[float] = None
     edge_q75: Optional[float] = None
+    news_count: Optional[int] = None  # number of FMP news articles found
 
     # Why it passed/failed
     passes_liquidity: bool = False

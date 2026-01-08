@@ -94,6 +94,38 @@ class TradeLog:
     counterfactual_exit_open_pnl: Optional[float] = None  # if exited at next open
     counterfactual_strangle_pnl: Optional[float] = None  # if used strangle instead
 
+    # News data tracking
+    news_count: Optional[int] = None  # number of FMP news articles found
+
+
+# Allowed column names for SQL updates (security: prevent injection via **kwargs)
+TRADE_COLUMNS = {
+    'trade_id', 'ticker', 'earnings_date', 'earnings_timing',
+    'entry_datetime', 'entry_quoted_bid', 'entry_quoted_ask', 'entry_quoted_mid',
+    'entry_limit_price', 'entry_combo_bid', 'entry_combo_ask', 'entry_fill_price',
+    'entry_fill_time', 'entry_slippage', 'decision_latency_ms', 'fill_latency_seconds',
+    'spread_at_fill', 'markout_1min', 'markout_5min', 'markout_30min',
+    'structure', 'strikes', 'expiration', 'contracts', 'premium_paid', 'max_loss',
+    'predicted_q50', 'predicted_q75', 'predicted_q90', 'predicted_q95',
+    'implied_move', 'edge_q75', 'edge_q90',
+    'exit_datetime', 'exit_quoted_bid', 'exit_quoted_ask', 'exit_quoted_mid',
+    'exit_limit_price', 'exit_fill_price', 'exit_slippage',
+    'exit_pnl', 'exit_pnl_pct', 'realized_move', 'realized_move_pct',
+    'spot_at_entry', 'spot_at_exit', 'status', 'notes',
+    'call_order_id', 'put_order_id', 'exit_call_order_id', 'exit_put_order_id',
+    'counterfactual_exit_open_pnl', 'counterfactual_strangle_pnl',
+    'news_count', 'updated_at',
+}
+
+NON_TRADE_COLUMNS = {
+    'log_id', 'ticker', 'earnings_date', 'earnings_timing', 'log_datetime',
+    'rejection_reason', 'quoted_bid', 'quoted_ask', 'quoted_spread_pct',
+    'quoted_oi', 'spot_price', 'implied_move', 'straddle_premium',
+    'predicted_q75', 'predicted_edge',
+    'counterfactual_realized_move', 'counterfactual_pnl', 'counterfactual_pnl_with_spread',
+    'notes',
+}
+
 
 @dataclass
 class NonTradeLog:
@@ -251,6 +283,12 @@ class TradeLogger:
                 except sqlite3.OperationalError:
                     pass
 
+            # Add news_count column to track trades with/without news data (migration)
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN news_count INTEGER")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
             # Non-trades table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS non_trades (
@@ -331,6 +369,11 @@ class TradeLogger:
         if not updates:
             return False
 
+        # Validate column names against whitelist (security)
+        invalid_cols = set(updates.keys()) - TRADE_COLUMNS
+        if invalid_cols:
+            raise ValueError(f"Invalid column names for trades: {invalid_cols}")
+
         updates["updated_at"] = datetime.now().isoformat()
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
 
@@ -359,6 +402,11 @@ class TradeLogger:
         """Update specific fields of a non-trade record."""
         if not updates:
             return False
+
+        # Validate column names against whitelist (security)
+        invalid_cols = set(updates.keys()) - NON_TRADE_COLUMNS
+        if invalid_cols:
+            raise ValueError(f"Invalid column names for non_trades: {invalid_cols}")
 
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
 

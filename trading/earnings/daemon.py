@@ -808,12 +808,12 @@ class TradingDaemon:
         # Get all trades from today
         try:
             import sqlite3
-            conn = sqlite3.connect(CONFIG['db_path'])
-            c = conn.cursor()
-            c.execute("SELECT trade_id, ticker FROM trades WHERE entry_datetime LIKE ?", (f"{today_str}%",))
-            rows = c.fetchall()
-            for tid, ticker in rows:
-                self.todays_trades.append(tid)
+            with sqlite3.connect(CONFIG['db_path']) as conn:
+                c = conn.cursor()
+                c.execute("SELECT trade_id, ticker FROM trades WHERE entry_datetime LIKE ?", (f"{today_str}%",))
+                rows = c.fetchall()
+                for tid, ticker in rows:
+                    self.todays_trades.append(tid)
 
             if rows:
                 logger.info(f"Loaded {len(rows)} trades placed today")

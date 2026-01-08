@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -156,6 +157,23 @@ class EarningsPredictor:
     # Live FMP data fetching
     # =========================================================================
 
+    def _make_request(self, url: str, timeout: int = 10) -> Optional[requests.Response]:
+        """Make HTTP request with rate limit retry (429)."""
+        for attempt in range(1, 4):
+            try:
+                r = requests.get(url, timeout=timeout)
+                if r.status_code == 429:
+                    wait = 2 ** attempt
+                    logger.debug(f"Rate limit hit (429), waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+                return r
+            except requests.RequestException:
+                if attempt == 3:
+                    return None  # Or let caller handle
+                time.sleep(1)
+        return None
+
     def _fetch_historical_earnings_moves(self, symbol: str, earnings_date: date) -> Optional[dict]:
         """Fetch historical earnings moves from FMP.
 
@@ -168,8 +186,8 @@ class EarningsPredictor:
         try:
             # Get historical earnings dates
             url = f"https://financialmodelingprep.com/stable/earnings?symbol={symbol}&apikey={FMP_API_KEY}"
-            r = requests.get(url, timeout=10)
-            if r.status_code != 200:
+            r = self._make_request(url)
+            if not r or r.status_code != 200:
                 return None
 
             earnings_data = r.json()
@@ -189,8 +207,8 @@ class EarningsPredictor:
             # Get historical prices to compute moves
             # Need prices around each earnings date
             price_url = f"https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted?symbol={symbol}&apikey={FMP_API_KEY}"
-            r = requests.get(price_url, timeout=10)
-            if r.status_code != 200:
+            r = self._make_request(price_url)
+            if not r or r.status_code != 200:
                 return None
 
             price_data = r.json()
@@ -270,8 +288,8 @@ class EarningsPredictor:
                 f"https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted"
                 f"?symbol={symbol}&from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
             )
-            r = requests.get(url, timeout=10)
-            if r.status_code != 200:
+            r = self._make_request(url)
+            if not r or r.status_code != 200:
                 return None
 
             data = r.json()
@@ -328,9 +346,9 @@ class EarningsPredictor:
             """Fetch from endpoint and extract point-in-time values."""
             try:
                 url = f"https://financialmodelingprep.com/stable/{endpoint}?symbol={symbol}&apikey={FMP_API_KEY}"
-                r = requests.get(url, timeout=10)
+                r = self._make_request(url)
 
-                if r.status_code != 200:
+                if not r or r.status_code != 200:
                     return {}
 
                 data = r.json()
@@ -398,9 +416,9 @@ class EarningsPredictor:
 
         try:
             url = f"https://financialmodelingprep.com/stable/earnings?symbol={symbol}&apikey={FMP_API_KEY}"
-            r = requests.get(url, timeout=10)
+            r = self._make_request(url)
 
-            if r.status_code != 200:
+            if not r or r.status_code != 200:
                 return defaults
 
             data = r.json()
@@ -803,13 +821,19 @@ class EarningsPredictor:
         return passed
 
 
-# Singleton instance
+import threading
+
+# Singleton instance and lock
 _predictor: Optional[EarningsPredictor] = None
+_predictor_lock = threading.Lock()
 
 
 def get_predictor() -> EarningsPredictor:
     """Get or create the singleton predictor instance."""
     global _predictor
     if _predictor is None:
-        _predictor = EarningsPredictor()
+        with _predictor_lock:
+            # Double-checked locking
+            if _predictor is None:
+                _predictor = EarningsPredictor()
     return _predictor

@@ -741,7 +741,15 @@ class TradingDaemon:
 
     def _load_positions_to_exit(self):
         """Load positions to exit."""
-        trades = self.trade_logger.get_trades(status='filled')
+        # Check both filled and partial trades
+        filled_trades = self.trade_logger.get_trades(status='filled')
+        try:
+            partial_trades = self.trade_logger.get_trades(status='partial')
+        except Exception:
+            partial_trades = []
+
+        trades = filled_trades + partial_trades
+
         self.positions_to_exit = []
         yesterday = date.today() - timedelta(days=1)
 
@@ -763,13 +771,30 @@ class TradingDaemon:
                 except Exception as e:
                     logger.error(f"Error parsing strikes for {trade.ticker}: {e}")
 
+                contracts = trade.contracts
+                entry_fill_price = trade.entry_fill_price
+
+                # For partials, we need to find actual filled quantity
+                if trade.status == 'partial':
+                    try:
+                        last_event = self.trade_logger.get_latest_order_event(trade.trade_id)
+                        if last_event and last_event.get('filled'):
+                            contracts = int(last_event['filled'])
+                            logger.info(f"{trade.ticker}: Resuming PARTIAL position - exiting {contracts} contracts (of {trade.contracts} planned)")
+                        else:
+                            logger.warning(f"{trade.ticker}: Partial status but no fill info - skipping exit for safety")
+                            continue
+                    except Exception as e:
+                        logger.error(f"{trade.ticker}: Error checking partial fills: {e}")
+                        continue
+
                 self.positions_to_exit.append({
                     'trade_id': trade.trade_id,
                     'symbol': trade.ticker,
                     'expiry': trade.expiration,
                     'strike': strike,
-                    'contracts': trade.contracts,
-                    'entry_fill_price': trade.entry_fill_price,
+                    'contracts': contracts,
+                    'entry_fill_price': entry_fill_price,
                 })
 
         if self.positions_to_exit:
@@ -981,9 +1006,15 @@ class TradingDaemon:
         """Async wrapper for synchronous backfill task."""
         logger.info("Starting daily counterfactual backfill...")
         try:
-            # Use to_thread for clean async execution of sync function
-            stats = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, date.today())
-            logger.info(f"Backfill complete: {stats}")
+            # Backfill for today (handles BMO earnings today)
+            stats_today = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, date.today())
+            logger.info(f"Backfill (Today): {stats_today}")
+
+            # Backfill for yesterday (handles AMC earnings yesterday which exit today)
+            yesterday = date.today() - timedelta(days=1)
+            stats_yesterday = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, yesterday)
+            logger.info(f"Backfill (Yesterday): {stats_yesterday}")
+
         except Exception as e:
             logger.exception(f"Backfill task failed: {e}")
 

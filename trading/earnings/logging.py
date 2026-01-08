@@ -283,6 +283,27 @@ class TradeLogger:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+            # Order events table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS order_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id TEXT NOT NULL,
+                    ib_order_id INTEGER,
+                    ts TEXT,
+                    event TEXT,
+                    status TEXT,
+                    filled REAL,
+                    remaining REAL,
+                    avg_fill_price REAL,
+                    last_fill_price REAL,
+                    last_fill_qty REAL,
+                    limit_price REAL,
+                    details TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_order_events_trade_id ON order_events(trade_id)")
+
             # Indexes for common queries
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(earnings_date)")
@@ -380,6 +401,18 @@ class TradeLogger:
                 last_fill_price, last_fill_qty, limit_price, details_json
             ))
             conn.commit()
+
+    def get_latest_order_event(self, trade_id: str) -> Optional[dict]:
+        """Get the latest order event for a trade."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM order_events WHERE trade_id = ? ORDER BY event_id DESC LIMIT 1",
+                (trade_id,)
+            ).fetchone()
+            if row:
+                return dict(row)
+        return None
 
     def get_non_trades_pending_counterfactual(
         self,

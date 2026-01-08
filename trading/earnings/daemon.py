@@ -5,12 +5,14 @@ Automated earnings volatility trading with scheduled execution.
 
 Schedule (all times ET):
 - 09:25: Connect to IB Gateway, load positions to exit
-- 14:45: Exit positions from previous day
-- 14:00: Screen upcoming earnings AND place new orders
-- 15:50: Final fill check, cancel unfilled orders
+- 14:00: Exit positions from previous day (free up capital first)
+- 14:15: Screen upcoming earnings AND place new orders
+- 14:25-14:55: Price improvements (every 10 min)
+- 15:55: Final fill check
+- 15:58: Cancel unfilled orders
 - 16:05: Disconnect (after market close)
 
-Exit positions are handled the next trading day at 14:45.
+Exit positions are handled the next trading day at 14:00.
 
 Usage:
     python -m trading.earnings.daemon
@@ -23,6 +25,7 @@ import signal
 import logging
 import asyncio
 from datetime import datetime, date, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -945,16 +948,16 @@ class TradingDaemon:
 
         self.scheduler.add_job(
             self.task_exit_positions,
-            CronTrigger(day_of_week='mon-fri', hour=14, minute=45, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=14, minute=0, timezone=ET),
             id='exit_positions',
-            name='Exit Positions (14:45 ET)',
+            name='Exit Positions (14:00 ET)',
         )
 
         self.scheduler.add_job(
             self.task_screen_candidates,
-            CronTrigger(day_of_week='mon-fri', hour=14, minute=0, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=14, minute=15, timezone=ET),
             id='screen_and_place',
-            name='Screen & Place Orders (14:00 ET)',
+            name='Screen & Place Orders (14:15 ET)',
         )
 
         self.scheduler.add_job(
@@ -964,13 +967,13 @@ class TradingDaemon:
             name='Monitor Fills (Every min)',
         )
 
-        # Price improvements 14:10 - 14:40
-        for m, agg in [(10, 0.4), (20, 0.5), (30, 0.6), (40, 0.7)]:
+        # Price improvements 14:25 - 14:55 (after 14:15 order placement)
+        for m, agg in [(25, 0.4), (35, 0.5), (45, 0.6), (55, 0.7)]:
             self.scheduler.add_job(
-                lambda a=agg: asyncio.create_task(self.task_improve_prices(a)),
+                partial(self.task_improve_prices, agg),
                 CronTrigger(day_of_week='mon-fri', hour=14, minute=m, timezone=ET),
                 id=f'improve_{m}',
-                name=f'Price Improvement (14:{m} ET)',
+                name=f'Price Improvement (14:{m:02d} ET)',
             )
 
         self.scheduler.add_job(

@@ -11,6 +11,7 @@ of both legs, eliminating orphan leg risk.
 from __future__ import annotations
 
 import logging
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -112,7 +113,7 @@ class Phase0Executor:
 
         return combo
 
-    def place_straddle(
+    async def place_straddle(
         self,
         candidate: ScreenedCandidate,
         contracts: int = None,
@@ -157,7 +158,7 @@ class Phase0Executor:
         )
 
         try:
-            qualified = self.ib.qualifyContracts(call, put)
+            qualified = await self.ib.qualifyContractsAsync(call, put)
             if len(qualified) < 2:
                 logger.error(f"{candidate.symbol}: Could not qualify options for order")
                 return None
@@ -262,7 +263,7 @@ class Phase0Executor:
                     entry_fill_price=combo_order.fill_price,
                     entry_fill_time=datetime.now().isoformat(),
                     entry_slippage=combo_order.fill_price - combo_order.trade.order.lmtPrice,
-                    premium_paid=combo_order.fill_price * self.max_contracts * 100,
+                    premium_paid=combo_order.fill_price * filled_qty * 100,  # Use actual filled quantity
                 )
 
             elif status in ('Cancelled', 'Inactive'):
@@ -498,7 +499,7 @@ def _create_exit_combo(
     return combo
 
 
-def close_position(
+async def close_position(
     ib: IB,
     trade_logger: TradeLogger,
     trade_id: str,
@@ -520,7 +521,7 @@ def close_position(
     put = Option(symbol, expiry, strike, 'P', 'SMART', tradingClass=symbol)
 
     try:
-        ib.qualifyContracts(call, put)
+        await ib.qualifyContractsAsync(call, put)
     except Exception as e:
         logger.error(f"Could not qualify options for close: {e}")
         return None
@@ -528,7 +529,13 @@ def close_position(
     # Get current quotes
     call_ticker = ib.reqMktData(call, '', False, False)
     put_ticker = ib.reqMktData(put, '', False, False)
-    ib.sleep(2)
+
+    # Wait for data (up to 2s)
+    for _ in range(20):
+        if (call_ticker.bid > 0 and call_ticker.ask > 0 and
+            put_ticker.bid > 0 and put_ticker.ask > 0):
+            break
+        await asyncio.sleep(0.1)
 
     call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
     call_ask = call_ticker.ask if call_ticker.ask == call_ticker.ask else 0

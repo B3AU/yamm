@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""Phase 0 Trading Daemon
+"""Phase 0 Trading Daemon (Async)
 
 Automated earnings volatility trading with scheduled execution.
 
 Schedule (all times ET):
 - 09:25: Connect to IB Gateway, load positions to exit
 - 14:45: Exit positions from previous day
-- 15:00: Screen upcoming earnings AND place new orders
+- 14:00: Screen upcoming earnings AND place new orders
 - 15:50: Final fill check, cancel unfilled orders
 - 16:05: Disconnect (after market close)
 
-Exit positions are handled the next trading day at 15:45.
+Exit positions are handled the next trading day at 14:45.
 
 Usage:
     python -m trading.earnings.daemon
-
-Or via systemd:
-    systemctl start yamm-trading
 """
 from __future__ import annotations
 
@@ -24,12 +21,12 @@ import os
 import sys
 import signal
 import logging
+import asyncio
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
-import time
 
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 import pytz
@@ -37,6 +34,14 @@ import pytz
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Use nest_asyncio to allow nested loops if needed (e.g. ib.run inside async)
+# But we aim for pure async.
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass
 
 from ib_insync import IB
 
@@ -61,7 +66,7 @@ ET = pytz.timezone('US/Eastern')
 # Check if paper trading mode
 PAPER_MODE = os.getenv('PAPER_MODE', 'true').lower() == 'true'
 
-# Configuration - use paper or live parameters based on mode
+# Configuration
 CONFIG = {
     'ib_host': os.getenv('IB_HOST', '127.0.0.1'),
     'ib_port': int(os.getenv('IB_PORT', '4002')),  # Paper trading port
@@ -103,19 +108,24 @@ def setup_logging():
             logging.StreamHandler(),
         ]
     )
+    # Silence ib_insync noise
+    logging.getLogger('ib_insync').setLevel(logging.WARNING)
     return logging.getLogger('earnings_daemon')
 
 logger = setup_logging()
 
 
 class TradingDaemon:
-    """Main trading daemon."""
+    """Main trading daemon (Async)."""
 
     def __init__(self):
-        self.ib: Optional[IB] = None
+        self.ib = IB()
         self.trade_logger = TradeLogger(db_path=CONFIG['db_path'])
+
+        # Async scheduler with ET timezone
+        self.scheduler = AsyncIOScheduler(timezone=ET)
+
         self.executor: Optional[Phase0Executor] = None
-        self.scheduler = BackgroundScheduler(timezone=ET)
 
         # ML predictor
         self.predictor: Optional[EarningsPredictor] = None
@@ -129,24 +139,23 @@ class TradingDaemon:
         # Track connection state
         self.connected = False
 
-    def connect(self):
-        """Connect to IB Gateway."""
-        if self.ib and self.ib.isConnected():
+    async def connect_async(self):
+        """Connect to IB Gateway asynchronously."""
+        if self.ib.isConnected():
             logger.info("Already connected to IB")
             return True
 
         logger.info(f"Connecting to IB Gateway at {CONFIG['ib_host']}:{CONFIG['ib_port']}...")
 
         try:
-            self.ib = IB()
-            self.ib.connect(
+            # Use connectAsync
+            await self.ib.connectAsync(
                 CONFIG['ib_host'],
                 CONFIG['ib_port'],
                 clientId=CONFIG['ib_client_id'],
             )
 
             # Request LIVE market data (1 = live, 3 = delayed)
-            # Must have IBKR market data subscription for live quotes
             self.ib.reqMarketDataType(1)
             logger.info("Requested LIVE market data (type 1)")
 
@@ -160,8 +169,8 @@ class TradingDaemon:
             self.connected = True
             logger.info("Connected to IB Gateway")
 
-            # Log extensive account info
-            self._log_account_summary()
+            # Log account info (runs async methods internally)
+            await self._log_account_summary()
 
             return True
 
@@ -172,33 +181,44 @@ class TradingDaemon:
 
     def disconnect(self):
         """Disconnect from IB Gateway."""
-        if self.ib and self.ib.isConnected():
+        if self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IB Gateway")
         self.connected = False
-        self.ib = None
         self.executor = None
 
-    def ensure_connected(self) -> bool:
+    async def ensure_connected(self) -> bool:
         """Ensure IB connection is alive, reconnect if needed."""
-        if self.ib and self.ib.isConnected():
+        if self.ib.isConnected():
             return True
 
-        logger.warning("IB connection lost, reconnecting...")
-        return self.connect()
+        logger.warning("IB connection lost, reconnecting with linear backoff...")
 
-    # ==================== Scheduled Tasks ====================
+        # Simple linear backoff: 3 attempts with 2s delay
+        for attempt in range(1, 4):
+            logger.info(f"Reconnection attempt {attempt}/3...")
+            if await self.connect_async():
+                return True
+            await asyncio.sleep(2)
 
-    def task_morning_connect(self):
-        """9:25 AM - Connect before market open."""
+        logger.error("Failed to reconnect after 3 attempts")
+        return False
+
+    # ==================== Scheduled Tasks (Async) ====================
+
+    async def task_morning_connect(self):
+        """9:25 AM ET - Connect before market open."""
         logger.info("=== MORNING CONNECT ===")
 
         # Reset daily state
         self.todays_candidates = []
         self.todays_trades = []
 
-        # Cleanup stale orders from previous days (prevents orphan trades)
+        # Cleanup stale orders
         self._cleanup_stale_orders()
+
+        # Load any trades already placed today (to prevent duplicates on restart)
+        self._load_todays_activity()
 
         # Load ML predictor
         try:
@@ -211,24 +231,33 @@ class TradingDaemon:
         # Load positions that need to be exited today
         self._load_positions_to_exit()
 
-        if not self.connect():
-            logger.error("Morning connect failed - will retry at screening time")
+        await self.connect_async()
 
-    def task_screen_candidates(self):
-        """3:00 PM - Screen upcoming earnings."""
+    async def task_screen_candidates(self):
+        """2:00 PM ET - Screen upcoming earnings."""
         logger.info("=== SCREENING CANDIDATES ===")
 
-        if not self.ensure_connected():
+        if not await self.ensure_connected():
             logger.error("Cannot screen - not connected")
             return
 
         try:
+            # Check if we already traded today (duplicate check)
+            self._load_todays_activity()
+            already_placed = len(self.todays_trades)
+            remaining_slots = max(0, CONFIG['max_daily_trades'] - already_placed)
+
+            if remaining_slots <= 0:
+                logger.info(f"Daily trade limit reached ({already_placed} placed). Skipping screening.")
+                return
+
             # Fetch earnings for tomorrow (T+1)
-            events = fetch_upcoming_earnings(days_ahead=3)
+            # Nasdaq API call is sync, run in executor to not block loop
+            loop = asyncio.get_event_loop()
+            events = await loop.run_in_executor(None, lambda: fetch_upcoming_earnings(days_ahead=3))
 
             # Filter to events happening tomorrow or day after
             tomorrow = date.today() + timedelta(days=1)
-            day_after = date.today() + timedelta(days=2)
 
             # For BMO earnings, we enter day before (today for tomorrow's BMO)
             # For AMC earnings, we enter same day (today for today's AMC)
@@ -245,8 +274,8 @@ class TradingDaemon:
                 logger.info("No earnings events requiring entry today")
                 return
 
-            # Screen candidates
-            passed, rejected = screen_all_candidates(
+            # Screen candidates (Async)
+            passed, rejected = await screen_all_candidates(
                 self.ib,
                 relevant_events,
                 spread_threshold=CONFIG['spread_threshold'],
@@ -255,16 +284,15 @@ class TradingDaemon:
 
             logger.info(f"Liquidity screening: {len(passed)} passed, {len(rejected)} rejected")
 
-            # Log rejected candidates (liquidity fails)
+            # Log rejected candidates
             for candidate in rejected:
                 self.executor.log_non_trade(candidate)
 
             # Apply ML edge filter
-            # Load predictor if not already loaded (handles daemon restarts)
             if not self.predictor:
+                # Try reload
                 try:
                     self.predictor = get_predictor()
-                    logger.info(f"ML predictor loaded on demand: {len(self.predictor.models)} models")
                 except Exception as e:
                     logger.error(f"Failed to load ML predictor: {e}")
 
@@ -281,7 +309,6 @@ class TradingDaemon:
                     )
 
                     if prediction is None:
-                        # Get detailed reason why prediction failed
                         status = self.predictor.get_prediction_status(
                             candidate.symbol, candidate.earnings_date
                         )
@@ -290,7 +317,7 @@ class TradingDaemon:
                         self.executor.log_non_trade(candidate)
                         continue
 
-                    # Add ML fields to candidate
+                    # Add ML fields
                     candidate.pred_q75 = prediction.pred_q75
                     candidate.hist_move_mean = prediction.hist_move_mean
                     candidate.edge_q75 = prediction.edge_q75
@@ -314,14 +341,10 @@ class TradingDaemon:
             else:
                 logger.warning("ML predictor not available - using liquidity-only screening")
 
-            # Apply max daily trades limit (accounting for already placed orders)
-            already_placed = len(self.todays_trades)
-            remaining_slots = max(0, CONFIG['max_daily_trades'] - already_placed)
-
+            # Limits again (in case changed)
             if already_placed > 0:
                 logger.info(f"Already placed {already_placed} orders today, {remaining_slots} slots remaining")
 
-            # Store passed candidates for order placement
             self.todays_candidates = passed[:remaining_slots]
 
             if self.todays_candidates:
@@ -331,17 +354,17 @@ class TradingDaemon:
                     logger.info(f"  {c.symbol}: earnings {c.earnings_date} ({c.timing}), "
                               f"spread {c.spread_pct:.1f}%, implied move {c.implied_move_pct:.1f}%{edge_str}")
 
-                # Place orders immediately after screening
-                self._place_orders_for_candidates()
+                # Place orders (Async)
+                await self._place_orders_for_candidates()
 
         except Exception as e:
             logger.exception(f"Screening failed: {e}")
 
-    def _place_orders_for_candidates(self):
-        """Place orders on screened candidates (called from screening task)."""
+    async def _place_orders_for_candidates(self):
+        """Place orders on screened candidates (Async)."""
         logger.info("=== PLACING ORDERS ===")
 
-        if not self.ensure_connected():
+        if not await self.ensure_connected():
             logger.error("Cannot place orders - not connected")
             return
 
@@ -357,9 +380,16 @@ class TradingDaemon:
 
         try:
             for candidate in self.todays_candidates:
+                # Double check we haven't already traded this symbol today
+                # (Paranoid check for duplicate trades)
+                if any(t.startswith(candidate.symbol) for t in self.todays_trades):
+                    logger.warning(f"Skipping {candidate.symbol} - already traded today")
+                    continue
+
                 logger.info(f"Placing order for {candidate.symbol}...")
 
-                order_pair = self.executor.place_straddle(candidate)
+                # Use async place_straddle
+                order_pair = await self.executor.place_straddle(candidate)
 
                 if order_pair:
                     self.todays_trades.append(order_pair.trade_id)
@@ -367,35 +397,51 @@ class TradingDaemon:
                 else:
                     logger.error(f"  Order failed for {candidate.symbol}")
 
-                # Small delay between orders
-                self.ib.sleep(1)
+                await asyncio.sleep(1)
 
             logger.info(f"Placed {len(self.todays_trades)} orders")
 
         except Exception as e:
             logger.exception(f"Order placement failed: {e}")
 
-    def task_place_orders(self):
-        """Manual trigger for placing orders (if needed separately)."""
-        self._place_orders_for_candidates()
+    async def task_cancel_unfilled(self):
+        """3:50 PM ET - Cancel unfilled orders."""
+        logger.info("=== CANCELLING UNFILLED ORDERS ===")
 
-    def task_check_fills(self):
-        """3:50 PM - Final fill check before close.
+        if not await self.ensure_connected():
+            return
 
-        Also cancels unfilled orders to prevent orphan positions.
-        """
-        logger.info("=== CHECKING FILLS (NEAR CLOSE) ===")
-
-        if not self.ensure_connected():
-            logger.error("Cannot check fills - not connected")
+        if not self.executor:
             return
 
         try:
-            # First, check current fill status (only logs NEW fills)
+            active_count = self.executor.get_active_count()
+            if active_count == 0:
+                logger.info("No active orders to cancel")
+                return
+
+            logger.info(f"Checking {active_count} active orders for cancellation...")
+
+            for trade_id, combo_order in list(self.executor.active_orders.items()):
+                if combo_order.status == 'pending':
+                    result = self.executor.cancel_unfilled_orders(trade_id)
+                    if result.get('cancelled'):
+                        logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
+
+        except Exception as e:
+            logger.exception(f"Cancel unfilled failed: {e}")
+
+    async def task_check_fills(self):
+        """3:50 PM ET - Fill check & Cancel."""
+        logger.info("=== CHECKING FILLS (NEAR CLOSE) ===")
+
+        if not await self.ensure_connected():
+            return
+
+        try:
+            # Sync check_fills is safe (checks internal state)
             filled = self.executor.check_fills()
 
-            # If we found new fills here (that weren't caught by monitor), schedule markouts immediately
-            # (Though they'll be late, better than nothing)
             if filled:
                 logger.info(f"Found {len(filled)} late fills, scheduling markouts...")
                 for order in filled:
@@ -403,19 +449,7 @@ class TradingDaemon:
 
             logger.info(f"Fill status (active): {self.executor.get_active_count()} pending")
 
-            # Check for partial fills (rare with combo orders)
-            partials = self.executor.get_partial_fills()
-            if partials:
-                logger.warning(f"=== PARTIAL FILLS DETECTED: {len(partials)} ===")
-                for order in partials:
-                    if order.trade:
-                        filled_qty = order.trade.orderStatus.filled
-                        total_qty = order.trade.order.totalQuantity
-                        logger.warning(
-                            f"  {order.symbol}: {int(filled_qty)}/{int(total_qty)} filled"
-                        )
-
-            # Cancel all unfilled orders near close
+            # Cancel unfilled
             pending_count = self.executor.get_active_count()
             if pending_count > 0:
                 logger.warning("=== CANCELLING UNFILLED ORDERS (NEAR CLOSE) ===")
@@ -425,7 +459,7 @@ class TradingDaemon:
                         if result.get('cancelled'):
                             logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
 
-            # Check exit order fills
+            # Check exit order fills (Sync check)
             if self.active_exit_orders:
                 logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
                 exit_filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
@@ -442,23 +476,19 @@ class TradingDaemon:
         except Exception as e:
             logger.exception(f"Fill check failed: {e}")
 
-    def task_monitor_fills(self):
+    async def task_monitor_fills(self):
         """Monitor for new fills and schedule markouts (runs every min)."""
-        if not self.ib or not self.ib.isConnected():
+        if not self.ib.isConnected():
             return
 
         if not self.executor:
             return
 
         try:
-            # Check for NEW fills
-            # check_fills() returns list of orders that transitioned to 'Filled' since last check
             filled = self.executor.check_fills()
-
             for order in filled:
                 logger.info(f"New fill detected for {order.symbol}, scheduling markouts...")
                 self._schedule_markouts(order)
-
         except Exception as e:
             logger.error(f"Monitor fills failed: {e}")
 
@@ -475,14 +505,14 @@ class TradingDaemon:
                 name=f"Markout {delay_m}m {order.symbol}"
             )
 
-    def task_record_markout(self, trade_id: str, symbol: str, expiry: str, strike: float, delay_min: int):
-        """Record post-fill markout price."""
+    async def task_record_markout(self, trade_id: str, symbol: str, expiry: str, strike: float, delay_min: int):
+        """Record post-fill markout price (Async)."""
         logger.info(f"Recording {delay_min}m markout for {symbol}...")
 
-        if not self.ensure_connected():
+        if not await self.ensure_connected():
             return
 
-        price = self._fetch_straddle_price(symbol, expiry, strike)
+        price = await self._fetch_straddle_price(symbol, expiry, strike)
 
         if price:
             field_name = f"markout_{delay_min}min"
@@ -491,36 +521,30 @@ class TradingDaemon:
         else:
             logger.warning(f"  {symbol}: Failed to fetch {delay_min}m markout price")
 
-    def _fetch_straddle_price(self, symbol: str, expiry: str, strike: float) -> Optional[float]:
-        """Fetch current mid price for a straddle."""
+    async def _fetch_straddle_price(self, symbol: str, expiry: str, strike: float) -> Optional[float]:
+        """Fetch current mid price for a straddle (Async)."""
         try:
             from ib_insync import Option
 
-            # Create contracts
             ib_expiry = expiry.replace('-', '')
-
             call = Option(symbol, ib_expiry, strike, 'C', 'SMART')
             put = Option(symbol, ib_expiry, strike, 'P', 'SMART')
 
-            self.ib.qualifyContracts(call, put)
+            await self.ib.qualifyContractsAsync(call, put)
 
-            # Request data
             call_ticker = self.ib.reqMktData(call, '', False, False)
             put_ticker = self.ib.reqMktData(put, '', False, False)
 
-            # Wait briefly
-            for _ in range(5):
-                self.ib.sleep(0.5)
+            # Wait for data
+            for _ in range(20):
                 if (call_ticker.bid > 0 and call_ticker.ask > 0 and
                     put_ticker.bid > 0 and put_ticker.ask > 0):
                     break
+                await asyncio.sleep(0.1)
 
-            # Get mids
             def get_mid(t):
                 if t.bid > 0 and t.ask > 0:
                     return (t.bid + t.ask) / 2
-                if t.last > 0:
-                    return t.last
                 return None
 
             call_mid = get_mid(call_ticker)
@@ -538,21 +562,14 @@ class TradingDaemon:
             logger.error(f"Error fetching straddle price for {symbol}: {e}")
             return None
 
-
-    def task_improve_prices(self, aggression: float = 0.5):
-        """Walk up limit prices for unfilled orders to improve fill probability.
-
-        Args:
-            aggression: How aggressive to price (0.3 = mid + 0.3*spread, 0.7 = mid + 0.7*spread)
-        """
+    async def task_improve_prices(self, aggression: float = 0.5):
+        """Walk up limit prices (Async)."""
         logger.info(f"=== PRICE IMPROVEMENT (aggression={aggression:.0%}) ===")
 
-        if not self.ensure_connected():
-            logger.error("Cannot improve prices - not connected")
+        if not await self.ensure_connected():
             return
 
         if not self.executor:
-            logger.warning("No executor available")
             return
 
         try:
@@ -571,12 +588,10 @@ class TradingDaemon:
                 symbol = combo_order.symbol
                 current_limit = combo_order.trade.order.lmtPrice
 
-                # Get fresh quotes
                 try:
                     from ib_insync import Option
                     import json
 
-                    # Parse strike from trade log
                     trade_log = self.trade_logger.get_trade(trade_id)
                     if not trade_log or not trade_log.strikes:
                         continue
@@ -588,16 +603,18 @@ class TradingDaemon:
                     if not strike or not expiry:
                         continue
 
-                    # Get call and put quotes
                     call = Option(symbol, expiry, strike, 'C', 'SMART')
                     put = Option(symbol, expiry, strike, 'P', 'SMART')
-                    self.ib.qualifyContracts(call, put)
+                    await self.ib.qualifyContractsAsync(call, put)
 
                     call_ticker = self.ib.reqMktData(call, '', False, False)
                     put_ticker = self.ib.reqMktData(put, '', False, False)
-                    self.ib.sleep(0.5)
 
-                    # Calculate new mid and spread
+                    for _ in range(10):
+                        if call_ticker.bid > 0 and put_ticker.bid > 0:
+                            break
+                        await asyncio.sleep(0.1)
+
                     def valid(p):
                         return p is not None and p == p and p > 0
 
@@ -608,83 +625,40 @@ class TradingDaemon:
                     self.ib.cancelMktData(put)
 
                     if not call_mid or not put_mid:
-                        logger.warning(f"  {symbol}: No valid quotes for price improvement")
                         continue
 
                     straddle_mid = call_mid + put_mid
-                    call_spread = (call_ticker.ask - call_ticker.bid) if valid(call_ticker.bid) and valid(call_ticker.ask) else 0
-                    put_spread = (put_ticker.ask - put_ticker.bid) if valid(put_ticker.bid) and valid(put_ticker.ask) else 0
+                    call_spread = (call_ticker.ask - call_ticker.bid) if valid(call_ticker.bid) else 0
+                    put_spread = (put_ticker.ask - put_ticker.bid) if valid(put_ticker.bid) else 0
                     total_spread = call_spread + put_spread
 
-                    # Calculate new limit price
                     new_limit = round(straddle_mid + aggression * total_spread, 2)
 
-                    # Only modify if new price is higher (more aggressive)
                     if new_limit <= current_limit:
-                        logger.info(f"  {symbol}: Current ${current_limit:.2f} already >= new ${new_limit:.2f}")
+                        logger.info(f"  {symbol}: Current ${current_limit:.2f} >= new ${new_limit:.2f}")
                         continue
 
-                    # Modify the order
                     combo_order.trade.order.lmtPrice = new_limit
                     self.ib.placeOrder(combo_order.trade.contract, combo_order.trade.order)
-                    self.ib.sleep(0.3)
 
-                    logger.info(f"  {symbol}: Improved ${current_limit:.2f} -> ${new_limit:.2f} (mid=${straddle_mid:.2f})")
+                    logger.info(f"  {symbol}: Improved ${current_limit:.2f} -> ${new_limit:.2f}")
                     improved += 1
 
                 except Exception as e:
-                    logger.error(f"  {symbol}: Price improvement failed: {e}")
+                    logger.error(f"  {symbol}: Price improvement error: {e}")
 
-            logger.info(f"Price improvement complete: {improved}/{pending_count} orders modified")
+            logger.info(f"Price improvement complete: {improved}/{pending_count} modified")
 
         except Exception as e:
             logger.exception(f"Price improvement failed: {e}")
 
-    def task_cancel_unfilled(self):
-        """Cancel all unfilled orders before market close.
-
-        This ensures clean state and prevents orphan orders.
-        """
-        logger.info("=== CANCELLING UNFILLED ORDERS ===")
-
-        if not self.ensure_connected():
-            logger.error("Cannot cancel orders - not connected")
-            return
-
-        if not self.executor:
-            logger.warning("No executor available")
-            return
-
-        try:
-            pending_count = self.executor.get_active_count()
-            if pending_count == 0:
-                logger.info("No pending orders to cancel")
-                return
-
-            logger.info(f"Cancelling {pending_count} unfilled orders...")
-
-            cancelled = 0
-            for trade_id, combo_order in list(self.executor.active_orders.items()):
-                if combo_order.status == 'pending':
-                    result = self.executor.cancel_unfilled_orders(trade_id)
-                    if result.get('cancelled'):
-                        logger.info(f"  {combo_order.symbol}: Cancelled")
-                        cancelled += 1
-
-            logger.info(f"Cancelled {cancelled} orders")
-
-        except Exception as e:
-            logger.exception(f"Order cancellation failed: {e}")
-
-    def task_exit_positions(self):
-        """2:45 PM - Exit positions from previous day."""
+    async def task_exit_positions(self):
+        """2:45 PM ET - Exit positions."""
         logger.info("=== EXITING POSITIONS ===")
 
-        if not self.ensure_connected():
-            logger.error("Cannot exit positions - not connected")
+        if not await self.ensure_connected():
             return
 
-        # Reload positions to exit (in case daemon was restarted)
         self._load_positions_to_exit()
 
         if not self.positions_to_exit:
@@ -692,16 +666,15 @@ class TradingDaemon:
             return
 
         if CONFIG['dry_run']:
-            logger.info("DRY RUN - would exit positions:")
-            for pos in self.positions_to_exit:
-                logger.info(f"  {pos['symbol']}")
+            logger.info("DRY RUN - would exit positions")
             return
 
         try:
             for pos in self.positions_to_exit:
                 logger.info(f"Exiting {pos['symbol']}...")
 
-                exit_pair = close_position(
+                # Use async close_position
+                exit_pair = await close_position(
                     self.ib,
                     self.trade_logger,
                     trade_id=pos['trade_id'],
@@ -719,335 +692,48 @@ class TradingDaemon:
                 else:
                     logger.error(f"  Exit failed for {pos['symbol']}")
 
-                self.ib.sleep(1)
+                await asyncio.sleep(1)
 
             logger.info(f"Tracking {len(self.active_exit_orders)} exit orders")
 
         except Exception as e:
             logger.exception(f"Position exit failed: {e}")
 
-    def task_evening_disconnect(self):
-        """4:05 PM - Disconnect after market close."""
+    async def task_evening_disconnect(self):
+        """4:05 PM ET - Disconnect."""
         logger.info("=== EVENING DISCONNECT ===")
 
-        # Monitor last-minute fills
-        self.task_monitor_fills()
+        await self.task_monitor_fills()
 
-        # Final exit fill check
         if self.active_exit_orders:
             logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
             filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
-            logger.info(f"Exit fills: {len(filled)} completed")
-
-            # Remove filled from tracking
             for exit_pair in filled:
                 self.active_exit_orders.pop(exit_pair.trade_id, None)
 
-            # Log any unfilled exit orders as warning
-            unfilled = [ep for ep in self.active_exit_orders.values() if ep.status != 'filled']
-            if unfilled:
-                logger.warning(f"UNFILLED EXIT ORDERS: {[ep.symbol for ep in unfilled]}")
-
-        # Log daily summary
-        stats = self.trade_logger.get_summary_stats()
-        logger.info(f"Daily summary: {stats['total_trades']} total trades, "
-                   f"{stats['completed_trades']} completed, P&L: ${stats['total_pnl']:.2f}")
-
         self.disconnect()
 
-    def task_backfill_counterfactuals(self):
-        """4:30 PM - Backfill counterfactual data for yesterday's non-trades.
-
-        For each candidate we passed on yesterday, fetch the realized stock move
-        and calculate what our P&L would have been. This prevents survivorship bias.
-        """
-        logger.info("=== BACKFILLING COUNTERFACTUALS ===")
-
-        try:
-            # Backfill for yesterday's earnings (T-1)
-            # These are the earnings that happened today that we decided not to trade yesterday
-            yesterday = date.today() - timedelta(days=1)
-            today = date.today()
-
-            # Check both yesterday (for BMO that we passed on) and today (for AMC from yesterday)
-            for earnings_date in [yesterday, today]:
-                result = backfill_counterfactuals(self.trade_logger, earnings_date)
-                if result['updated'] > 0:
-                    logger.info(
-                        f"  {earnings_date}: Updated {result['updated']} non-trades "
-                        f"({result['failed']} failed)"
-                    )
-
-        except Exception as e:
-            logger.exception(f"Counterfactual backfill failed: {e}")
-
-    def _log_account_summary(self):
-        """Log extensive account information for monitoring."""
-        logger.info("=" * 50)
-        logger.info("ACCOUNT SUMMARY")
-        logger.info("=" * 50)
-
-        try:
-            # Account ID first
-            accounts = self.ib.managedAccounts()
-            logger.info(f"Account(s): {accounts}")
-
-            # Account values - collect all, prefer USD but take any
-            account_values = {}
-            all_values = self.ib.accountValues()
-            logger.info(f"Total account values received: {len(all_values)}")
-
-            for av in all_values:
-                # Store values, prefer BASE currency (EUR for your account), then USD
-                if av.tag not in account_values or av.currency in ('BASE', 'EUR', 'USD'):
-                    account_values[av.tag] = (av.value, av.currency or 'BASE')
-
-            # Key metrics
-            key_tags = [
-                'NetLiquidation', 'TotalCashValue', 'BuyingPower',
-                'AvailableFunds', 'ExcessLiquidity', 'GrossPositionValue',
-                'MaintMarginReq', 'InitMarginReq', 'UnrealizedPnL', 'RealizedPnL',
-                'CashBalance', 'AccruedCash', 'EquityWithLoanValue'
-            ]
-
-            logger.info("\nKEY METRICS:")
-            for tag in key_tags:
-                if tag in account_values:
-                    val, currency = account_values[tag]
-                    try:
-                        val_float = float(val)
-                        logger.info(f"  {tag}: ${val_float:,.2f} {currency or ''}")
-                    except (ValueError, TypeError):
-                        logger.info(f"  {tag}: {val} {currency or ''}")
-
-            # Current positions
-            positions = self.ib.positions()
-            if positions:
-                logger.info(f"\nOPEN POSITIONS ({len(positions)}):")
-                for pos in positions:
-                    logger.info(f"  {pos.contract.symbol}: {pos.position} @ ${pos.avgCost:.2f}")
-            else:
-                logger.info("\nNo open positions")
-
-            # Open orders
-            orders = self.ib.openOrders()
-            if orders:
-                logger.info(f"\nOPEN ORDERS ({len(orders)}):")
-                for order in orders:
-                    logger.info(f"  {order.orderId}: {order.action} {order.totalQuantity}")
-            else:
-                logger.info("\nNo open orders")
-
-            # Test live market data with SPY
-            logger.info("\nTESTING LIVE MARKET DATA...")
-            self._test_live_market_data()
-
-        except Exception as e:
-            logger.exception(f"Error logging account summary: {e}")
-
-        logger.info("=" * 50)
-
-    def _test_live_market_data(self):
-        """Test that we're getting live (not delayed) market data."""
-        from ib_insync import Stock
-
-        try:
-            spy = Stock('SPY', 'SMART', 'USD')
-            self.ib.qualifyContracts(spy)
-            logger.info(f"  SPY contract qualified: conId={spy.conId}")
-
-            # Request market data type info
-            # 1 = live, 2 = frozen, 3 = delayed, 4 = delayed-frozen
-            logger.info("  Requesting market data (type 1 = live)...")
-
-            ticker = self.ib.reqMktData(spy, '', False, False)
-
-            # Wait longer and check incrementally
-            for i in range(5):
-                self.ib.sleep(1)
-                if ticker.bid and ticker.bid == ticker.bid:  # has valid bid
-                    break
-                logger.info(f"  Waiting for data... ({i+1}/5)")
-
-            # Get all available data
-            bid = ticker.bid
-            ask = ticker.ask
-            last = ticker.last
-            close = ticker.close
-            high = ticker.high
-            low = ticker.low
-            volume = ticker.volume
-
-            # Check market data type returned
-            # ticker.marketDataType: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
-            mkt_data_type = getattr(ticker, 'marketDataType', None)
-
-            self.ib.cancelMktData(spy)
-
-            logger.info(f"  SPY Quote: bid=${bid}, ask=${ask}, last=${last}, close=${close}")
-            logger.info(f"  SPY OHLV: high=${high}, low=${low}, volume={volume}")
-            logger.info(f"  Market data type: {mkt_data_type} (1=live, 2=frozen, 3=delayed, 4=delayed-frozen)")
-
-            # Check if we got valid data
-            has_bid = bid is not None and bid == bid and bid > 0  # nan check
-            has_ask = ask is not None and ask == ask and ask > 0
-            has_last = last is not None and last == last and last > 0
-
-            if mkt_data_type == 3:
-                logger.warning("  ✗ DELAYED DATA DETECTED (type 3)")
-                logger.warning("    You need to subscribe to US Equity Real-Time Data in IBKR Account Management")
-                logger.warning("    Go to: Account Management > Settings > Market Data Subscriptions")
-            elif mkt_data_type == 1:
-                logger.info("  ✓ LIVE DATA TYPE CONFIRMED (type 1)")
-            elif mkt_data_type == 2:
-                logger.info("  Market is closed - using frozen data (type 2)")
-            elif mkt_data_type == 4:
-                logger.warning("  ✗ DELAYED-FROZEN DATA (type 4) - need subscription")
-
-            # Check for competing session error (10197)
-            # This happens when another session is using the market data lines
-            if not has_bid and not has_ask and not has_last:
-                logger.warning("  NOTE: If you see Error 10197 above, it means another session")
-                logger.warning("    (TWS, another IB Gateway, or API client) is using your market data.")
-                logger.warning("    Close other sessions or increase market data lines in IBKR settings.")
-
-            if has_bid and has_ask:
-                spread = ask - bid
-                spread_pct = spread / ((bid + ask) / 2) * 100
-                logger.info(f"  SPY Spread: ${spread:.2f} ({spread_pct:.3f}%)")
-
-                if spread_pct < 0.1:
-                    logger.info("  ✓ TIGHT SPREAD - quotes look live")
-                elif spread_pct < 1.0:
-                    logger.info("  Spread OK for market conditions")
-                else:
-                    logger.warning("  ? Spread wider than expected")
-            elif has_last:
-                logger.info("  Got last price but no bid/ask - market may be closed")
-            else:
-                logger.warning("  ✗ NO QUOTE DATA RECEIVED")
-                logger.warning("    Possible causes:")
-                logger.warning("    - No market data subscription for US equities")
-                logger.warning("    - IB Gateway not connected properly")
-                logger.warning("    - Paper account needs delayed data enabled")
-
-        except Exception as e:
-            logger.exception(f"  Market data test failed: {e}")
-
-    def _log_upcoming_earnings(self):
-        """Log upcoming earnings events for visibility."""
-        logger.info("=" * 50)
-        logger.info("UPCOMING EARNINGS (Next 7 Days)")
-        logger.info("=" * 50)
-
-        try:
-            events = fetch_upcoming_earnings(days_ahead=7)
-
-            if not events:
-                logger.info("No upcoming earnings found")
-                return
-
-            # Group by date
-            from collections import defaultdict
-            by_date = defaultdict(list)
-            for e in events:
-                by_date[e.earnings_date].append(e)
-
-            # Sort dates
-            today = date.today()
-            tomorrow = today + timedelta(days=1)
-
-            for earn_date in sorted(by_date.keys()):
-                events_on_date = by_date[earn_date]
-                bmo = [e for e in events_on_date if e.timing == 'BMO']
-                amc = [e for e in events_on_date if e.timing == 'AMC']
-                unknown = [e for e in events_on_date if e.timing == 'unknown']
-
-                # Highlight today/tomorrow
-                if earn_date == today:
-                    date_label = f"{earn_date} (TODAY)"
-                elif earn_date == tomorrow:
-                    date_label = f"{earn_date} (TOMORROW)"
-                else:
-                    date_label = str(earn_date)
-
-                logger.info(f"\n{date_label}: {len(events_on_date)} earnings")
-
-                if bmo:
-                    bmo_symbols = [e.symbol for e in bmo[:15]]
-                    more = f" +{len(bmo)-15} more" if len(bmo) > 15 else ""
-                    logger.info(f"  BMO ({len(bmo)}): {', '.join(bmo_symbols)}{more}")
-
-                if amc:
-                    amc_symbols = [e.symbol for e in amc[:15]]
-                    more = f" +{len(amc)-15} more" if len(amc) > 15 else ""
-                    logger.info(f"  AMC ({len(amc)}): {', '.join(amc_symbols)}{more}")
-
-                if unknown:
-                    unk_symbols = [e.symbol for e in unknown[:10]]
-                    more = f" +{len(unknown)-10} more" if len(unknown) > 10 else ""
-                    logger.info(f"  Unknown ({len(unknown)}): {', '.join(unk_symbols)}{more}")
-
-            # Summary of what we'd trade today
-            logger.info("\n" + "-" * 50)
-            logger.info("TRADEABLE TODAY:")
-
-            # BMO tomorrow = enter today
-            tomorrows_bmo = [e for e in events if e.earnings_date == tomorrow and e.timing == 'BMO']
-            # AMC today = enter today
-            todays_amc = [e for e in events if e.earnings_date == today and e.timing == 'AMC']
-
-            if tomorrows_bmo:
-                symbols = [e.symbol for e in tomorrows_bmo[:20]]
-                more = f" +{len(tomorrows_bmo)-20} more" if len(tomorrows_bmo) > 20 else ""
-                logger.info(f"  Tomorrow BMO (enter today): {len(tomorrows_bmo)} - {', '.join(symbols)}{more}")
-            else:
-                logger.info("  Tomorrow BMO: None")
-
-            if todays_amc:
-                symbols = [e.symbol for e in todays_amc[:20]]
-                more = f" +{len(todays_amc)-20} more" if len(todays_amc) > 20 else ""
-                logger.info(f"  Today AMC (enter today): {len(todays_amc)} - {', '.join(symbols)}{more}")
-            else:
-                logger.info("  Today AMC: None")
-
-            total_tradeable = len(tomorrows_bmo) + len(todays_amc)
-            logger.info(f"  TOTAL CANDIDATES TO SCREEN: {total_tradeable}")
-
-        except Exception as e:
-            logger.exception(f"Error fetching upcoming earnings: {e}")
-
-        logger.info("=" * 50)
-
     def _cleanup_stale_orders(self):
-        """Clean up stale unfilled orders to prevent orphan trades."""
+        """Clean up stale unfilled orders."""
         try:
             cancelled = self.trade_logger.cleanup_stale_orders(max_age_hours=24)
             if cancelled:
-                logger.warning(f"Cleaned up {len(cancelled)} stale unfilled orders: {cancelled}")
-            else:
-                logger.info("No stale orders to clean up")
+                logger.warning(f"Cleaned up {len(cancelled)} stale orders")
         except Exception as e:
             logger.error(f"Failed to cleanup stale orders: {e}")
 
     def _load_positions_to_exit(self):
-        """Load positions that need to be exited today."""
-        # Get trades that are 'filled' status and were entered yesterday
-        # They should be exited today at T+1 close
+        """Load positions to exit."""
         trades = self.trade_logger.get_trades(status='filled')
-
         self.positions_to_exit = []
         yesterday = date.today() - timedelta(days=1)
 
         for trade in trades:
-            # Parse entry date
             try:
                 entry_date = datetime.fromisoformat(trade.entry_datetime).date()
             except:
                 continue
 
-            # Check if this should be exited today
-            # (entered yesterday or earlier, not yet exited)
             if entry_date <= yesterday and not trade.exit_datetime:
                 self.positions_to_exit.append({
                     'trade_id': trade.trade_id,
@@ -1055,226 +741,221 @@ class TradingDaemon:
                     'expiry': trade.expiration,
                     'strike': float(trade.strikes.strip('[]')),
                     'contracts': trade.contracts,
-                    'entry_fill_price': trade.entry_fill_price,  # For P&L calculation
+                    'entry_fill_price': trade.entry_fill_price,
                 })
 
         if self.positions_to_exit:
-            logger.info(f"Loaded {len(self.positions_to_exit)} positions to exit today")
+            logger.info(f"Loaded {len(self.positions_to_exit)} positions to exit")
 
-    # ==================== Scheduler Setup ====================
+    def _load_todays_activity(self):
+        """Load trades placed today to prevent duplicates on restart."""
+        self.todays_trades = []
+        today_str = date.today().isoformat()
+
+        # Get all trades from today
+        try:
+            import sqlite3
+            conn = sqlite3.connect(CONFIG['db_path'])
+            c = conn.cursor()
+            c.execute("SELECT trade_id, ticker FROM trades WHERE entry_datetime LIKE ?", (f"{today_str}%",))
+            rows = c.fetchall()
+            for tid, ticker in rows:
+                self.todays_trades.append(tid)
+
+            if rows:
+                logger.info(f"Loaded {len(rows)} trades placed today")
+        except Exception as e:
+            logger.error(f"Failed to load today's activity: {e}")
+
+    async def _log_account_summary(self):
+        """Log account info (Async)."""
+        logger.info("=" * 50)
+        logger.info("ACCOUNT SUMMARY")
+        logger.info("=" * 50)
+
+        # managedAccounts is sync and cached
+        accounts = self.ib.managedAccounts()
+        logger.info(f"Account(s): {accounts}")
+
+        # accountValues is sync and cached (updates in background)
+        all_values = self.ib.accountValues()
+        for av in all_values:
+            if av.tag in ('NetLiquidation', 'BuyingPower', 'UnrealizedPnL', 'RealizedPnL') and av.currency == 'USD':
+                logger.info(f"  {av.tag}: {av.value} {av.currency}")
+
+        positions = self.ib.positions()
+        if positions:
+            logger.info(f"OPEN POSITIONS: {len(positions)}")
+            for pos in positions:
+                logger.info(f"  {pos.contract.symbol}: {pos.position}")
+
+        # Test live data using async
+        await self._test_live_market_data_async()
+
+    async def _test_live_market_data_async(self):
+        """Test live data (Async)."""
+        from ib_insync import Stock
+        spy = Stock('SPY', 'SMART', 'USD')
+        await self.ib.qualifyContractsAsync(spy)
+
+        ticker = self.ib.reqMktData(spy, '', False, False)
+        for _ in range(10):
+            if ticker.bid and ticker.bid > 0:
+                break
+            await asyncio.sleep(0.5)
+
+        self.ib.cancelMktData(spy)
+        logger.info(f"  SPY: bid={ticker.bid}, type={getattr(ticker, 'marketDataType', '?')}")
 
     def setup_schedule(self):
-        """Configure the job schedule."""
+        """Configure the job schedule (Timezone Aware)."""
 
-        # Market hours schedule (Monday-Friday)
-        # US market: 09:30-16:00 ET = 14:30-21:00 UTC
-        # All times below in UTC (system timezone)
+        # NOTE: When timezone=ET is set on the scheduler, triggers should use ET hours.
+        # 09:25 ET = 9, 25
+        # 14:00 ET = 14, 0
 
-        # Morning connect - 09:25 ET = 14:25 UTC
         self.scheduler.add_job(
             self.task_morning_connect,
-            CronTrigger(day_of_week='mon-fri', hour=14, minute=25),
+            CronTrigger(day_of_week='mon-fri', hour=9, minute=25, timezone=ET),
             id='morning_connect',
             name='Morning Connect (09:25 ET)',
         )
 
-        # Exit positions BEFORE placing new ones - 14:45 ET = 19:45 UTC
         self.scheduler.add_job(
             self.task_exit_positions,
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=45),
+            CronTrigger(day_of_week='mon-fri', hour=14, minute=45, timezone=ET),
             id='exit_positions',
             name='Exit Positions (14:45 ET)',
         )
 
-        # Screen candidates AND place orders - 14:00 ET = 19:00 UTC (moved from 15:00)
         self.scheduler.add_job(
             self.task_screen_candidates,
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=0),
+            CronTrigger(day_of_week='mon-fri', hour=14, minute=0, timezone=ET),
             id='screen_and_place',
             name='Screen & Place Orders (14:00 ET)',
         )
 
-        # Monitor for fills - every minute during trading hours
-        # 14:00 - 16:00 ET (19:00 - 21:00 UTC) + buffer
         self.scheduler.add_job(
             self.task_monitor_fills,
-            CronTrigger(day_of_week='mon-fri', hour='19-21', minute='*'),
+            CronTrigger(day_of_week='mon-fri', hour='14-16', minute='*', timezone=ET),
             id='monitor_fills',
             name='Monitor Fills (Every min)',
         )
 
-        # Price improvement checks - walk up limit prices for unfilled orders
-        # 14:10 ET = 19:10 UTC
-        self.scheduler.add_job(
-            lambda: self.task_improve_prices(aggression=0.4),
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=10),
-            id='improve_prices_1',
-            name='Price Improvement 1 (14:10 ET)',
-        )
-        # 14:20 ET = 19:20 UTC
-        self.scheduler.add_job(
-            lambda: self.task_improve_prices(aggression=0.5),
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=20),
-            id='improve_prices_2',
-            name='Price Improvement 2 (14:20 ET)',
-        )
-        # 14:30 ET = 19:30 UTC
-        self.scheduler.add_job(
-            lambda: self.task_improve_prices(aggression=0.6),
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=30),
-            id='improve_prices_3',
-            name='Price Improvement 3 (14:30 ET)',
-        )
-        # 14:40 ET = 19:40 UTC - final attempt, most aggressive
-        self.scheduler.add_job(
-            lambda: self.task_improve_prices(aggression=0.7),
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=40),
-            id='improve_prices_4',
-            name='Price Improvement 4 (14:40 ET)',
-        )
+        # Price improvements 14:10 - 14:40
+        for m, agg in [(10, 0.4), (20, 0.5), (30, 0.6), (40, 0.7)]:
+            self.scheduler.add_job(
+                lambda a=agg: asyncio.create_task(self.task_improve_prices(a)),
+                CronTrigger(day_of_week='mon-fri', hour=14, minute=m, timezone=ET),
+                id=f'improve_{m}',
+                name=f'Price Improvement (14:{m} ET)',
+            )
 
-        # Cancel unfilled orders - 15:50 ET = 20:50 UTC
         self.scheduler.add_job(
             self.task_cancel_unfilled,
-            CronTrigger(day_of_week='mon-fri', hour=20, minute=50),
+            CronTrigger(day_of_week='mon-fri', hour=15, minute=58, timezone=ET),
             id='cancel_unfilled',
-            name='Cancel Unfilled Orders (15:50 ET)',
+            name='Cancel Unfilled (15:58 ET)',
         )
 
-        # Final fill check - 15:55 ET = 20:55 UTC
         self.scheduler.add_job(
             self.task_check_fills,
-            CronTrigger(day_of_week='mon-fri', hour=20, minute=55),
+            CronTrigger(day_of_week='mon-fri', hour=15, minute=55, timezone=ET),
             id='check_fills',
             name='Check Fills (15:55 ET)',
         )
 
-        # Evening disconnect - 16:05 ET = 21:05 UTC
         self.scheduler.add_job(
             self.task_evening_disconnect,
-            CronTrigger(day_of_week='mon-fri', hour=21, minute=5),
-            id='evening_disconnect',
-            name='Evening Disconnect (16:05 ET)',
+            CronTrigger(day_of_week='mon-fri', hour=16, minute=5, timezone=ET),
+            id='disconnect',
+            name='Disconnect (16:05 ET)',
         )
 
-        # Backfill counterfactuals - 16:30 ET = 21:30 UTC
-        # Runs after market close to fetch realized moves for non-traded candidates
+        # Backfill - 16:30 ET
+        # Sync task in async scheduler needs executor?
+        # No, backfill_counterfactuals is sync. Run in executor.
+        loop = asyncio.get_event_loop()
         self.scheduler.add_job(
-            self.task_backfill_counterfactuals,
-            CronTrigger(day_of_week='mon-fri', hour=21, minute=30),
-            id='backfill_counterfactuals',
-            name='Backfill Counterfactuals (16:30 ET)',
+            lambda: loop.run_in_executor(None, lambda: backfill_counterfactuals(self.trade_logger)),
+            CronTrigger(day_of_week='mon-fri', hour=16, minute=30, timezone=ET),
+            id='backfill',
+            name='Backfill (16:30 ET)',
         )
 
-        logger.info("Schedule configured:")
-        for job in self.scheduler.get_jobs():
-            logger.info(f"  {job.name}: {job.trigger}")
+    async def run_async(self):
+        """Async entry point."""
+        logger.info("DAEMON STARTING (Async)...")
 
-    def run(self):
-        """Start the daemon."""
-        logger.info("=" * 60)
-        logger.info("EARNINGS TRADING DAEMON STARTING")
-        logger.info("=" * 60)
+        # Setup signals
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-        mode_str = "PAPER" if CONFIG['paper_mode'] else "LIVE"
-        logger.info(f"Mode: {mode_str}")
-        logger.info(f"Config: spread_threshold={CONFIG['spread_threshold']}%, "
-                   f"edge_threshold={CONFIG['edge_threshold']:.0%}, "
-                   f"max_contracts={CONFIG['max_contracts']}, "
-                   f"max_daily_trades={CONFIG['max_daily_trades']}, "
-                   f"dry_run={CONFIG['dry_run']}")
-
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        # Setup schedule
         self.setup_schedule()
 
-        # Cleanup stale orders before doing anything else
+        # Connect
+        await self.connect_async()
+
+        # Initial cleanup & load
         self._cleanup_stale_orders()
+        self._load_todays_activity()
 
-        # Always connect immediately on start to verify connection and log account
-        logger.info("Connecting to IB Gateway on startup...")
-        if self.connect():
-            logger.info("Startup connection successful")
+        # Startup checks
+        await self._run_screening_if_needed()
 
-            # Load ML predictor
-            try:
-                self.predictor = get_predictor()
-                logger.info(f"ML predictor loaded: {len(self.predictor.models)} models, {len(self.predictor.feature_cols)} features")
-            except Exception as e:
-                logger.error(f"Failed to load ML predictor: {e}")
-                self.predictor = None
-
-            # Show upcoming earnings
-            self._log_upcoming_earnings()
-
-            # Recover any pending orders from previous run
-            if self.executor:
-                recovered = self.executor.recover_orders()
-                if recovered > 0:
-                    logger.info(f"Recovered {recovered} pending orders from database")
-        else:
-            logger.error("STARTUP CONNECTION FAILED - check IB Gateway is running")
-            logger.error("Daemon will continue and retry at scheduled times")
-
-        # Check if we should run screening immediately (missed the scheduled time)
-        self._run_screening_if_needed()
-
-        # Start scheduler (background - doesn't block)
-        logger.info("Starting scheduler...")
+        # Start scheduler
         self.scheduler.start()
+        logger.info("Scheduler started")
 
-        # Log next scheduled jobs
-        for job in self.scheduler.get_jobs():
-            logger.info(f"  {job.name}: next run at {job.next_run_time}")
-
-        # Keep main thread alive with IB event loop
-        logger.info("Entering main loop (Ctrl+C to stop)...")
+        # Keep alive
         try:
             while True:
-                if self.ib and self.ib.isConnected():
-                    self.ib.sleep(1)  # Process IB events
-                else:
-                    time.sleep(1)
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("Daemon stopped")
-        finally:
-            self.scheduler.shutdown()
-            self.disconnect()
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
 
-    def _run_screening_if_needed(self):
-        """Run screening immediately if we're in the trading window and missed the scheduled time."""
-        if not self.connected:
-            logger.info("Not connected - skipping startup screening")
+    async def shutdown(self):
+        """Graceful shutdown."""
+        logger.info("Shutting down...")
+        self.scheduler.shutdown()
+        self.disconnect()
+        # Cancel all tasks?
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        asyncio.get_running_loop().stop()
+
+    async def _run_screening_if_needed(self):
+        """Run screening if started during window."""
+        if not self.ib.isConnected():
             return
 
         now = datetime.now(ET)
-        screen_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        start = now.replace(hour=14, minute=0, second=0)
+        end = now.replace(hour=15, minute=0, second=0) # Window until 3 PM?
 
-        # If we're between 15:00 and 16:00 ET on a weekday
-        if now.weekday() < 5 and screen_time <= now < market_close:
-            # Run screening (which now also places orders immediately)
-            logger.info("=" * 60)
-            logger.info("STARTUP: Running screening (missed 15:00 scheduled time)")
-            logger.info("=" * 60)
-            self.task_screen_candidates()
+        # If between 14:00 and 15:00 ET
+        if now.weekday() < 5 and start <= now < end:
+            # Check if we already traded
+            if self.todays_trades:
+                logger.info("Already traded today, skipping startup screening")
+                return
 
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals."""
-        logger.info(f"Received signal {signum}, shutting down...")
-        self.scheduler.shutdown(wait=False)
-        self.disconnect()
-        sys.exit(0)
+            logger.info("Running missed screening...")
+            await self.task_screen_candidates()
 
+    def run(self):
+        """Entry point."""
+        try:
+            asyncio.run(self.run_async())
+        except (KeyboardInterrupt, SystemExit):
+            pass
 
 def main():
-    """Entry point."""
     daemon = TradingDaemon()
     daemon.run()
-
 
 if __name__ == '__main__':
     main()

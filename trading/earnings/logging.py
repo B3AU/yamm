@@ -34,6 +34,11 @@ class TradeLog:
     entry_fill_time: Optional[str] = None
     entry_slippage: Optional[float] = None  # fill - mid
 
+    # Post-fill Markouts (price behavior after entry)
+    markout_1min: Optional[float] = None  # Price 1 min after fill
+    markout_5min: Optional[float] = None  # Price 5 min after fill
+    markout_30min: Optional[float] = None # Price 30 min after fill
+
     # Structure
     structure: str = "straddle"  # "straddle" or "strangle"
     strikes: str = ""  # JSON list of strikes
@@ -165,6 +170,9 @@ class TradeLogger:
                     entry_fill_price REAL,
                     entry_fill_time TEXT,
                     entry_slippage REAL,
+                    markout_1min REAL,
+                    markout_5min REAL,
+                    markout_30min REAL,
                     structure TEXT,
                     strikes TEXT,
                     expiration TEXT,
@@ -211,6 +219,13 @@ class TradeLogger:
                 conn.execute("ALTER TABLE trades ADD COLUMN put_order_id INTEGER")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+            # Add markout columns (migration)
+            for col in ['markout_1min', 'markout_5min', 'markout_30min']:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+                except sqlite3.OperationalError:
+                    pass
 
             # Non-trades table
             conn.execute("""
@@ -441,6 +456,56 @@ class TradeLogger:
                 row_dict.pop('updated_at', None)
                 results.append(TradeLog(**row_dict))
             return results
+
+    def cleanup_stale_orders(self, max_age_hours: int = 24) -> list[str]:
+        """Cancel trades that are stale (pending/submitted for too long without fills).
+
+        This prevents orphan trades from polluting metrics. Trades are marked as
+        'cancelled' with a note explaining they were auto-cleaned.
+
+        Args:
+            max_age_hours: Orders older than this (since entry_datetime) are cleaned up
+
+        Returns:
+            List of trade_ids that were cancelled
+        """
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+
+        # Find stale trades: pending/submitted status, no fill, older than cutoff
+        query = """
+            SELECT trade_id, ticker, entry_datetime, status
+            FROM trades
+            WHERE status IN ('pending', 'submitted')
+            AND entry_fill_price IS NULL
+            AND entry_datetime < ?
+        """
+
+        cancelled_ids = []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(query, (cutoff,)).fetchall()
+
+            for row in rows:
+                trade_id = row['trade_id']
+                ticker = row['ticker']
+                entry_dt = row['entry_datetime']
+
+                # Mark as cancelled
+                conn.execute(
+                    """UPDATE trades
+                    SET status = 'cancelled',
+                        notes = COALESCE(notes || '; ', '') || 'Auto-cancelled: stale unfilled order',
+                        updated_at = ?
+                    WHERE trade_id = ?""",
+                    (datetime.now().isoformat(), trade_id)
+                )
+                cancelled_ids.append(trade_id)
+
+            conn.commit()
+
+        return cancelled_ids
 
     def get_execution_metrics(self) -> ExecutionMetrics:
         """Compute aggregated execution metrics for Phase 0 validation."""

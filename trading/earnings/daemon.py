@@ -197,6 +197,9 @@ class TradingDaemon:
         self.todays_candidates = []
         self.todays_trades = []
 
+        # Cleanup stale orders from previous days (prevents orphan trades)
+        self._cleanup_stale_orders()
+
         # Load ML predictor
         try:
             self.predictor = get_predictor()
@@ -257,6 +260,14 @@ class TradingDaemon:
                 self.executor.log_non_trade(candidate)
 
             # Apply ML edge filter
+            # Load predictor if not already loaded (handles daemon restarts)
+            if not self.predictor:
+                try:
+                    self.predictor = get_predictor()
+                    logger.info(f"ML predictor loaded on demand: {len(self.predictor.models)} models")
+                except Exception as e:
+                    logger.error(f"Failed to load ML predictor: {e}")
+
             if self.predictor and passed:
                 edge_threshold = CONFIG['edge_threshold']
                 logger.info(f"Applying ML edge filter (threshold={edge_threshold:.0%})...")
@@ -380,14 +391,17 @@ class TradingDaemon:
             return
 
         try:
-            # First, check current fill status
+            # First, check current fill status (only logs NEW fills)
             filled = self.executor.check_fills()
 
-            logger.info(f"Fill status: {len(filled)} filled, "
-                       f"{self.executor.get_active_count()} still pending")
+            # If we found new fills here (that weren't caught by monitor), schedule markouts immediately
+            # (Though they'll be late, better than nothing)
+            if filled:
+                logger.info(f"Found {len(filled)} late fills, scheduling markouts...")
+                for order in filled:
+                    self._schedule_markouts(order)
 
-            for order in filled:
-                logger.info(f"  {order.symbol}: Straddle @ ${order.fill_price:.2f}")
+            logger.info(f"Fill status (active): {self.executor.get_active_count()} pending")
 
             # Check for partial fills (rare with combo orders)
             partials = self.executor.get_partial_fills()
@@ -417,7 +431,6 @@ class TradingDaemon:
                 exit_filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
                 logger.info(f"Exit fills: {len(exit_filled)} completed")
 
-                # Remove filled from tracking
                 for exit_pair in exit_filled:
                     self.active_exit_orders.pop(exit_pair.trade_id, None)
 
@@ -429,13 +442,250 @@ class TradingDaemon:
         except Exception as e:
             logger.exception(f"Fill check failed: {e}")
 
+    def task_monitor_fills(self):
+        """Monitor for new fills and schedule markouts (runs every min)."""
+        if not self.ib or not self.ib.isConnected():
+            return
+
+        if not self.executor:
+            return
+
+        try:
+            # Check for NEW fills
+            # check_fills() returns list of orders that transitioned to 'Filled' since last check
+            filled = self.executor.check_fills()
+
+            for order in filled:
+                logger.info(f"New fill detected for {order.symbol}, scheduling markouts...")
+                self._schedule_markouts(order)
+
+        except Exception as e:
+            logger.error(f"Monitor fills failed: {e}")
+
+    def _schedule_markouts(self, order):
+        """Schedule 1m, 5m, 30m markout checks for a filled order."""
+        for delay_m in [1, 5, 30]:
+            run_time = datetime.now(ET) + timedelta(minutes=delay_m)
+
+            self.scheduler.add_job(
+                self.task_record_markout,
+                'date',
+                run_date=run_time,
+                args=[order.trade_id, order.symbol, order.expiry, order.strike, delay_m],
+                name=f"Markout {delay_m}m {order.symbol}"
+            )
+
+    def task_record_markout(self, trade_id: str, symbol: str, expiry: str, strike: float, delay_min: int):
+        """Record post-fill markout price."""
+        logger.info(f"Recording {delay_min}m markout for {symbol}...")
+
+        if not self.ensure_connected():
+            return
+
+        price = self._fetch_straddle_price(symbol, expiry, strike)
+
+        if price:
+            field_name = f"markout_{delay_min}min"
+            self.trade_logger.update_trade(trade_id, **{field_name: price})
+            logger.info(f"  {symbol}: {delay_min}m markout = ${price:.2f}")
+        else:
+            logger.warning(f"  {symbol}: Failed to fetch {delay_min}m markout price")
+
+    def _fetch_straddle_price(self, symbol: str, expiry: str, strike: float) -> Optional[float]:
+        """Fetch current mid price for a straddle."""
+        try:
+            from ib_insync import Option
+
+            # Create contracts
+            ib_expiry = expiry.replace('-', '')
+
+            call = Option(symbol, ib_expiry, strike, 'C', 'SMART')
+            put = Option(symbol, ib_expiry, strike, 'P', 'SMART')
+
+            self.ib.qualifyContracts(call, put)
+
+            # Request data
+            call_ticker = self.ib.reqMktData(call, '', False, False)
+            put_ticker = self.ib.reqMktData(put, '', False, False)
+
+            # Wait briefly
+            for _ in range(5):
+                self.ib.sleep(0.5)
+                if (call_ticker.bid > 0 and call_ticker.ask > 0 and
+                    put_ticker.bid > 0 and put_ticker.ask > 0):
+                    break
+
+            # Get mids
+            def get_mid(t):
+                if t.bid > 0 and t.ask > 0:
+                    return (t.bid + t.ask) / 2
+                if t.last > 0:
+                    return t.last
+                return None
+
+            call_mid = get_mid(call_ticker)
+            put_mid = get_mid(put_ticker)
+
+            self.ib.cancelMktData(call)
+            self.ib.cancelMktData(put)
+
+            if call_mid is not None and put_mid is not None:
+                return call_mid + put_mid
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error fetching straddle price for {symbol}: {e}")
+            return None
+
+
+    def task_improve_prices(self, aggression: float = 0.5):
+        """Walk up limit prices for unfilled orders to improve fill probability.
+
+        Args:
+            aggression: How aggressive to price (0.3 = mid + 0.3*spread, 0.7 = mid + 0.7*spread)
+        """
+        logger.info(f"=== PRICE IMPROVEMENT (aggression={aggression:.0%}) ===")
+
+        if not self.ensure_connected():
+            logger.error("Cannot improve prices - not connected")
+            return
+
+        if not self.executor:
+            logger.warning("No executor available")
+            return
+
+        try:
+            pending_count = self.executor.get_active_count()
+            if pending_count == 0:
+                logger.info("No pending orders to improve")
+                return
+
+            logger.info(f"Checking {pending_count} pending orders...")
+
+            improved = 0
+            for trade_id, combo_order in list(self.executor.active_orders.items()):
+                if combo_order.status != 'pending' or not combo_order.trade:
+                    continue
+
+                symbol = combo_order.symbol
+                current_limit = combo_order.trade.order.lmtPrice
+
+                # Get fresh quotes
+                try:
+                    from ib_insync import Option
+                    import json
+
+                    # Parse strike from trade log
+                    trade_log = self.trade_logger.get_trade(trade_id)
+                    if not trade_log or not trade_log.strikes:
+                        continue
+
+                    strikes = json.loads(trade_log.strikes)
+                    strike = strikes[0] if strikes else None
+                    expiry = trade_log.expiration.replace('-', '') if trade_log.expiration else None
+
+                    if not strike or not expiry:
+                        continue
+
+                    # Get call and put quotes
+                    call = Option(symbol, expiry, strike, 'C', 'SMART')
+                    put = Option(symbol, expiry, strike, 'P', 'SMART')
+                    self.ib.qualifyContracts(call, put)
+
+                    call_ticker = self.ib.reqMktData(call, '', False, False)
+                    put_ticker = self.ib.reqMktData(put, '', False, False)
+                    self.ib.sleep(0.5)
+
+                    # Calculate new mid and spread
+                    def valid(p):
+                        return p is not None and p == p and p > 0
+
+                    call_mid = (call_ticker.bid + call_ticker.ask) / 2 if valid(call_ticker.bid) and valid(call_ticker.ask) else None
+                    put_mid = (put_ticker.bid + put_ticker.ask) / 2 if valid(put_ticker.bid) and valid(put_ticker.ask) else None
+
+                    self.ib.cancelMktData(call)
+                    self.ib.cancelMktData(put)
+
+                    if not call_mid or not put_mid:
+                        logger.warning(f"  {symbol}: No valid quotes for price improvement")
+                        continue
+
+                    straddle_mid = call_mid + put_mid
+                    call_spread = (call_ticker.ask - call_ticker.bid) if valid(call_ticker.bid) and valid(call_ticker.ask) else 0
+                    put_spread = (put_ticker.ask - put_ticker.bid) if valid(put_ticker.bid) and valid(put_ticker.ask) else 0
+                    total_spread = call_spread + put_spread
+
+                    # Calculate new limit price
+                    new_limit = round(straddle_mid + aggression * total_spread, 2)
+
+                    # Only modify if new price is higher (more aggressive)
+                    if new_limit <= current_limit:
+                        logger.info(f"  {symbol}: Current ${current_limit:.2f} already >= new ${new_limit:.2f}")
+                        continue
+
+                    # Modify the order
+                    combo_order.trade.order.lmtPrice = new_limit
+                    self.ib.placeOrder(combo_order.trade.contract, combo_order.trade.order)
+                    self.ib.sleep(0.3)
+
+                    logger.info(f"  {symbol}: Improved ${current_limit:.2f} -> ${new_limit:.2f} (mid=${straddle_mid:.2f})")
+                    improved += 1
+
+                except Exception as e:
+                    logger.error(f"  {symbol}: Price improvement failed: {e}")
+
+            logger.info(f"Price improvement complete: {improved}/{pending_count} orders modified")
+
+        except Exception as e:
+            logger.exception(f"Price improvement failed: {e}")
+
+    def task_cancel_unfilled(self):
+        """Cancel all unfilled orders before market close.
+
+        This ensures clean state and prevents orphan orders.
+        """
+        logger.info("=== CANCELLING UNFILLED ORDERS ===")
+
+        if not self.ensure_connected():
+            logger.error("Cannot cancel orders - not connected")
+            return
+
+        if not self.executor:
+            logger.warning("No executor available")
+            return
+
+        try:
+            pending_count = self.executor.get_active_count()
+            if pending_count == 0:
+                logger.info("No pending orders to cancel")
+                return
+
+            logger.info(f"Cancelling {pending_count} unfilled orders...")
+
+            cancelled = 0
+            for trade_id, combo_order in list(self.executor.active_orders.items()):
+                if combo_order.status == 'pending':
+                    result = self.executor.cancel_unfilled_orders(trade_id)
+                    if result.get('cancelled'):
+                        logger.info(f"  {combo_order.symbol}: Cancelled")
+                        cancelled += 1
+
+            logger.info(f"Cancelled {cancelled} orders")
+
+        except Exception as e:
+            logger.exception(f"Order cancellation failed: {e}")
+
     def task_exit_positions(self):
-        """3:45 PM - Exit positions from previous day."""
+        """2:45 PM - Exit positions from previous day."""
         logger.info("=== EXITING POSITIONS ===")
 
         if not self.ensure_connected():
             logger.error("Cannot exit positions - not connected")
             return
+
+        # Reload positions to exit (in case daemon was restarted)
+        self._load_positions_to_exit()
 
         if not self.positions_to_exit:
             logger.info("No positions to exit today")
@@ -480,9 +730,8 @@ class TradingDaemon:
         """4:05 PM - Disconnect after market close."""
         logger.info("=== EVENING DISCONNECT ===")
 
-        # Final entry fill check
-        if self.executor:
-            self.executor.check_fills()
+        # Monitor last-minute fills
+        self.task_monitor_fills()
 
         # Final exit fill check
         if self.active_exit_orders:
@@ -770,6 +1019,17 @@ class TradingDaemon:
 
         logger.info("=" * 50)
 
+    def _cleanup_stale_orders(self):
+        """Clean up stale unfilled orders to prevent orphan trades."""
+        try:
+            cancelled = self.trade_logger.cleanup_stale_orders(max_age_hours=24)
+            if cancelled:
+                logger.warning(f"Cleaned up {len(cancelled)} stale unfilled orders: {cancelled}")
+            else:
+                logger.info("No stale orders to clean up")
+        except Exception as e:
+            logger.error(f"Failed to cleanup stale orders: {e}")
+
     def _load_positions_to_exit(self):
         """Load positions that need to be exited today."""
         # Get trades that are 'filled' status and were entered yesterday
@@ -826,20 +1086,67 @@ class TradingDaemon:
             name='Exit Positions (14:45 ET)',
         )
 
-        # Screen candidates AND place orders (after exits are done) - 15:00 ET = 20:00 UTC
+        # Screen candidates AND place orders - 14:00 ET = 19:00 UTC (moved from 15:00)
         self.scheduler.add_job(
             self.task_screen_candidates,
-            CronTrigger(day_of_week='mon-fri', hour=20, minute=0),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=0),
             id='screen_and_place',
-            name='Screen & Place Orders (15:00 ET)',
+            name='Screen & Place Orders (14:00 ET)',
         )
 
-        # Final fill check - 15:50 ET = 20:50 UTC
+        # Monitor for fills - every minute during trading hours
+        # 14:00 - 16:00 ET (19:00 - 21:00 UTC) + buffer
+        self.scheduler.add_job(
+            self.task_monitor_fills,
+            CronTrigger(day_of_week='mon-fri', hour='19-21', minute='*'),
+            id='monitor_fills',
+            name='Monitor Fills (Every min)',
+        )
+
+        # Price improvement checks - walk up limit prices for unfilled orders
+        # 14:10 ET = 19:10 UTC
+        self.scheduler.add_job(
+            lambda: self.task_improve_prices(aggression=0.4),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=10),
+            id='improve_prices_1',
+            name='Price Improvement 1 (14:10 ET)',
+        )
+        # 14:20 ET = 19:20 UTC
+        self.scheduler.add_job(
+            lambda: self.task_improve_prices(aggression=0.5),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=20),
+            id='improve_prices_2',
+            name='Price Improvement 2 (14:20 ET)',
+        )
+        # 14:30 ET = 19:30 UTC
+        self.scheduler.add_job(
+            lambda: self.task_improve_prices(aggression=0.6),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=30),
+            id='improve_prices_3',
+            name='Price Improvement 3 (14:30 ET)',
+        )
+        # 14:40 ET = 19:40 UTC - final attempt, most aggressive
+        self.scheduler.add_job(
+            lambda: self.task_improve_prices(aggression=0.7),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=40),
+            id='improve_prices_4',
+            name='Price Improvement 4 (14:40 ET)',
+        )
+
+        # Cancel unfilled orders - 15:50 ET = 20:50 UTC
+        self.scheduler.add_job(
+            self.task_cancel_unfilled,
+            CronTrigger(day_of_week='mon-fri', hour=20, minute=50),
+            id='cancel_unfilled',
+            name='Cancel Unfilled Orders (15:50 ET)',
+        )
+
+        # Final fill check - 15:55 ET = 20:55 UTC
         self.scheduler.add_job(
             self.task_check_fills,
-            CronTrigger(day_of_week='mon-fri', hour=20, minute=50),
+            CronTrigger(day_of_week='mon-fri', hour=20, minute=55),
             id='check_fills',
-            name='Check Fills (15:50 ET)',
+            name='Check Fills (15:55 ET)',
         )
 
         # Evening disconnect - 16:05 ET = 21:05 UTC
@@ -883,6 +1190,9 @@ class TradingDaemon:
 
         # Setup schedule
         self.setup_schedule()
+
+        # Cleanup stale orders before doing anything else
+        self._cleanup_stale_orders()
 
         # Always connect immediately on start to verify connection and log account
         logger.info("Connecting to IB Gateway on startup...")

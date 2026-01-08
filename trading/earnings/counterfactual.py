@@ -233,6 +233,19 @@ def backfill_counterfactuals(
     failed = 0
 
     for non_trade in pending:
+        # Skip if earnings reaction hasn't happened yet
+        # BMO: reaction is same day, need exit_date = earnings_date
+        # AMC: reaction is next day, need exit_date = earnings_date + 1
+        if non_trade.earnings_timing == 'BMO':
+            exit_date = earnings_date
+        else:  # AMC
+            exit_date = earnings_date + timedelta(days=1)
+
+        if exit_date > date.today():
+            skipped += 1
+            logger.debug(f"{non_trade.ticker}: Skipping - exit date {exit_date} is in the future")
+            continue
+
         # Fetch realized move
         move_data = fetch_realized_move(
             non_trade.ticker,

@@ -420,8 +420,18 @@ class Phase0Executor:
                 strike = 0.0
 
             if not ib_trade:
-                # Order not found - may have been cancelled or filled
-                logger.warning(f"{trade.ticker}: Order not found in IBKR (ID: {order_id})")
+                # Order not found in IBKR's open orders
+                # If it was already filled, leave it alone (filled orders aren't "open")
+                if trade.status == 'filled':
+                    logger.info(f"{trade.ticker}: Already filled, skipping recovery")
+                    continue
+                # Only cancel truly pending orders that aren't in IBKR
+                logger.warning(f"{trade.ticker}: Order not found in IBKR (ID: {order_id}) - marking as cancelled")
+                self.logger.update_trade(
+                    trade.trade_id,
+                    status='cancelled',
+                    notes='Auto-cancelled: order not found in IBKR on recovery'
+                )
                 continue
 
             # Check status

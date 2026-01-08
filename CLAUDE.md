@@ -122,6 +122,8 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Max daily trades limit enforcement
 - [x] Dashboard warnings/errors display
 - [x] Counterfactual logging for non-trades
+- [x] Dashboard UX improved (Portugal time, visual timeline, compact view)
+- [x] Daemon duplicate trade prevention (restart safety)
 
 ### File Structure
 

@@ -210,28 +210,36 @@ class TradingDaemon:
         """9:25 AM ET - Connect before market open."""
         logger.info("=== MORNING CONNECT ===")
 
-        # Reset daily state
-        self.todays_candidates = []
-        self.todays_trades = []
-
-        # Cleanup stale orders
-        self._cleanup_stale_orders()
-
-        # Load any trades already placed today (to prevent duplicates on restart)
-        self._load_todays_activity()
-
-        # Load ML predictor
         try:
-            self.predictor = get_predictor()
-            logger.info(f"ML predictor loaded: {len(self.predictor.models)} models")
+            # Reset daily state
+            self.todays_candidates = []
+            self.todays_trades = []
+
+            # Cleanup stale orders
+            self._cleanup_stale_orders()
+
+            # Load any trades already placed today (to prevent duplicates on restart)
+            self._load_todays_activity()
+
+            # Load ML predictor
+            try:
+                self.predictor = get_predictor()
+                logger.info(f"ML predictor loaded: {len(self.predictor.models)} models")
+            except Exception as e:
+                logger.error(f"Failed to load ML predictor: {e}")
+                self.predictor = None
+
+            # Load positions that need to be exited today
+            self._load_positions_to_exit()
+
+            # Recover active exit orders
+            if self.executor:
+                self._recover_exit_orders()
+
+            await self.connect_async()
+
         except Exception as e:
-            logger.error(f"Failed to load ML predictor: {e}")
-            self.predictor = None
-
-        # Load positions that need to be exited today
-        self._load_positions_to_exit()
-
-        await self.connect_async()
+            logger.exception(f"Morning connect failed: {e}")
 
     async def task_screen_candidates(self):
         """2:00 PM ET - Screen upcoming earnings."""
@@ -253,7 +261,7 @@ class TradingDaemon:
 
             # Fetch earnings for tomorrow (T+1)
             # Nasdaq API call is sync, run in executor to not block loop
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             events = await loop.run_in_executor(None, lambda: fetch_upcoming_earnings(days_ahead=3))
 
             # Filter to events happening tomorrow or day after
@@ -709,15 +717,18 @@ class TradingDaemon:
         """4:05 PM ET - Disconnect."""
         logger.info("=== EVENING DISCONNECT ===")
 
-        await self.task_monitor_fills()
+        try:
+            await self.task_monitor_fills()
 
-        if self.active_exit_orders:
-            logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
-            filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
-            for exit_pair in filled:
-                self.active_exit_orders.pop(exit_pair.trade_id, None)
+            if self.active_exit_orders:
+                logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
+                filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
+                for exit_pair in filled:
+                    self.active_exit_orders.pop(exit_pair.trade_id, None)
 
-        self.disconnect()
+            self.disconnect()
+        except Exception as e:
+            logger.exception(f"Evening disconnect failed: {e}")
 
     def _cleanup_stale_orders(self):
         """Clean up stale unfilled orders."""
@@ -737,15 +748,26 @@ class TradingDaemon:
         for trade in trades:
             try:
                 entry_date = datetime.fromisoformat(trade.entry_datetime).date()
-            except:
+            except Exception:
                 continue
 
             if entry_date <= yesterday and not trade.exit_datetime:
+                # Safe strike parsing
+                strike = 0.0
+                try:
+                    import json
+                    if trade.strikes:
+                        strikes_list = json.loads(trade.strikes)
+                        if strikes_list:
+                            strike = float(strikes_list[0])
+                except Exception as e:
+                    logger.error(f"Error parsing strikes for {trade.ticker}: {e}")
+
                 self.positions_to_exit.append({
                     'trade_id': trade.trade_id,
                     'symbol': trade.ticker,
                     'expiry': trade.expiration,
-                    'strike': float(trade.strikes.strip('[]')),
+                    'strike': strike,
                     'contracts': trade.contracts,
                     'entry_fill_price': trade.entry_fill_price,
                 })
@@ -818,7 +840,7 @@ class TradingDaemon:
                     import json
                     strikes = json.loads(trade.strikes) if trade.strikes else []
                     strike = strikes[0] if strikes else 0.0
-                except:
+                except Exception:
                     strike = 0.0
 
                 exit_order = ExitComboOrder(

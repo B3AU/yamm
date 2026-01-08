@@ -441,7 +441,17 @@ class TradeLogger:
                 # Remove DB-only columns not in dataclass
                 row_dict.pop('created_at', None)
                 row_dict.pop('updated_at', None)
-                results.append(TradeLog(**row_dict))
+
+                # IMPORTANT: Handle dynamically added columns (like entry_combo_bid/ask)
+                # that might exist in DB but aren't in TradeLog dataclass yet if old code runs
+                # Or vice versa: if dataclass has fields but DB row doesn't (handled by dataclass defaults)
+
+                # Filter row_dict to only include keys that match TradeLog fields
+                # This makes the logger robust to schema drifts
+                valid_fields = set(TradeLog.__match_args__)
+                filtered_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
+
+                results.append(TradeLog(**filtered_dict))
             return results
 
     def get_non_trades(
@@ -500,7 +510,11 @@ class TradeLogger:
                 row_dict = dict(row)
                 row_dict.pop('created_at', None)
                 row_dict.pop('updated_at', None)
-                results.append(TradeLog(**row_dict))
+
+                valid_fields = set(TradeLog.__match_args__)
+                filtered_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
+
+                results.append(TradeLog(**filtered_dict))
             return results
 
     def cleanup_stale_orders(self, max_age_hours: int = 24) -> list[str]:

@@ -312,6 +312,10 @@ class Phase0Executor:
 
             elif filled_qty > 0 and filled_qty < total_qty:
                 # Partial fill on combo (rare but possible)
+                if combo_order.status != 'partial':
+                    combo_order.status = 'partial'
+                    self.logger.update_trade(trade_id, status='partial')
+
                 logger.warning(
                     f"{combo_order.symbol}: PARTIAL COMBO FILL - "
                     f"{int(filled_qty)}/{int(total_qty)} ({status})"
@@ -617,6 +621,12 @@ async def close_position(
             avg_fill_price=0.0,
             limit_price=straddle_limit,
             details={'type': 'exit', 'symbol': symbol}
+        )
+
+        # Save exit order ID for recovery
+        trade_logger.update_trade(
+            trade_id,
+            exit_call_order_id=trade.order.orderId
         )
 
     except Exception as e:

@@ -424,6 +424,11 @@ class TradingDaemon:
             logger.info(f"Checking {active_count} active orders for cancellation...")
 
             for trade_id, combo_order in list(self.executor.active_orders.items()):
+                # Handle partial fills
+                if combo_order.status == 'partial':
+                    logger.info(f"  {combo_order.symbol}: Order is partially filled, keeping open until close.")
+                    continue
+
                 if combo_order.status == 'pending':
                     result = self.executor.cancel_unfilled_orders(trade_id)
                     if result.get('cancelled'):
@@ -768,6 +773,75 @@ class TradingDaemon:
         except Exception as e:
             logger.error(f"Failed to load today's activity: {e}")
 
+    def _recover_exit_orders(self):
+        """Recover active exit orders from database after restart."""
+        try:
+            # Find trades that are exiting/exited but we want to track
+            # 'exited' might be useful if we want to confirm fill details,
+            # but mainly we care about 'exiting' (placed but not confirmed filled by daemon)
+            # OR 'exited' if we just restarted and want to catch up on fill events.
+            # For simplicity, look for trades with exit order IDs.
+
+            trades = self.trade_logger.get_trades()
+            recovered_count = 0
+
+            # Get open orders from IB to map orderId -> Trade object
+            open_orders = {t.order.orderId: t for t in self.ib.openTrades()}
+
+            for trade in trades:
+                # We only care if:
+                # 1. It has an exit order ID
+                # 2. It's not fully finalized in our memory (though here we start fresh)
+                # 3. Status is 'exiting' OR 'exited' (to catch up)
+                if not trade.exit_call_order_id:
+                    continue
+
+                if trade.trade_id in self.active_exit_orders:
+                    continue
+
+                # Check if this exit order is still open in IB
+                order_id = trade.exit_call_order_id
+                ib_trade = open_orders.get(order_id)
+
+                if not ib_trade:
+                    # Not in open orders. Check if it's filled or cancelled according to DB
+                    # If DB says 'exiting' but IB doesn't have it, it might be filled or cancelled.
+                    # We can't easily reconstruct the ExitComboOrder without the IB Trade object
+                    # unless we create a dummy one, which is risky.
+                    # For now, skip if not in open orders.
+                    # Ideally we should query execution details, but that's complex for combo.
+                    continue
+
+                # Reconstruct ExitComboOrder
+                # Need to parse strikes/expiry from trade log
+                try:
+                    import json
+                    strikes = json.loads(trade.strikes) if trade.strikes else []
+                    strike = strikes[0] if strikes else 0.0
+                except:
+                    strike = 0.0
+
+                exit_order = ExitComboOrder(
+                    trade_id=trade.trade_id,
+                    symbol=trade.ticker,
+                    expiry=trade.expiration,
+                    strike=strike,
+                    contracts=trade.contracts,
+                    order_id=order_id,
+                    trade=ib_trade,
+                    entry_fill_price=trade.entry_fill_price,
+                    status=ib_trade.orderStatus.status.lower()
+                )
+
+                self.active_exit_orders[trade.trade_id] = exit_order
+                recovered_count += 1
+
+            if recovered_count > 0:
+                logger.info(f"Recovered {recovered_count} active exit orders")
+
+        except Exception as e:
+            logger.error(f"Failed to recover exit orders: {e}")
+
     async def _log_account_summary(self):
         """Log account info (Async)."""
         logger.info("=" * 50)
@@ -874,15 +948,22 @@ class TradingDaemon:
         )
 
         # Backfill - 16:30 ET
-        # Sync task in async scheduler needs executor?
-        # No, backfill_counterfactuals is sync. Run in executor.
-        loop = asyncio.get_event_loop()
         self.scheduler.add_job(
-            lambda: loop.run_in_executor(None, lambda: backfill_counterfactuals(self.trade_logger)),
+            self.run_backfill_task,
             CronTrigger(day_of_week='mon-fri', hour=16, minute=30, timezone=ET),
             id='backfill',
             name='Backfill (16:30 ET)',
         )
+
+    async def run_backfill_task(self):
+        """Async wrapper for synchronous backfill task."""
+        logger.info("Starting daily counterfactual backfill...")
+        try:
+            # Use to_thread for clean async execution of sync function
+            stats = await asyncio.to_thread(backfill_counterfactuals, self.trade_logger, date.today())
+            logger.info(f"Backfill complete: {stats}")
+        except Exception as e:
+            logger.exception(f"Backfill task failed: {e}")
 
     async def run_async(self):
         """Async entry point."""
@@ -901,6 +982,11 @@ class TradingDaemon:
         # Initial cleanup & load
         self._cleanup_stale_orders()
         self._load_todays_activity()
+
+        # Recover any active orders (entry or exit) from DB if daemon restarted
+        if self.executor:
+            self.executor.recover_orders()
+            self._recover_exit_orders()
 
         # Startup checks
         await self._run_screening_if_needed()

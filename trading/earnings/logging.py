@@ -87,6 +87,8 @@ class TradeLog:
     # IBKR order tracking (for recovery after restart)
     call_order_id: Optional[int] = None
     put_order_id: Optional[int] = None
+    exit_call_order_id: Optional[int] = None
+    exit_put_order_id: Optional[int] = None
 
     # Counterfactuals (logged for analysis)
     counterfactual_exit_open_pnl: Optional[float] = None  # if exited at next open
@@ -226,6 +228,14 @@ class TradeLogger:
                 conn.execute("ALTER TABLE trades ADD COLUMN put_order_id INTEGER")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN exit_call_order_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN exit_put_order_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
 
             # Add markout columns (migration)
             for col in ['markout_1min', 'markout_5min', 'markout_30min']:

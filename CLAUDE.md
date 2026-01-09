@@ -243,6 +243,15 @@ python -m trading.earnings.dashboard --watch --live
 
 # Dashboard (show completed trades)
 python -m trading.earnings.dashboard --all
+
+# Test screening pipeline (without daemon)
+python -m trading.earnings.test_screening
+
+# Test specific ticker
+python -m trading.earnings.test_screening --ticker AAPL --earnings-date 2026-01-30 --timing AMC
+
+# Test ML only (no IBKR)
+python -m trading.earnings.test_screening --no-ibkr --ticker AAPL
 ```
 
 ### Environment Variables

@@ -50,6 +50,27 @@ DRY_RUN=true python3 -m trading.earnings.daemon
 python3 -m trading.earnings.daemon
 ```
 
+### Test Screening Pipeline
+
+Run the ML and LLM screening pipeline outside of the daemon:
+
+```bash
+# Full pipeline with IBKR connection
+python3 -m trading.earnings.test_screening
+
+# Test specific ticker(s)
+python3 -m trading.earnings.test_screening --ticker AAPL --earnings-date 2026-01-30 --timing AMC
+
+# Skip IBKR screening (ML + LLM only)
+python3 -m trading.earnings.test_screening --no-ibkr --ticker AAPL
+
+# Skip LLM sanity check
+python3 -m trading.earnings.test_screening --no-llm
+
+# Custom thresholds
+python3 -m trading.earnings.test_screening --spread-threshold 12 --edge-threshold 0.03
+```
+
 **Option 2: Systemd (for production)**
 ```bash
 # Install service

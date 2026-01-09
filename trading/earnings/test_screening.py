@@ -72,18 +72,22 @@ async def main():
     else:
         # Mock candidates for testing ML/LLM without IBKR
         from trading.earnings.screener import ScreenedCandidate
+        from datetime import timedelta
         logger.info("\nSkipping IBKR screening, using mock candidate data")
         for e in events:
+            # Mock expiry: next Friday after earnings (or +3 days if that's simpler)
+            mock_expiry = e.earnings_date + timedelta(days=3)
             candidates.append(ScreenedCandidate(
                 symbol=e.symbol,
                 earnings_date=e.earnings_date,
                 timing=e.timing,
-                expiry="2026-01-17",  # Mock
+                expiry=mock_expiry.strftime("%Y-%m-%d"),
                 atm_strike=100.0,
                 spot_price=100.0,
                 call_bid=2.0, call_ask=2.20, call_iv=0.50,
                 put_bid=2.0, put_ask=2.20, put_iv=0.50,
                 straddle_mid=4.10,
+                straddle_spread=0.40,
                 spread_pct=4.9,
                 implied_move_pct=4.1,
             ))

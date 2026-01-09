@@ -182,6 +182,8 @@ WEB SEARCH RESULTS:
 
 Analyze and respond with JSON only."""
 
+    logger.info(f"Calling OpenRouter with model: {DEFAULT_MODEL}")
+
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -195,14 +197,34 @@ Analyze and respond with JSON only."""
                 {"role": "user", "content": user_message},
             ],
             "temperature": 0.1,  # Low temperature for consistent output
-            "max_tokens": 500,
+            "max_tokens": 5000,  # Enough for reasoning models + response
         },
         timeout=30,
     )
+
+    # Log response status for debugging
+    if not response.ok:
+        logger.error(f"OpenRouter API error: {response.status_code} - {response.text[:500]}")
     response.raise_for_status()
 
     data = response.json()
+
+    # Check for API-level errors
+    if "error" in data:
+        raise ValueError(f"OpenRouter error: {data['error']}")
+
+    # Extract content
+    if "choices" not in data or not data["choices"]:
+        logger.error(f"Unexpected OpenRouter response: {data}")
+        raise ValueError("No choices in OpenRouter response")
+
     content = data["choices"][0]["message"]["content"]
+
+    if not content:
+        logger.error(f"Empty content in OpenRouter response: {data}")
+        raise ValueError("Empty content from LLM")
+
+    logger.debug(f"Raw LLM response: {content[:200]}...")
 
     # Parse JSON from response (handle markdown code blocks)
     if "```json" in content:

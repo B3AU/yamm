@@ -128,6 +128,20 @@ NON_TRADE_COLUMNS = {
 
 
 @dataclass
+class SnapshotLog:
+    """Intraday price snapshot for an open position."""
+    trade_id: str
+    ts: str  # ISO timestamp
+    minutes_since_open: int  # Minutes since 9:30 ET market open
+    straddle_mid: float  # Call mid + Put mid
+    call_mid: Optional[float] = None
+    put_mid: Optional[float] = None
+    spot_price: Optional[float] = None  # Underlying stock price
+    unrealized_pnl: Optional[float] = None  # (straddle_mid - entry_fill_price) * contracts * 100
+    unrealized_pnl_pct: Optional[float] = None  # straddle_mid / entry_fill_price - 1
+
+
+@dataclass
 class NonTradeLog:
     """Record of candidates we passed on - critical for survivorship bias."""
     # Identification
@@ -321,6 +335,25 @@ class TradeLogger:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+            # Price snapshots table (intraday position tracking)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS price_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    minutes_since_open INTEGER,
+                    straddle_mid REAL,
+                    call_mid REAL,
+                    put_mid REAL,
+                    spot_price REAL,
+                    unrealized_pnl REAL,
+                    unrealized_pnl_pct REAL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_trade ON price_snapshots(trade_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON price_snapshots(ts)")
+
             # Order events table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS order_events (
@@ -341,6 +374,28 @@ class TradeLogger:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_order_events_trade_id ON order_events(trade_id)")
+
+            # LLM sanity checks table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS llm_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    trade_id TEXT,
+                    decision TEXT NOT NULL,
+                    risk_flags TEXT,
+                    reasons TEXT,
+                    search_queries TEXT,
+                    search_results TEXT,
+                    packet_json TEXT,
+                    response_json TEXT,
+                    latency_ms INTEGER,
+                    model TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_checks_ticker ON llm_checks(ticker)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_checks_decision ON llm_checks(decision)")
 
             # Indexes for common queries
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)")
@@ -449,6 +504,83 @@ class TradeLogger:
                 last_fill_price, last_fill_qty, limit_price, details_json
             ))
             conn.commit()
+
+    def log_snapshot(self, snapshot: SnapshotLog) -> None:
+        """Log an intraday price snapshot for a position."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO price_snapshots (
+                    trade_id, ts, minutes_since_open, straddle_mid,
+                    call_mid, put_mid, spot_price,
+                    unrealized_pnl, unrealized_pnl_pct
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                snapshot.trade_id, snapshot.ts, snapshot.minutes_since_open,
+                snapshot.straddle_mid, snapshot.call_mid, snapshot.put_mid,
+                snapshot.spot_price, snapshot.unrealized_pnl, snapshot.unrealized_pnl_pct
+            ))
+            conn.commit()
+
+    def log_llm_check(
+        self,
+        ticker: str,
+        decision: str,
+        risk_flags: list,
+        reasons: list,
+        search_queries: list,
+        search_results: list,
+        packet: dict,
+        response: dict,
+        latency_ms: int,
+        model: str,
+        trade_id: str = None,
+    ) -> None:
+        """Log an LLM sanity check result."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO llm_checks (
+                    ts, ticker, trade_id, decision, risk_flags, reasons,
+                    search_queries, search_results, packet_json, response_json,
+                    latency_ms, model
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.utcnow().isoformat(),
+                ticker,
+                trade_id,
+                decision,
+                json.dumps(risk_flags),
+                json.dumps(reasons),
+                json.dumps(search_queries),
+                json.dumps(search_results[:5]),  # Limit stored results
+                json.dumps(packet),
+                json.dumps(response),
+                latency_ms,
+                model,
+            ))
+            conn.commit()
+
+    def get_snapshots(self, trade_id: str) -> list[SnapshotLog]:
+        """Get all snapshots for a trade, ordered by time."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM price_snapshots WHERE trade_id = ? ORDER BY ts",
+                (trade_id,)
+            ).fetchall()
+            results = []
+            for row in rows:
+                results.append(SnapshotLog(
+                    trade_id=row['trade_id'],
+                    ts=row['ts'],
+                    minutes_since_open=row['minutes_since_open'],
+                    straddle_mid=row['straddle_mid'],
+                    call_mid=row['call_mid'],
+                    put_mid=row['put_mid'],
+                    spot_price=row['spot_price'],
+                    unrealized_pnl=row['unrealized_pnl'],
+                    unrealized_pnl_pct=row['unrealized_pnl_pct'],
+                ))
+            return results
 
     def get_latest_order_event(self, trade_id: str) -> Optional[dict]:
         """Get the latest order event for a trade."""

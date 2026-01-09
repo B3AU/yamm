@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from ib_insync import IB, Option, LimitOrder, Trade, Contract, ComboLeg
+from ib_insync import IB, Option, Stock, LimitOrder, MarketOrder, Trade, Contract, ComboLeg
 
 from trading.earnings.screener import ScreenedCandidate
 from trading.earnings.logging import (
@@ -96,6 +96,7 @@ class ExitComboOrder:
     call_fill_price: Optional[float] = None
     put_fill_price: Optional[float] = None
     entry_fill_price: Optional[float] = None  # For P&L calculation
+    spot_at_entry: Optional[float] = None  # For realized move calculation
 
     status: str = 'pending'  # pending, filled
 
@@ -561,6 +562,7 @@ async def close_position(
     contracts: int,
     limit_aggression: float = 0.3,
     entry_fill_price: Optional[float] = None,
+    spot_at_entry: Optional[float] = None,
 ) -> Optional[ExitComboOrder]:
     """
     Close an existing straddle position using separate leg orders.
@@ -689,6 +691,7 @@ async def close_position(
         call_conId=call.conId,
         put_conId=put.conId,
         entry_fill_price=entry_fill_price,
+        spot_at_entry=spot_at_entry,
         status='pending',
     )
     # Store put trade for monitoring
@@ -697,13 +700,61 @@ async def close_position(
     return exit_order
 
 
-def check_exit_fills(
+async def _retry_failed_exit_leg(
+    ib: IB,
+    exit_order: ExitComboOrder,
+    failed_side: str,  # 'call' or 'put'
+    use_market_order: bool = True,
+) -> Optional[Trade]:
+    """Retry a failed exit leg with more aggressive pricing (market order)."""
+    symbol = exit_order.symbol
+    expiry = exit_order.expiry
+    strike = exit_order.strike
+    contracts = exit_order.contracts
+
+    # Create option contract for failed leg
+    right = 'C' if failed_side == 'call' else 'P'
+    option = Option(symbol, expiry, strike, right, 'SMART', tradingClass=symbol)
+
+    try:
+        await ib.qualifyContractsAsync(option)
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to qualify {failed_side} for retry: {e}")
+        return None
+
+    # Use market order for reliability
+    if use_market_order:
+        order = MarketOrder('SELL', contracts)
+    else:
+        # Get current quote and use bid price (most aggressive limit)
+        ticker = ib.reqMktData(option, '', False, False)
+        for _ in range(10):
+            if ticker.bid and ticker.bid > 0:
+                break
+            await asyncio.sleep(0.1)
+        limit_price = ticker.bid if ticker.bid and ticker.bid > 0 else 0.01
+        ib.cancelMktData(option)
+        order = LimitOrder('SELL', contracts, limit_price)
+
+    try:
+        trade = ib.placeOrder(option, order)
+        logger.info(f"{symbol}: Retry {failed_side} exit order placed ({'MKT' if use_market_order else 'LMT'})")
+        return trade
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to place retry order: {e}")
+        return None
+
+
+async def check_exit_fills(
     exit_orders: dict[str, ExitComboOrder],
     trade_logger: TradeLogger,
+    ib: IB = None,
 ) -> list[ExitComboOrder]:
     """Check status of exit orders (separate call/put legs) and update trade logs.
 
     Returns list of fully filled exit orders (both legs filled).
+
+    If ib is provided, fetches spot price at exit to calculate realized move.
     """
     filled = []
 
@@ -789,6 +840,38 @@ def check_exit_fills(
                 exit_pnl = premium_received - premium_paid
                 exit_pnl_pct = (exit_order.fill_price / exit_order.entry_fill_price - 1)
 
+            # Fetch spot price at exit and calculate realized move
+            spot_at_exit = None
+            realized_move = None
+            realized_move_pct = None
+
+            if ib and ib.isConnected():
+                try:
+                    stock = Stock(exit_order.symbol, 'SMART', 'USD')
+                    await ib.qualifyContractsAsync(stock)
+                    ticker = ib.reqMktData(stock, '', False, False)
+
+                    # Wait for price (max 2s)
+                    for _ in range(20):
+                        if ticker.last and ticker.last > 0:
+                            break
+                        if ticker.close and ticker.close > 0:
+                            break
+                        await asyncio.sleep(0.1)
+
+                    spot_at_exit = ticker.marketPrice()
+                    if spot_at_exit != spot_at_exit or spot_at_exit <= 0:  # NaN check
+                        spot_at_exit = ticker.last if ticker.last and ticker.last > 0 else ticker.close
+
+                    ib.cancelMktData(stock)
+
+                    if spot_at_exit and spot_at_exit > 0 and exit_order.spot_at_entry:
+                        realized_move = abs(spot_at_exit - exit_order.spot_at_entry)
+                        realized_move_pct = realized_move / exit_order.spot_at_entry
+
+                except Exception as e:
+                    logger.warning(f"{exit_order.symbol}: Failed to fetch spot at exit: {e}")
+
             trade_logger.update_trade(
                 trade_id,
                 status='exited',
@@ -796,17 +879,52 @@ def check_exit_fills(
                 exit_slippage=exit_order.fill_price - combined_limit if combined_limit else None,
                 exit_pnl=exit_pnl,
                 exit_pnl_pct=exit_pnl_pct,
+                spot_at_exit=spot_at_exit,
+                realized_move=realized_move,
+                realized_move_pct=realized_move_pct,
             )
 
             pnl_str = f", P&L: ${exit_pnl:.2f}" if exit_pnl else ""
+            move_str = f", move: {realized_move_pct*100:.1f}%" if realized_move_pct else ""
             logger.info(
                 f"{exit_order.symbol}: EXIT COMPLETE - "
                 f"Call: ${call_avg_fill:.2f}, Put: ${put_avg_fill:.2f}, "
-                f"Combined: ${exit_order.fill_price:.2f}{pnl_str}"
+                f"Combined: ${exit_order.fill_price:.2f}{pnl_str}{move_str}"
             )
 
-        # Handle cancellations
-        elif call_status in ('Cancelled', 'Inactive') or put_status in ('Cancelled', 'Inactive'):
+        # Handle partial exits (orphan leg detection)
+        call_filled = call_status == 'Filled'
+        put_filled = put_status == 'Filled'
+        call_failed = call_status in ('Cancelled', 'Inactive')
+        put_failed = put_status in ('Cancelled', 'Inactive')
+
+        if (call_filled and put_failed) or (put_filled and call_failed):
+            # ORPHAN DETECTED - one leg closed, other failed
+            failed_side = 'put' if put_failed else 'call'
+            logger.warning(f"{exit_order.symbol}: ORPHAN LEG - {failed_side} failed while other filled, retrying...")
+
+            if ib and ib.isConnected():
+                retry_trade = await _retry_failed_exit_leg(ib, exit_order, failed_side)
+                if retry_trade:
+                    # Update tracking to monitor retry
+                    if failed_side == 'put':
+                        exit_order.put_trade = retry_trade
+                        exit_order._last_put_status = None  # Reset status tracking
+                        exit_order._last_put_filled = 0
+                    else:
+                        exit_order.trade = retry_trade
+                        exit_order._last_call_status = None
+                        exit_order._last_call_filled = 0
+                    exit_order.status = 'retrying'
+                else:
+                    exit_order.status = 'orphan'
+                    logger.error(f"{exit_order.symbol}: Failed to retry {failed_side} exit - MANUAL INTERVENTION REQUIRED")
+            else:
+                exit_order.status = 'orphan'
+                logger.error(f"{exit_order.symbol}: Cannot retry - IB not connected - MANUAL INTERVENTION REQUIRED")
+
+        # Handle both legs cancelled
+        elif call_failed and put_failed:
             exit_order.status = 'cancelled'
             logger.warning(f"{exit_order.symbol}: Exit order cancelled/inactive (call={call_status}, put={put_status})")
 

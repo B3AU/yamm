@@ -56,7 +56,7 @@ from trading.earnings.screener import (
 from trading.earnings.executor import (
     Phase0Executor, close_position, ExitComboOrder, check_exit_fills
 )
-from trading.earnings.logging import TradeLogger
+from trading.earnings.logging import TradeLogger, SnapshotLog
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
 from trading.earnings.counterfactual import backfill_counterfactuals
 
@@ -104,6 +104,16 @@ CONFIG = {
     'log_path': PROJECT_ROOT / 'logs' / 'daemon.log',
 
     'dry_run': os.getenv('DRY_RUN', 'false').lower() == 'true',
+
+    # LLM sanity check threshold: PASS, WARN, NO_TRADE, or DISABLED
+    # - PASS: Only trade if LLM returns PASS (strictest)
+    # - WARN: Trade on PASS or WARN, block on NO_TRADE (default for live)
+    # - NO_TRADE: Trade on anything except NO_TRADE (permissive, good for paper)
+    # - DISABLED: Skip LLM check entirely
+    'llm_sanity_threshold': os.getenv(
+        'PAPER_LLM_SANITY_THRESHOLD' if PAPER_MODE else 'LLM_SANITY_THRESHOLD',
+        'NO_TRADE' if PAPER_MODE else 'WARN'
+    ),
 }
 
 # Setup logging
@@ -357,8 +367,54 @@ class TradingDaemon:
 
                 passed = ml_passed
                 logger.info(f"ML edge filter: {len(passed)} passed")
+            elif not passed:
+                logger.info("No candidates passed liquidity screening - skipping ML filter")
             else:
                 logger.warning("ML predictor not available - using liquidity-only screening")
+
+            # LLM sanity check (if not disabled)
+            llm_threshold = CONFIG['llm_sanity_threshold']
+            if llm_threshold != 'DISABLED' and passed:
+                from trading.earnings.llm_sanity_check import check_with_llm, build_sanity_packet
+
+                logger.info(f"Running LLM sanity checks (threshold={llm_threshold})...")
+                llm_passed = []
+
+                for candidate in passed:
+                    # Need to get prediction for this candidate to build packet
+                    prediction = self.predictor.predict(
+                        symbol=candidate.symbol,
+                        earnings_date=candidate.earnings_date,
+                        timing=candidate.timing,
+                    ) if self.predictor else None
+
+                    if not prediction:
+                        # No prediction, skip LLM check but allow trade
+                        llm_passed.append(candidate)
+                        continue
+
+                    packet = build_sanity_packet(candidate, prediction)
+                    result = await check_with_llm(packet, self.trade_logger, ticker=candidate.symbol)
+
+                    if result.decision == "NO_TRADE":
+                        candidate.rejection_reason = f"LLM NO_TRADE: {result.reasons[0] if result.reasons else 'Unknown'}"
+                        self.executor.log_non_trade(candidate)
+                        logger.warning(f"  {candidate.symbol}: LLM NO_TRADE - {result.risk_flags}")
+                    elif result.decision == "WARN" and llm_threshold == "PASS":
+                        # Strict mode: block on WARN
+                        candidate.rejection_reason = f"LLM WARN: {result.reasons[0] if result.reasons else 'Unknown'}"
+                        self.executor.log_non_trade(candidate)
+                        logger.warning(f"  {candidate.symbol}: LLM WARN (blocked in strict mode) - {result.risk_flags}")
+                    else:
+                        # PASS or WARN with permissive threshold
+                        if result.decision == "WARN":
+                            logger.warning(f"  {candidate.symbol}: LLM WARN (proceeding) - {result.risk_flags}")
+                        else:
+                            logger.info(f"  {candidate.symbol}: LLM PASS")
+                        llm_passed.append(candidate)
+
+                passed = llm_passed
+                logger.info(f"LLM sanity check: {len(passed)} passed")
 
             # Limits again (in case changed)
             if already_placed > 0:
@@ -489,10 +545,10 @@ class TradingDaemon:
                         if result.get('cancelled'):
                             logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
 
-            # Check exit order fills (Sync check)
+            # Check exit order fills (with IB for spot price)
             if self.active_exit_orders:
                 logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
-                exit_filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
+                exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
                 logger.info(f"Exit fills: {len(exit_filled)} completed")
 
                 for exit_pair in exit_filled:
@@ -512,6 +568,10 @@ class TradingDaemon:
             return
 
         if not self.executor:
+            return
+
+        # Skip if no pending orders to monitor
+        if self.executor.get_active_count() == 0:
             return
 
         try:
@@ -602,6 +662,128 @@ class TradingDaemon:
                     self.ib.cancelMktData(put)
                 except Exception:
                     pass
+
+    async def _fetch_spot_price(self, symbol: str) -> Optional[float]:
+        """Fetch current stock price (Async)."""
+        stock = None
+        try:
+            from ib_insync import Stock
+            stock = Stock(symbol, 'SMART', 'USD')
+            await self.ib.qualifyContractsAsync(stock)
+
+            ticker = self.ib.reqMktData(stock, '', False, False)
+
+            # Wait for data
+            for _ in range(20):
+                if ticker.last and ticker.last > 0:
+                    break
+                if ticker.close and ticker.close > 0:
+                    break
+                await asyncio.sleep(0.1)
+
+            spot = ticker.marketPrice()
+            if spot != spot or spot <= 0:  # NaN check
+                spot = ticker.last if ticker.last and ticker.last > 0 else ticker.close
+
+            return spot if spot and spot > 0 else None
+
+        except Exception as e:
+            logger.error(f"Error fetching spot price for {symbol}: {e}")
+            return None
+        finally:
+            if stock is not None:
+                try:
+                    self.ib.cancelMktData(stock)
+                except Exception:
+                    pass
+
+    def _get_open_positions(self) -> list[dict]:
+        """Get positions to snapshot (open + exited today for counterfactual tracking)."""
+        filled_trades = self.trade_logger.get_trades(status='filled')
+        exited_trades = self.trade_logger.get_trades(status='exited')
+        positions = []
+
+        for trade in filled_trades + exited_trades:
+            # Skip if exited before today (only track same-day exits for counterfactual)
+            if trade.exit_datetime:
+                try:
+                    exit_date = datetime.fromisoformat(trade.exit_datetime).date()
+                    if exit_date < today_et():
+                        continue  # Exited on previous day, don't track
+                except Exception:
+                    continue
+
+            # Parse strike from JSON
+            try:
+                import json
+                strikes = json.loads(trade.strikes) if trade.strikes else []
+                strike = strikes[0] if strikes else 0.0
+            except Exception:
+                strike = 0.0
+
+            positions.append({
+                'trade_id': trade.trade_id,
+                'symbol': trade.ticker,
+                'expiry': trade.expiration,
+                'strike': strike,
+                'contracts': trade.contracts,
+                'entry_fill_price': trade.entry_fill_price,
+                'spot_at_entry': trade.spot_at_entry,
+            })
+
+        return positions
+
+    async def task_snapshot_positions(self):
+        """Take price snapshot of all open positions (runs every 5 min during market hours)."""
+        if not self.ib.isConnected():
+            return
+
+        positions = self._get_open_positions()
+        if not positions:
+            return
+
+        now = datetime.now(ET)
+        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_since_open = int((now - market_open).total_seconds() / 60)
+
+        logger.debug(f"Snapshotting {len(positions)} positions at T+{minutes_since_open}min")
+
+        for pos in positions:
+            try:
+                # Fetch straddle price (returns combined mid)
+                straddle_mid = await self._fetch_straddle_price(
+                    pos['symbol'], pos['expiry'], pos['strike']
+                )
+
+                if not straddle_mid:
+                    continue
+
+                # Calculate unrealized P&L
+                unrealized_pnl = None
+                unrealized_pnl_pct = None
+                entry_fill = pos.get('entry_fill_price')
+                if entry_fill and entry_fill > 0:
+                    unrealized_pnl = (straddle_mid - entry_fill) * pos['contracts'] * 100
+                    unrealized_pnl_pct = straddle_mid / entry_fill - 1
+
+                # Fetch spot price
+                spot = await self._fetch_spot_price(pos['symbol'])
+
+                snapshot = SnapshotLog(
+                    trade_id=pos['trade_id'],
+                    ts=now.isoformat(),
+                    minutes_since_open=minutes_since_open,
+                    straddle_mid=straddle_mid,
+                    call_mid=None,  # Could parse from _fetch_straddle_price if needed
+                    put_mid=None,
+                    spot_price=spot,
+                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pnl_pct=unrealized_pnl_pct,
+                )
+                self.trade_logger.log_snapshot(snapshot)
+
+            except Exception as e:
+                logger.error(f"Snapshot error for {pos['symbol']}: {e}")
 
     async def task_improve_prices(self, aggression: float = 0.5):
         """Walk up limit prices (Async)."""
@@ -725,6 +907,7 @@ class TradingDaemon:
                     contracts=pos['contracts'],
                     limit_aggression=CONFIG['limit_aggression'],
                     entry_fill_price=pos.get('entry_fill_price'),
+                    spot_at_entry=pos.get('spot_at_entry'),
                 )
 
                 if exit_pair:
@@ -749,7 +932,7 @@ class TradingDaemon:
 
             if self.active_exit_orders:
                 logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
-                filled = check_exit_fills(self.active_exit_orders, self.trade_logger)
+                filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
                 for exit_pair in filled:
                     self.active_exit_orders.pop(exit_pair.trade_id, None)
 
@@ -822,6 +1005,7 @@ class TradingDaemon:
                     'strike': strike,
                     'contracts': contracts,
                     'entry_fill_price': entry_fill_price,
+                    'spot_at_entry': trade.spot_at_entry,
                 })
 
         if self.positions_to_exit:
@@ -904,6 +1088,7 @@ class TradingDaemon:
                     order_id=order_id,
                     trade=ib_trade,
                     entry_fill_price=trade.entry_fill_price,
+                    spot_at_entry=trade.spot_at_entry,
                     status=ib_trade.orderStatus.status.lower()
                 )
 
@@ -989,6 +1174,14 @@ class TradingDaemon:
             CronTrigger(day_of_week='mon-fri', hour='14-16', minute='*', timezone=ET),
             id='monitor_fills',
             name='Monitor Fills (Every min)',
+        )
+
+        # Position snapshots every 5 minutes from 9:30-16:00 for intraday P&L tracking
+        self.scheduler.add_job(
+            self.task_snapshot_positions,
+            CronTrigger(day_of_week='mon-fri', hour='9-15', minute='*/5', timezone=ET),
+            id='snapshot_positions',
+            name='Snapshot Positions (Every 5min)',
         )
 
         # Price improvements 14:25 - 14:55 (after 14:15 order placement)

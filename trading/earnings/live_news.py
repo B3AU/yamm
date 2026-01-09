@@ -183,7 +183,8 @@ def get_live_news_pca_features(
     earnings_date: date,
     pca_model,
     lookback_days: int = 7,
-) -> tuple[int, np.ndarray]:
+    return_headlines: bool = False,
+) -> tuple[int, np.ndarray] | tuple[int, np.ndarray, list[dict]]:
     """Fetch live news and compute PCA features for prediction.
 
     Args:
@@ -191,16 +192,21 @@ def get_live_news_pca_features(
         earnings_date: Upcoming earnings date
         pca_model: Fitted PCA model from training
         lookback_days: Days before earnings to fetch news
+        return_headlines: If True, also return raw headline data for LLM sanity check
 
     Returns:
-        Tuple of (news_count, pca_features_array)
+        If return_headlines=False: Tuple of (news_count, pca_features_array)
+        If return_headlines=True: Tuple of (news_count, pca_features_array, headlines_list)
         pca_features_array is zeros if no news found
     """
     n_components = pca_model.n_components_ if pca_model else 10
     default_features = np.zeros(n_components)
+    empty_headlines: list[dict] = []
 
     if not FMP_API_KEY:
         logger.debug(f"FMP_API_KEY not set, using default news features for {symbol}")
+        if return_headlines:
+            return 0, default_features, empty_headlines
         return 0, default_features
 
     # Fetch news for lookback window
@@ -209,21 +215,39 @@ def get_live_news_pca_features(
 
     articles = fetch_fmp_news(symbol, from_date, to_date)
 
+    # Extract headlines for LLM sanity check (limit to 10 most recent)
+    headlines = [
+        {
+            "ts": a.get("publishedDate"),
+            "source": a.get("site"),
+            "title": a.get("title"),
+        }
+        for a in articles[:10]
+    ]
+
     if not articles:
         logger.debug(f"No news found for {symbol} in {lookback_days}-day window")
+        if return_headlines:
+            return 0, default_features, empty_headlines
         return 0, default_features
 
     # Get mean embedding
     mean_emb = anonymize_and_embed(articles, symbol)
 
     if mean_emb is None:
+        if return_headlines:
+            return len(articles), default_features, headlines
         return len(articles), default_features
 
     # Apply PCA
     try:
         pca_features = pca_model.transform(mean_emb.reshape(1, -1))[0]
         logger.debug(f"Generated PCA features for {symbol} from {len(articles)} articles")
+        if return_headlines:
+            return len(articles), pca_features, headlines
         return len(articles), pca_features
     except Exception as e:
         logger.error(f"PCA transform error for {symbol}: {e}")
+        if return_headlines:
+            return len(articles), default_features, headlines
         return len(articles), default_features

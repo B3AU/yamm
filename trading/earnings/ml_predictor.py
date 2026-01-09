@@ -50,6 +50,7 @@ class EdgePrediction:
     edge_q75: float  # pred_q75 - hist_move_mean
     edge_q90: float  # pred_q90 - hist_move_mean
     news_count: int = 0  # number of FMP news articles found
+    headlines: list = None  # raw headline data for LLM sanity check
 
 
 class EarningsPredictor:
@@ -475,9 +476,9 @@ class EarningsPredictor:
     def _fetch_news_features(self, symbol: str, earnings_date: date, lookback_days: int = 7) -> dict:
         """Fetch news and compute PCA features from FMP.
 
-        Returns dict with pre_earnings_news_count and news_pca_0 through news_pca_9.
+        Returns dict with pre_earnings_news_count, news_pca_0 through news_pca_9, and headlines.
         """
-        defaults = {'pre_earnings_news_count': 0}
+        defaults = {'pre_earnings_news_count': 0, 'headlines': []}
         for i in range(10):
             defaults[f'news_pca_{i}'] = 0.0
 
@@ -486,14 +487,15 @@ class EarningsPredictor:
 
         try:
             from .live_news import get_live_news_pca_features
-            news_count, pca_features = get_live_news_pca_features(
+            news_count, pca_features, headlines = get_live_news_pca_features(
                 symbol=symbol,
                 earnings_date=earnings_date,
                 pca_model=self.news_pca,
                 lookback_days=lookback_days,
+                return_headlines=True,
             )
 
-            result = {'pre_earnings_news_count': news_count}
+            result = {'pre_earnings_news_count': news_count, 'headlines': headlines}
             for i, val in enumerate(pca_features):
                 result[f'news_pca_{i}'] = float(val)
 
@@ -619,7 +621,7 @@ class EarningsPredictor:
 
     def _compute_news_features(self, symbol: str, earnings_date: date) -> dict:
         """Compute news PCA features from live FMP data only (no stale parquet fallback)."""
-        defaults = {'pre_earnings_news_count': 0}
+        defaults = {'pre_earnings_news_count': 0, 'headlines': []}
         for i in range(10):
             defaults[f'news_pca_{i}'] = 0.0
 
@@ -728,6 +730,7 @@ class EarningsPredictor:
         # Compute edge
         hist_move_mean = features.get('hist_move_mean', 0.0)
         news_count = int(features.get('pre_earnings_news_count', 0))
+        headlines = features.get('headlines', [])
 
         return EdgePrediction(
             symbol=symbol,
@@ -739,6 +742,7 @@ class EarningsPredictor:
             edge_q75=predictions.get(0.75, 0.0) - hist_move_mean,
             edge_q90=predictions.get(0.90, 0.0) - hist_move_mean,
             news_count=news_count,
+            headlines=headlines,
         )
 
     def get_prediction_status(

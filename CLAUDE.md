@@ -112,9 +112,6 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 ### Current Limitations / TODO
 
-#### High Priority
-- [ ] No position sizing logic (fixed 1 contract currently)
-
 #### Medium Priority
 - [ ] Strangle structure not implemented (straddles only)
 - [ ] No IV rank/percentile features
@@ -131,6 +128,74 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Counterfactual logging for non-trades
 - [x] Dashboard UX improved (Portugal time, visual timeline, compact view)
 - [x] Daemon duplicate trade prevention (restart safety)
+- [x] Proportional position sizing (target dollar entry amount)
+- [x] News count tracking (no stale parquet fallback)
+- [x] Realized move tracking (spot_at_exit, realized_move_pct)
+
+---
+
+### Analysis Queries (When More Data Available)
+
+#### Edge Hit Rate
+```sql
+-- Did actual moves exceed implied move?
+SELECT
+    COUNT(*) as total_trades,
+    SUM(CASE WHEN realized_move_pct > implied_move THEN 1 ELSE 0 END) as edge_hits,
+    ROUND(100.0 * SUM(CASE WHEN realized_move_pct > implied_move THEN 1 ELSE 0 END) / COUNT(*), 1) as hit_rate_pct
+FROM trades WHERE status = 'exited' AND realized_move_pct IS NOT NULL;
+```
+
+#### Implied vs Realized Analysis
+```sql
+-- Compare what we paid for vs what happened
+SELECT
+    ticker,
+    ROUND(implied_move * 100, 1) as implied_pct,
+    ROUND(realized_move_pct * 100, 1) as actual_pct,
+    ROUND((realized_move_pct - implied_move) * 100, 1) as edge_realized,
+    ROUND(exit_pnl, 0) as pnl,
+    news_count
+FROM trades
+WHERE status = 'exited'
+ORDER BY earnings_date DESC;
+```
+
+#### Edge vs P&L Correlation
+```sql
+-- Does positive edge correlate with positive P&L?
+SELECT
+    CASE WHEN realized_move_pct > implied_move THEN 'Edge Hit' ELSE 'Edge Miss' END as category,
+    COUNT(*) as trades,
+    ROUND(AVG(exit_pnl), 0) as avg_pnl,
+    SUM(exit_pnl) as total_pnl
+FROM trades WHERE status = 'exited' AND realized_move_pct IS NOT NULL
+GROUP BY category;
+```
+
+#### News Impact
+```sql
+-- Does having news improve predictions?
+SELECT
+    CASE WHEN news_count > 0 THEN 'With News' ELSE 'No News' END as category,
+    COUNT(*) as trades,
+    ROUND(AVG(exit_pnl_pct * 100), 1) as avg_return_pct,
+    ROUND(AVG(realized_move_pct - implied_move) * 100, 1) as avg_edge_realized
+FROM trades WHERE status = 'exited'
+GROUP BY category;
+```
+
+#### Position Sizing Impact
+```sql
+-- Did sizing help normalize risk?
+SELECT
+    contracts,
+    COUNT(*) as trades,
+    ROUND(AVG(premium_paid), 0) as avg_entry,
+    ROUND(AVG(exit_pnl), 0) as avg_pnl
+FROM trades WHERE status = 'exited'
+GROUP BY contracts ORDER BY contracts;
+```
 
 ### File Structure
 

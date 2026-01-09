@@ -85,6 +85,21 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Computes embeddings using sentence-transformers (BAAI/bge-base-en-v1.5)
 - Anonymizes company names for cleaner embeddings
 - PCA projection to match training features
+- Returns raw headlines for LLM sanity check
+
+#### LLM Sanity Check (`trading/earnings/llm_sanity_check.py`)
+- Pre-trade validation using LLM + web search
+- **Tavily API** for web search (earnings releases, halts, offerings, acquisitions)
+- **OpenRouter API** for LLM reasoning (Claude 3.5 Sonnet default)
+- Returns decision: `PASS`, `WARN`, or `NO_TRADE`
+- Configurable threshold via environment variable
+- All results logged to `llm_checks` table for analysis
+
+#### Test Screening (`trading/earnings/test_screening.py`)
+- Standalone script to test ML + LLM pipeline outside daemon
+- Supports specific tickers with manual earnings dates
+- Can skip IBKR or LLM for targeted testing
+- Useful for debugging and pre-market validation
 
 #### IB Options Client (`trading/earnings/ib_options.py`)
 - Wrapper around `ib_insync` for option chains and market data
@@ -131,6 +146,9 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Proportional position sizing (target dollar entry amount)
 - [x] News count tracking (no stale parquet fallback)
 - [x] Realized move tracking (spot_at_exit, realized_move_pct)
+- [x] LLM sanity check before order placement (Tavily + OpenRouter)
+- [x] Intraday price snapshots for exit timing analysis
+- [x] Orphan leg retry logic for failed exits
 
 ---
 
@@ -201,15 +219,18 @@ GROUP BY contracts ORDER BY contracts;
 
 ```
 trading/earnings/
-├── daemon.py          # Main scheduler daemon
-├── screener.py        # Earnings + options screening
-├── ml_predictor.py    # ML model inference
-├── executor.py        # Order placement + management
-├── logging.py         # Trade/non-trade logging
-├── counterfactual.py  # Counterfactual backfill for non-trades
-├── dashboard.py       # CLI dashboard
-├── live_news.py       # Live news embeddings
-└── ib_options.py      # IBKR options client wrapper
+├── daemon.py            # Main scheduler daemon
+├── screener.py          # Earnings + options screening
+├── ml_predictor.py      # ML model inference
+├── executor.py          # Order placement + management
+├── logging.py           # Trade/non-trade logging
+├── counterfactual.py    # Counterfactual backfill for non-trades
+├── dashboard.py         # CLI dashboard
+├── live_news.py         # Live news embeddings
+├── llm_sanity_check.py  # LLM + web search pre-trade validation
+├── test_screening.py    # Standalone pipeline testing
+├── ib_options.py        # IBKR options client wrapper
+└── README.md            # Component documentation
 
 models/
 ├── earnings_q50.txt   # LightGBM model files
@@ -257,8 +278,28 @@ python -m trading.earnings.test_screening --no-ibkr --ticker AAPL
 ### Environment Variables
 
 ```bash
-FMP_API_KEY=xxx          # Financial Modeling Prep API
-IB_CLIENT_ID=1           # IBKR client ID (default: 1)
+# Required
+FMP_API_KEY=xxx              # Financial Modeling Prep API
+
+# IBKR
+IB_PORT=4002                 # Gateway port (4002=paper, 7497=live)
+IB_CLIENT_ID=1               # Client ID
+
+# LLM Sanity Check (optional)
+OPENROUTER_API_KEY=xxx       # For LLM calls
+TAVILY_API_KEY=xxx           # For web search
+LLM_SANITY_MODEL=anthropic/claude-3.5-sonnet
+
+# LLM threshold: PASS, WARN, NO_TRADE, DISABLED
+LLM_SANITY_THRESHOLD=WARN              # Live default
+PAPER_LLM_SANITY_THRESHOLD=NO_TRADE    # Paper default
+
+# Trading config
+PAPER_MODE=true              # Paper trading mode
+SPREAD_THRESHOLD=15.0        # Max spread %
+EDGE_THRESHOLD=0.05          # Min edge (5%)
+MAX_DAILY_TRADES=5           # Daily trade limit
+TARGET_POSITION_DOLLARS=500  # Position size target
 ```
 
 ---

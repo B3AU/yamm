@@ -532,7 +532,6 @@ def render_dashboard(
 
     # === Open Positions ===
     print(bold("  OPEN POSITIONS"))
-    print("  " + "-" * 116)
 
     total_unrealized_pnl = 0
     has_live_data = False
@@ -541,10 +540,10 @@ def render_dashboard(
         if compact:
             # Compact format: 1 line per position
             print(f"  {'Sym':<5} {'Status':<7} {'Strike':<7} {'Exp':<5} {'Time':<4} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<6}")
-            print("  " + "-" * 122)
+            print("  " + "-" * 118)
         else:
             print(f"  {'Symbol':<8} {'Earnings':<12} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<12} {'LLM':<6}")
-            print("  " + "-" * 122)
+            print("  " + "-" * 118)
 
         for trade in open_trades:
             status_color = get_status_color(trade.status)
@@ -704,7 +703,7 @@ def render_dashboard(
                 print()
 
         # Show total unrealized P&L and risk summary
-        print("  " + "-" * 116)
+        print("  " + "-" * 118)
 
         # Calculate total capital at risk
         total_at_risk = sum(t.premium_paid or 0 for t in open_trades)
@@ -725,7 +724,7 @@ def render_dashboard(
     # === Completed Trades ===
     if completed_trades or show_all:
         print(bold("  COMPLETED TRADES"))
-        print("  " + "-" * 116)
+        print("  " + "-" * 118)
 
         if completed_trades:
             total_pnl = 0
@@ -733,7 +732,7 @@ def render_dashboard(
             losses = 0
 
             print(f"  {'Symbol':<8} {'Date':<12} {'Entry':<10} {'Exit':<10} {'P&L':<12} {'Return':<10}")
-            print("  " + "-" * 116)
+            print("  " + "-" * 118)
 
             for trade in completed_trades[-10:]:  # Last 10
                 entry = trade.premium_paid or 0
@@ -755,7 +754,7 @@ def render_dashboard(
                       f"{pnl_color}{format_currency(pnl):<12}{reset_color()} "
                       f"{pnl_color}{ret:+.1f}%{reset_color()}")
 
-            print("  " + "-" * 116)
+            print("  " + "-" * 118)
             win_rate = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
             pnl_color = '\033[92m' if total_pnl >= 0 else '\033[91m'
             print(f"  {'TOTAL':<8} {'':<12} {'':<10} {'':<10} "
@@ -767,7 +766,7 @@ def render_dashboard(
 
     # === Summary Stats ===
     print(bold("  SUMMARY"))
-    print("  " + "-" * 116)
+    print("  " + "-" * 118)
 
     stats = logger.get_summary_stats()
     metrics = logger.get_execution_metrics()
@@ -831,7 +830,7 @@ def render_dashboard(
                      timeline_events.append((f"{e.symbol} (Tmw BMO)", 1)) # 1 = tomorrow
 
              if timeline_events:
-                 print(dim("  " + "-" * 116))
+                 print(dim("  " + "-" * 118))
                  print(bold("  EARNINGS TIMELINE"))
 
                  # Group by day
@@ -861,7 +860,7 @@ def render_dashboard(
         if edge_total > 0:
             edge_hit_rate = edge_hits / edge_total * 100
             print(bold("  EDGE REALIZATION"))
-            print("  " + "-" * 116)
+            print("  " + "-" * 118)
             print(f"  Realized > Implied: {edge_hits}/{edge_total} ({edge_hit_rate:.0f}%)")
 
             # Show recent edge performance
@@ -880,7 +879,7 @@ def render_dashboard(
     # === Execution Quality ===
     if metrics.total_orders >= 5:
         print(bold("  EXECUTION QUALITY"))
-        print("  " + "-" * 116)
+        print("  " + "-" * 118)
 
         # Fill rate trend (last 10 vs all-time)
         recent_trades = [t for t in all_trades if t.status in ('filled', 'exited', 'cancelled')][-10:]
@@ -904,7 +903,7 @@ def render_dashboard(
     # === Equity Curve ===
     if len(completed_trades) >= 3:
         print(bold("  EQUITY CURVE"))
-        print("  " + "-" * 116)
+        print("  " + "-" * 118)
 
         # Build cumulative P&L series
         sorted_trades = sorted(
@@ -952,7 +951,7 @@ def render_dashboard(
     warnings_errors = get_recent_warnings_errors(LOG_PATH)
     if warnings_errors:
         print(bold("  RECENT WARNINGS/ERRORS"))
-        print("  " + "-" * 116)
+        print("  " + "-" * 118)
         for level, message in warnings_errors:
             if level == 'ERROR':
                 color = '\033[91m'  # Red
@@ -968,7 +967,7 @@ def render_dashboard(
         with_cf = [nt for nt in non_trades if nt.counterfactual_pnl is not None]
 
         print(bold("  COUNTERFACTUAL ANALYSIS (Rejected Candidates)"))
-        print("  " + "-" * 116)
+        print("  " + "-" * 118)
 
         if with_cf:
             avg_cf_pnl = sum(nt.counterfactual_pnl for nt in with_cf) / len(with_cf)

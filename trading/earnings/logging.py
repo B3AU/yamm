@@ -594,6 +594,24 @@ class TradeLogger:
                 return dict(row)
         return None
 
+    def get_llm_check_for_trade(self, ticker: str, entry_datetime: str) -> Optional[dict]:
+        """Get most recent LLM check for a ticker before entry time."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("""
+                SELECT * FROM llm_checks
+                WHERE ticker = ? AND ts <= ?
+                ORDER BY ts DESC LIMIT 1
+            """, (ticker, entry_datetime)).fetchone()
+            if row:
+                result = dict(row)
+                # Parse JSON fields
+                result['risk_flags'] = json.loads(result['risk_flags'] or '[]')
+                result['reasons'] = json.loads(result['reasons'] or '[]')
+                result['search_queries'] = json.loads(result['search_queries'] or '[]')
+                return result
+        return None
+
     def get_non_trades_pending_counterfactual(
         self,
         earnings_date: str,

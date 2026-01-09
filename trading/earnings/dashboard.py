@@ -518,6 +518,14 @@ def render_dashboard(
         print()
         return
 
+    # Build LLM check map for all trades
+    llm_check_map = {}
+    for trade in all_trades:
+        if trade.entry_datetime:
+            llm_check = logger.get_llm_check_for_trade(trade.ticker, trade.entry_datetime)
+            if llm_check:
+                llm_check_map[trade.trade_id] = llm_check
+
     # Categorize trades
     open_trades = [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
     completed_trades = [t for t in all_trades if t.status in ('completed', 'exited')]
@@ -532,11 +540,11 @@ def render_dashboard(
     if open_trades:
         if compact:
             # Compact format: 1 line per position
-            print(f"  {'Sym':<5} {'Status':<7} {'Strike':<7} {'Exp':<5} {'Time':<4} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5}")
-            print("  " + "-" * 116)
+            print(f"  {'Sym':<5} {'Status':<7} {'Strike':<7} {'Exp':<5} {'Time':<4} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<6}")
+            print("  " + "-" * 122)
         else:
-            print(f"  {'Symbol':<8} {'Earnings':<12} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<12}")
-            print("  " + "-" * 116)
+            print(f"  {'Symbol':<8} {'Earnings':<12} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<12} {'LLM':<6}")
+            print("  " + "-" * 122)
 
         for trade in open_trades:
             status_color = get_status_color(trade.status)
@@ -600,13 +608,23 @@ def render_dashboard(
                     spread_pct = (spread / trade.entry_quoted_mid) * 100
                     spread_str = f"{spread_pct:.0f}%"
 
+                # LLM check result with color
+                llm_check = llm_check_map.get(trade.trade_id)
+                if llm_check:
+                    llm_decision = llm_check['decision']
+                    llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
+                    llm_color = llm_colors.get(llm_decision, '')
+                    llm_str = f"{llm_color}{llm_decision[:4]}{reset_color()}"
+                else:
+                    llm_str = "."
+
                 # Truncate symbol if too long
                 sym = trade.ticker[:5]
 
                 print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
                       f"{strike_str:<7} {expiry_short:<5} {timing:<4} "
                       f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
-                      f"{edge_str:<5} {impl_str:<5} {spread_str:<5}")
+                      f"{edge_str:<5} {impl_str:<5} {spread_str:<5} {llm_str:<6}")
 
 
                 # Only show errors/warnings on second line if critical
@@ -614,9 +632,19 @@ def render_dashboard(
                     print(f"         \033[91m^ {trade.notes}\033[0m")
             else:
                 # Full format: multiple lines per position
+                # LLM check result with color
+                llm_check = llm_check_map.get(trade.trade_id)
+                if llm_check:
+                    llm_decision = llm_check['decision']
+                    llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
+                    llm_color = llm_colors.get(llm_decision, '')
+                    llm_str = f"{llm_color}{llm_decision[:4]}{reset_color()}"
+                else:
+                    llm_str = "."
+
                 print(f"  {trade.ticker:<8} {trade.earnings_date:<12} "
                       f"{status_color}{status_display:<10}{reset_color()} "
-                      f"{entry_price:<10} {current_price:<10} {pnl_color}{pnl_str:<12}{reset_color()}")
+                      f"{entry_price:<10} {current_price:<10} {pnl_color}{pnl_str:<12}{reset_color()} {llm_str:<6}")
 
                 # Show partial fill warning with details
                 if trade.status == 'partial' and trade.notes:
@@ -977,6 +1005,108 @@ def get_open_positions(logger: TradeLogger) -> list:
     return [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
 
 
+def show_llm_details_interactive(logger: TradeLogger):
+    """Interactive LLM check details viewer."""
+    all_trades = logger.get_trades()
+    if not all_trades:
+        print("\n  No trades to show LLM details for.")
+        input("  Press Enter to continue...")
+        return
+
+    # Build list of trades with LLM checks
+    trades_with_llm = []
+    for trade in all_trades:
+        if trade.entry_datetime:
+            llm_check = logger.get_llm_check_for_trade(trade.ticker, trade.entry_datetime)
+            if llm_check:
+                trades_with_llm.append((trade, llm_check))
+
+    if not trades_with_llm:
+        print("\n  No LLM checks found for any trades.")
+        input("  Press Enter to continue...")
+        return
+
+    print("\n" + bold("  LLM SANITY CHECK DETAILS"))
+    print("  " + "-" * 60)
+    print()
+
+    # List trades with LLM status
+    for i, (trade, llm_check) in enumerate(trades_with_llm, 1):
+        decision = llm_check['decision']
+        llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
+        llm_color = llm_colors.get(decision, '')
+        print(f"  {i}. {trade.ticker:<8} {llm_color}{decision:<8}{reset_color()} "
+              f"{trade.earnings_date} ({trade.earnings_timing or '?'})")
+
+    print()
+    print("  0. Cancel")
+    print()
+
+    try:
+        choice = input("  Select trade to view LLM details: ").strip()
+        if not choice or choice == '0':
+            return
+
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(trades_with_llm):
+            print("  Invalid selection.")
+            input("  Press Enter to continue...")
+            return
+
+        trade, llm_check = trades_with_llm[idx]
+
+        # Display full LLM check details
+        print()
+        print(bold(f"  LLM Check for {trade.ticker}"))
+        print("  " + "-" * 60)
+        print()
+
+        decision = llm_check['decision']
+        llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
+        llm_color = llm_colors.get(decision, '')
+        print(f"  Decision:    {llm_color}{decision}{reset_color()}")
+        print(f"  Model:       {llm_check.get('model', 'N/A')}")
+        print(f"  Latency:     {llm_check.get('latency_ms', 0)}ms")
+        print(f"  Timestamp:   {llm_check.get('ts', 'N/A')}")
+        print()
+
+        risk_flags = llm_check.get('risk_flags', [])
+        if risk_flags:
+            print(f"  Risk Flags:")
+            for flag in risk_flags:
+                print(f"    - {flag}")
+            print()
+
+        reasons = llm_check.get('reasons', [])
+        if reasons:
+            print(f"  Reasons:")
+            for reason in reasons:
+                # Word wrap long reasons
+                import textwrap
+                wrapped = textwrap.wrap(reason, width=70)
+                for j, line in enumerate(wrapped):
+                    if j == 0:
+                        print(f"    - {line}")
+                    else:
+                        print(f"      {line}")
+            print()
+
+        search_queries = llm_check.get('search_queries', [])
+        if search_queries:
+            print(f"  Search Queries:")
+            for query in search_queries:
+                print(f"    - {query}")
+            print()
+
+        input("  Press Enter to continue...")
+
+    except ValueError:
+        print("  Invalid input.")
+        input("  Press Enter to continue...")
+    except KeyboardInterrupt:
+        pass
+
+
 def close_position_interactive(logger: TradeLogger):
     """Interactive position closing with fill tracking."""
     global _ib
@@ -1278,7 +1408,7 @@ def main():
 
                     mode = "LIVE" if args.live else "DB only"
                     compact_str = " | COMPACT" if args.compact else ""
-                    print(f"  [{mode}{compact_str} | Refreshing every {args.interval}s | c=close, r=refresh, q=quit]")
+                    print(f"  [{mode}{compact_str} | Refreshing every {args.interval}s | c=close, l=llm, r=refresh, q=quit]")
 
                     # Wait for interval...
                     start = time.time()
@@ -1290,6 +1420,9 @@ def main():
                             elif key.lower() == 'c':
                                 close_position_interactive(logger) # This is sync but interactive
                                 break  # Refresh after closing
+                            elif key.lower() == 'l':
+                                show_llm_details_interactive(logger)
+                                break  # Refresh after viewing
                             elif key.lower() == 'r':
                                 break  # Refresh now
                         await asyncio.sleep(0.01) # Yield to event loop if needed

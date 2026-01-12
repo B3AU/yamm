@@ -507,10 +507,10 @@ def render_dashboard(
     # Get PT timezone abbreviation (WET/WEST)
     pt_tz_name = now_pt.strftime('%Z')
 
-    print(bold("=" * 120))
+    print(bold("=" * 90))
     print(bold(f"  EARNINGS TRADING DASHBOARD - {now_pt.strftime('%Y-%m-%d %H:%M:%S')} ({pt_tz_name})"))
     print(f"  Market: {market_color}{market_status}{reset_color()}{time_info}")
-    print(bold("=" * 120))
+    print(bold("=" * 90))
     print()
 
     # Get all trades
@@ -543,10 +543,10 @@ def render_dashboard(
         if compact:
             # Compact format: 1 line per position
             print(f"  {'Sym':<5} {'Status':<7} {'Strike':<7} {'Exp':<5} {'Time':<4} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<6}")
-            print("  " + "-" * 118)
+            print("  " + "-" * 88)
         else:
             print(f"  {'Symbol':<8} {'Earnings':<12} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<12} {'LLM':<6}")
-            print("  " + "-" * 118)
+            print("  " + "-" * 88)
 
         for trade in open_trades:
             status_color = get_status_color(trade.status)
@@ -706,7 +706,7 @@ def render_dashboard(
                 print()
 
         # Show total unrealized P&L and risk summary
-        print("  " + "-" * 118)
+        print("  " + "-" * 88)
 
         # Calculate total capital at risk
         total_at_risk = sum(t.premium_paid or 0 for t in open_trades)
@@ -727,15 +727,11 @@ def render_dashboard(
     # === Completed Trades ===
     if completed_trades or show_all:
         print(bold("  COMPLETED TRADES"))
-        print("  " + "-" * 118)
-
         if completed_trades:
             total_pnl = 0
             wins = 0
             losses = 0
-
             print(f"  {'Symbol':<8} {'Date':<12} {'Entry':<10} {'Exit':<10} {'P&L':<12} {'Return':<10}")
-            print("  " + "-" * 118)
 
             for trade in completed_trades[:10]:  # Most recent 10 (ordered by entry_datetime DESC)
                 entry = trade.premium_paid or 0
@@ -756,8 +752,6 @@ def render_dashboard(
                       f"{format_currency(entry + pnl):<10} "
                       f"{pnl_color}{format_currency(pnl):<12}{reset_color()} "
                       f"{pnl_color}{ret:+.1f}%{reset_color()}")
-
-            print("  " + "-" * 118)
             win_rate = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
             pnl_color = '\033[92m' if total_pnl >= 0 else '\033[91m'
             print(f"  {'TOTAL':<8} {'':<12} {'':<10} {'':<10} "
@@ -765,26 +759,15 @@ def render_dashboard(
                   f"Win: {win_rate:.0f}%")
         else:
             print("  No completed trades")
-        print()
 
     # === Summary Stats ===
     print(bold("  SUMMARY"))
-    print("  " + "-" * 118)
-
     stats = logger.get_summary_stats()
     metrics = logger.get_execution_metrics()
-
-    print(f"  Total Trades: {stats['total_trades']:<10} "
-          f"Completed: {stats['completed_trades']:<10} "
-          f"Open: {len(open_trades)}")
-
+    summary_parts = [f"Trades: {stats['total_trades']} ({stats['completed_trades']} done, {len(open_trades)} open)"]
     if stats['completed_trades'] > 0:
-        print(f"  Total P&L: {format_currency(stats['total_pnl']):<12} "
-              f"Avg P&L: {stats['avg_pnl_pct']*100:.1f}%")
-
-    if metrics.total_orders > 0:
-        print(f"  Fill Rate: {metrics.fill_rate*100:.1f}%  "
-              f"Avg Slippage: {metrics.avg_slippage_bps:.1f} bps")
+        summary_parts.append(f"P&L: {format_currency(stats['total_pnl'])} ({stats['avg_pnl_pct']*100:.1f}% avg)")
+    print("  " + "  |  ".join(summary_parts))
 
     # Next exit and screen countdown
     next_exit = get_next_exit_time()
@@ -832,7 +815,7 @@ def render_dashboard(
                      timeline_events.append((f"{e.symbol} (Tmw BMO)", 1)) # 1 = tomorrow
 
              if timeline_events:
-                 print(dim("  " + "-" * 118))
+                 print(dim("  " + "-" * 88))
                  print(bold("  EARNINGS TIMELINE"))
 
                  # Group by day
@@ -846,11 +829,9 @@ def render_dashboard(
         except:
             pass
 
-    print()
 
     # === Edge Realization (for completed trades) ===
     if completed_trades:
-        # Calculate edge hit rate: did realized move exceed implied?
         edge_hits = 0
         edge_total = 0
         for t in completed_trades:
@@ -858,56 +839,36 @@ def render_dashboard(
                 edge_total += 1
                 if t.realized_move_pct > t.implied_move:
                     edge_hits += 1
-
         if edge_total > 0:
             edge_hit_rate = edge_hits / edge_total * 100
-            print(bold("  EDGE REALIZATION"))
-            print("  " + "-" * 118)
-            print(f"  Realized > Implied: {edge_hits}/{edge_total} ({edge_hit_rate:.0f}%)")
-
-            # Show recent edge performance
-            recent_with_data = [t for t in completed_trades[-10:]
+            recent_with_data = [t for t in completed_trades[:10]
                                if t.realized_move_pct is not None and t.implied_move is not None]
-            if recent_with_data:
-                recent_str = ""
-                for t in recent_with_data[-8:]:
-                    if t.realized_move_pct > t.implied_move:
-                        recent_str += "\033[92m✓\033[0m"  # Green check
-                    else:
-                        recent_str += "\033[91m✗\033[0m"  # Red X
-                print(f"  Recent (last 8): {recent_str}")
-            print()
+            recent_str = ""
+            for t in recent_with_data[:8]:
+                recent_str += "\033[92m✓\033[0m" if t.realized_move_pct > t.implied_move else "\033[91m✗\033[0m"
+            print(f"  Edge: {edge_hits}/{edge_total} ({edge_hit_rate:.0f}%) hit  Recent: {recent_str}")
 
     # === Execution Quality ===
-    if metrics.total_orders >= 5:
-        print(bold("  EXECUTION QUALITY"))
-        print("  " + "-" * 118)
-
-        # Fill rate trend (last 10 vs all-time)
-        recent_trades = [t for t in all_trades if t.status in ('filled', 'exited', 'cancelled')][-10:]
-        if recent_trades:
-            recent_fills = sum(1 for t in recent_trades if t.status in ('filled', 'exited'))
-            recent_fill_rate = recent_fills / len(recent_trades) * 100
-            trend = ""
-            if recent_fill_rate > metrics.fill_rate * 100 + 5:
-                trend = " \033[92m↑\033[0m"
-            elif recent_fill_rate < metrics.fill_rate * 100 - 5:
-                trend = " \033[91m↓\033[0m"
-
-            print(f"  Fill Rate: {metrics.fill_rate*100:.0f}% all-time | {recent_fill_rate:.0f}% recent{trend}")
-
-        # Average slippage detail
-        if metrics.avg_slippage_bps != 0:
-            print(f"  Slippage: avg {metrics.avg_slippage_bps:.1f} bps | max {metrics.max_slippage_bps:.1f} bps")
-
-        print()
+    if metrics.total_orders >= 1:
+        slip_str = f" | Slip: {metrics.avg_slippage_bps:.0f}bps" if metrics.avg_slippage_bps != 0 else ""
+        if metrics.total_orders >= 5:
+            recent_trades = [t for t in all_trades if t.status in ('filled', 'exited', 'cancelled')][-10:]
+            if recent_trades:
+                recent_fills = sum(1 for t in recent_trades if t.status in ('filled', 'exited'))
+                recent_fill_rate = recent_fills / len(recent_trades) * 100
+                trend = ""
+                if recent_fill_rate > metrics.fill_rate * 100 + 5:
+                    trend = " \033[92m↑\033[0m"
+                elif recent_fill_rate < metrics.fill_rate * 100 - 5:
+                    trend = " \033[91m↓\033[0m"
+                print(f"  Exec: {metrics.fill_rate*100:.0f}% fill ({recent_fill_rate:.0f}% recent{trend}){slip_str}")
+            else:
+                print(f"  Exec: {metrics.fill_rate*100:.0f}% fill{slip_str}")
+        else:
+            print(f"  Exec: {metrics.fill_rate*100:.0f}% fill{slip_str}")
 
     # === Equity Curve ===
     if len(completed_trades) >= 3:
-        print(bold("  EQUITY CURVE"))
-        print("  " + "-" * 118)
-
-        # Build cumulative P&L series
         sorted_trades = sorted(
             [t for t in completed_trades if t.exit_pnl is not None],
             key=lambda t: t.exit_datetime or ""
@@ -918,14 +879,11 @@ def render_dashboard(
             for t in sorted_trades:
                 running += t.exit_pnl
                 cumulative.append(running)
-
-            sparkline = make_sparkline(cumulative, width=40)
+            sparkline = make_sparkline(cumulative, width=30)
             final_pnl = cumulative[-1] if cumulative else 0
             pnl_color = '\033[92m' if final_pnl >= 0 else '\033[91m'
 
-            print(f"  {sparkline}  {pnl_color}{format_currency(final_pnl)}{reset_color()}")
-
-            # Weekly breakdown (last 4 weeks)
+            # Weekly breakdown
             from collections import defaultdict
             weekly_pnl = defaultdict(float)
             for t in sorted_trades:
@@ -937,67 +895,39 @@ def render_dashboard(
                         weekly_pnl[week_key] += t.exit_pnl
                     except:
                         pass
-
+            week_str = ""
             if weekly_pnl:
-                recent_weeks = sorted(weekly_pnl.keys())[-4:]
-                week_str = "  Weekly: "
-                for wk in recent_weeks:
+                for wk in sorted(weekly_pnl.keys())[-3:]:
                     pnl = weekly_pnl[wk]
                     color = '\033[92m' if pnl >= 0 else '\033[91m'
-                    week_str += f"{wk}: {color}{format_currency(pnl)}{reset_color()}  "
-                print(week_str)
-
-        print()
+                    week_str += f" {wk}:{color}{format_currency(pnl)}{reset_color()}"
+            print(f"  Curve: {sparkline} {pnl_color}{format_currency(final_pnl)}{reset_color()} |{week_str}")
 
     # === Recent Warnings/Errors ===
+    # === Warnings/Errors (compact) ===
     warnings_errors = get_recent_warnings_errors(LOG_PATH)
     if warnings_errors:
-        print(bold("  RECENT WARNINGS/ERRORS"))
-        print("  " + "-" * 118)
-        for level, message in warnings_errors:
-            if level == 'ERROR':
-                color = '\033[91m'  # Red
-            else:
-                color = '\033[93m'  # Yellow
-            print(f"  {color}{level:<7}{reset_color()} {message}")
-        print()
+        print(bold("  RECENT ISSUES"))
+        for level, message in warnings_errors[:5]:  # Only show 5
+            color = '\033[91m' if level == 'ERROR' else '\033[93m'
+            print(f"  {color}{level[0]}{reset_color()} {message[:75]}")
 
     # === Counterfactual Summary (Non-Trades) ===
     non_trades = logger.get_non_trades()
     if non_trades:
-        # Calculate counterfactual stats for trades with realized data
         with_cf = [nt for nt in non_trades if nt.counterfactual_pnl is not None]
-
-        print(bold("  COUNTERFACTUAL ANALYSIS (Rejected Candidates)"))
-        print("  " + "-" * 118)
-
         if with_cf:
-            avg_cf_pnl = sum(nt.counterfactual_pnl for nt in with_cf) / len(with_cf)
             total_cf_pnl = sum(nt.counterfactual_pnl for nt in with_cf)
             profitable_cf = sum(1 for nt in with_cf if nt.counterfactual_pnl > 0)
             cf_win_rate = profitable_cf / len(with_cf) * 100
-
             cf_color = '\033[92m' if total_cf_pnl >= 0 else '\033[91m'
-            print(f"  If we traded all rejections: {cf_color}{format_currency(total_cf_pnl)}{reset_color()} "
-                  f"(avg: {format_currency(avg_cf_pnl)}, win rate: {cf_win_rate:.0f}%)")
-
-            # With spread costs
             with_spread = [nt for nt in non_trades if nt.counterfactual_pnl_with_spread is not None]
-            if with_spread:
-                total_cf_spread = sum(nt.counterfactual_pnl_with_spread for nt in with_spread)
-                spread_color = '\033[92m' if total_cf_spread >= 0 else '\033[91m'
-                print(f"  With spread costs:           {spread_color}{format_currency(total_cf_spread)}{reset_color()}")
-        else:
-            print(f"  {len(non_trades)} candidates rejected (counterfactual data pending backfill)")
-
-        # Show recent rejections breakdown by reason
-        from collections import Counter
-        recent_reasons = Counter(nt.rejection_reason for nt in non_trades[:20] if nt.rejection_reason)
-        if recent_reasons:
-            reason_str = ", ".join(f"{r}: {c}" for r, c in recent_reasons.most_common(3))
-            print(f"  Recent reasons: {reason_str}")
-
-        print()
+            spread_pnl = sum(nt.counterfactual_pnl_with_spread for nt in with_spread) if with_spread else 0
+            spread_color = '\033[92m' if spread_pnl >= 0 else '\033[91m'
+            from collections import Counter
+            recent_reasons = Counter(nt.rejection_reason for nt in non_trades[:20] if nt.rejection_reason)
+            reason_str = ", ".join(f"{r[:15]}:{c}" for r, c in recent_reasons.most_common(2))
+            print(f"  Counterfactual: {cf_color}{format_currency(total_cf_pnl)}{reset_color()} ({cf_win_rate:.0f}% win) | w/spread: {spread_color}{format_currency(spread_pnl)}{reset_color()} | {reason_str}")
 
 
 def get_open_positions(logger: TradeLogger) -> list:

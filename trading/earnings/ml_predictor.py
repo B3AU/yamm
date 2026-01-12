@@ -627,9 +627,13 @@ class EarningsPredictor:
 
     def _compute_news_features(self, symbol: str, earnings_date: date) -> dict:
         """Compute news PCA features from live FMP data only (no stale parquet fallback)."""
-        defaults = {'pre_earnings_news_count': 0, 'headlines': []}
+        # Use training medians as defaults instead of zeros (prevents feature discontinuity)
+        defaults = {
+            'pre_earnings_news_count': self.news_feature_medians.get('pre_earnings_news_count', 1.0),
+            'headlines': []
+        }
         for i in range(10):
-            defaults[f'news_pca_{i}'] = 0.0
+            defaults[f'news_pca_{i}'] = self.news_feature_medians.get(f'news_pca_{i}', 0.0)
 
         if self.news_pca is None:
             return defaults
@@ -639,8 +643,8 @@ class EarningsPredictor:
         if live_result['pre_earnings_news_count'] > 0:
             return live_result
 
-        # No news available - use zero features
-        logger.info(f"{symbol}: No FMP news available, using zero features")
+        # No news available - use training medians instead of zeros
+        logger.info(f"{symbol}: No FMP news available, using training median features")
         return defaults
 
     def compute_features(

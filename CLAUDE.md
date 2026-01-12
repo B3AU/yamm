@@ -419,63 +419,57 @@ PAPER_MAX_DAILY_TRADES=10
 
 **Why "overnight_move" still works:** The `Close_T-1 → Close_T+1` move captures the full window for both BMO and AMC, making it robust to timing uncertainty. However, the gap/full moves needed correction for proper feature engineering.
 
-### Known Backtest/Model Issues (Pre-Live Checklist)
+### Backtest Analysis Summary
 
-These issues should be addressed or validated before deploying with significant capital:
+The calibration notebook (`notebooks/1.2 calibration_analysis.ipynb`) includes comprehensive analysis:
 
-#### 1. Backtest P&L Likely Overstated (30-50%)
+#### Realistic Assumptions (Section 5.2)
+- **Implied move multiplier**: Both 1.0x (optimistic) and 1.3x (realistic) analyzed
+- **Commission costs**: $1.30/contract IBKR commissions included
+- **Spread costs**: 3% round-trip spread modeled
+
+#### Key Results (1.3x realistic multiplier)
+| Threshold | Trades | Mean P&L | Sharpe |
+|-----------|--------|----------|--------|
+| 6% | 950 | +1.13% | 1.37 |
+| 8% | 281 | +3.01% | 1.76 |
+| 10% | 68 | +7.49% | 1.47 |
+
+**Recommendation:** 8% edge threshold under realistic assumptions (vs 7% with optimistic 1.0x).
+
+### Known Remaining Issues
+
+#### 1. Edge Threshold Test-Set Overfitting
 **Location:** `notebooks/1.2 calibration_analysis.ipynb`
 
-The strategy simulation assumes straddles cost exactly the historical move (`implied_move = hist_move_mean * 1.0`). In reality, options market prices in a volatility premium - implied moves are typically **1.3-1.5x realized moves**.
+The edge thresholds were optimized on the same out-of-sample data used for model evaluation.
 
-**Impact:** The reported +2.39% mean P&L at 7% edge threshold is likely break-even or slightly negative in reality.
+**Impact:** Reported Sharpe may be overstated by 0.3-0.5.
 
-**Fix needed:** Use realistic implied move multiplier (1.3-1.5x) and validate with Phase 0 paper trading data.
+**Mitigation:** Validate with Phase 0 paper trading data before sizing up.
 
-#### 2. No Transaction Costs in Backtest
-**Location:** `notebooks/1.2 calibration_analysis.ipynb`
-
-Simulation includes spread cost but NOT:
-- Commissions ($1-2 per leg x 2 = $2-4 per straddle)
-- Assumes 100% fill rate (unrealistic for semi-illiquid names)
-
-**Impact:** True P&L likely 1-2% lower than backtest shows.
-
-**Fix needed:** Add realistic commission model ($1.30/contract typical for IBKR) to simulation.
-
-#### 3. Edge Threshold Test-Set Overfitting
-**Location:** `notebooks/1.2 calibration_analysis.ipynb`
-
-The 7% edge threshold was optimized on the same out-of-sample data used for model evaluation.
-
-**Impact:** Reported Sharpe ~3.0 is overstated; likely 2.0-2.5 in practice.
-
-**Fix needed:** Hold out final 20% of test data for threshold selection.
-
-#### 4. Gap Ratio Threshold Data Snooping
+#### 2. Gap Ratio Threshold Data Snooping
 **Location:** `notebooks/0.2c_infer_earnings_timing.ipynb`
 
 BMO/AMC timing thresholds (gap_ratio > 2.0 for BMO, < 0.5 for AMC) were tuned on the same data used for training, with no held-out validation.
 
 **Impact:** Timing labels may be partially arbitrary rather than representing true BMO/AMC signal.
 
-**Fix needed:** Hold out last 10% of data for threshold tuning, or validate against external timing source.
+**Mitigation:** Monitor BMO vs AMC performance divergence in paper trading.
 
-#### 5. News Feature Defaults to Zero
-**Location:** `trading/earnings/ml_predictor.py:481-483`
+#### 3. News Feature Defaults - FIXED
+**Location:** `trading/earnings/ml_predictor.py`
 
-When news is unavailable, all 10 PCA components default to exactly 0.0 instead of training median.
+~~When news is unavailable, all 10 PCA components defaulted to 0.0 instead of training median.~~
 
-**Impact:** Creates discontinuity in feature space; model may systematically bias predictions for low-news stocks.
-
-**Fix needed:** Store training-set medians per `news_pca_*` component and use those as defaults.
+**Status:** Fixed - now uses training medians from `models/feature_config.json`.
 
 #### Recommended Validation Before Live
 
-1. Re-run backtest with 1.3x implied move multiplier and commissions
-2. Compare paper trading P&L to revised backtest predictions
-3. Verify calibration: q75 exceedance should be ~25% (currently untested live)
-4. Track actual fill rates vs 100% assumption
+1. Compare paper trading P&L to revised backtest predictions (use 1.3x assumptions)
+2. Verify calibration: q75 exceedance should be ~25%
+3. Track actual fill rates vs 100% assumption
+4. Monitor edge decay over time
 
 ---
 

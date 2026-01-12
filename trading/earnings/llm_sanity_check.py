@@ -275,10 +275,25 @@ async def check_with_llm(
 
         latency_ms = int((time.time() - start_time) * 1000)
 
+        # Validate decision against whitelist (fail-closed on invalid values)
+        VALID_DECISIONS = {"PASS", "WARN", "NO_TRADE"}
+        raw_decision = llm_response.get("decision", "")
+        if raw_decision not in VALID_DECISIONS:
+            logger.warning(f"{ticker}: Invalid LLM decision '{raw_decision}', defaulting to NO_TRADE")
+            raw_decision = "NO_TRADE"
+
+        # Ensure risk_flags and reasons are lists
+        risk_flags = llm_response.get("risk_flags", [])
+        if not isinstance(risk_flags, list):
+            risk_flags = []
+        reasons = llm_response.get("reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+
         result = SanityResult(
-            decision=llm_response.get("decision", "PASS"),
-            risk_flags=llm_response.get("risk_flags", []),
-            reasons=llm_response.get("reasons", []),
+            decision=raw_decision,
+            risk_flags=risk_flags,
+            reasons=reasons,
             search_queries=queries,
             search_results=search_results,
             model=DEFAULT_MODEL,

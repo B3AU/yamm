@@ -611,7 +611,7 @@ class TradingDaemon:
             try:
                 exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
                 if exit_filled:
-                    logger.info(f"Exit fills detected: {list(exit_filled.keys())}")
+                    logger.info(f"Exit fills detected: {[e.trade_id for e in exit_filled]}")
             except Exception as e:
                 logger.error(f"Monitor exit fills failed: {e}")
 
@@ -1240,8 +1240,13 @@ class TradingDaemon:
 
                     if call_fills and put_fills:
                         # Both legs filled - calculate P&L and update DB
-                        call_fill_price = sum(f.execution.price * f.execution.shares for f in call_fills) / sum(f.execution.shares for f in call_fills)
-                        put_fill_price = sum(f.execution.price * f.execution.shares for f in put_fills) / sum(f.execution.shares for f in put_fills)
+                        call_shares = sum(f.execution.shares for f in call_fills)
+                        put_shares = sum(f.execution.shares for f in put_fills)
+                        if call_shares <= 0 or put_shares <= 0:
+                            logger.warning(f"{trade.ticker}: Zero shares in exit fills (call={call_shares}, put={put_shares})")
+                            continue
+                        call_fill_price = sum(f.execution.price * f.execution.shares for f in call_fills) / call_shares
+                        put_fill_price = sum(f.execution.price * f.execution.shares for f in put_fills) / put_shares
                         combined_fill = call_fill_price + put_fill_price
 
                         if trade.entry_fill_price:

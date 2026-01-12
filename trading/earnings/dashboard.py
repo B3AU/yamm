@@ -1202,7 +1202,7 @@ def close_position_interactive(logger: TradeLogger):
             return
 
         # Close each position and track fills
-        from ib_insync import Option, LimitOrder
+        from ib_insync import Option, LimitOrder, Stock
 
         placed_orders = []  # Track (order_trade, contract, qty, price) for fill checking
         total_exit_value = 0.0
@@ -1329,7 +1329,7 @@ def close_position_interactive(logger: TradeLogger):
             ticker = ib.reqMktData(stock, '', False, False)
             ib.sleep(1)
             spot_at_exit = ticker.marketPrice()
-            if spot_at_exit != spot_at_exit or spot_at_exit <= 0:  # NaN check
+            if spot_at_exit is None or math.isnan(spot_at_exit) or spot_at_exit <= 0:
                 spot_at_exit = ticker.last if ticker.last and ticker.last > 0 else ticker.close
             ib.cancelMktData(stock)
 
@@ -1448,9 +1448,10 @@ def main():
                                      tasks.append((trade.trade_id, get_position_live_value_async(ib, trade)))
 
                                  if tasks:
-                                     results = await asyncio.gather(*(t[1] for t in tasks))
+                                     results = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
                                      for i, res in enumerate(results):
-                                         new_live_data[tasks[i][0]] = res
+                                         if not isinstance(res, Exception):
+                                             new_live_data[tasks[i][0]] = res
 
                          # Update cache
                          live_data_cache.update(new_live_data)
@@ -1514,9 +1515,10 @@ def main():
                              continue
                          tasks.append((trade.trade_id, get_position_live_value_async(ib, trade)))
                      if tasks:
-                         results = await asyncio.gather(*(t[1] for t in tasks))
+                         results = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
                          for i, res in enumerate(results):
-                             live_data_cache[tasks[i][0]] = res
+                             if not isinstance(res, Exception):
+                                 live_data_cache[tasks[i][0]] = res
 
                 render_dashboard(logger, show_all=args.all, live=True, compact=args.compact, live_data_map=live_data_cache)
             else:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import math
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -620,10 +621,11 @@ async def close_position(
                 break
             await asyncio.sleep(0.1)
 
-        call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
-        call_ask = call_ticker.ask if call_ticker.ask == call_ticker.ask else 0
-        put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
-        put_ask = put_ticker.ask if put_ticker.ask == put_ticker.ask else 0
+        # Handle NaN values from market data
+        call_bid = call_ticker.bid if call_ticker.bid and not math.isnan(call_ticker.bid) else 0
+        call_ask = call_ticker.ask if call_ticker.ask and not math.isnan(call_ticker.ask) else 0
+        put_bid = put_ticker.bid if put_ticker.bid and not math.isnan(put_ticker.bid) else 0
+        put_ask = put_ticker.ask if put_ticker.ask and not math.isnan(put_ticker.ask) else 0
     finally:
         # Always cancel market data subscriptions to prevent leaks
         if call_ticker is not None:
@@ -908,7 +910,7 @@ async def check_exit_fills(
                         await asyncio.sleep(0.1)
 
                     spot_at_exit = ticker.marketPrice()
-                    if spot_at_exit != spot_at_exit or spot_at_exit <= 0:  # NaN check
+                    if (spot_at_exit is None or math.isnan(spot_at_exit) or spot_at_exit <= 0):
                         spot_at_exit = ticker.last if ticker.last and ticker.last > 0 else ticker.close
 
                     ib.cancelMktData(stock)
@@ -1027,8 +1029,9 @@ async def reprice_exit_to_bid(
                 break
             await asyncio.sleep(0.1)
 
-        call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
-        put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
+        # Handle NaN values from market data
+        call_bid = call_ticker.bid if call_ticker.bid and not math.isnan(call_ticker.bid) else 0
+        put_bid = put_ticker.bid if put_ticker.bid and not math.isnan(put_ticker.bid) else 0
     finally:
         # Always cancel market data subscriptions to prevent leaks
         if call_ticker is not None:

@@ -156,10 +156,11 @@ def anonymize_and_embed(
     # Combine title + text for each article (same as training)
     texts = []
     for article in articles:
-        title = article.get('title', '')
-        text = article.get('text', '')
+        # Handle None values from FMP API (keys can exist with None value)
+        title = article.get('title') or ''
+        text = article.get('text') or ''
         combined = f"{title}. {text}" if text else title
-        if combined.strip():
+        if combined and combined.strip():
             # Anonymize to replace company names with tokens
             anon_text = anon(combined, symbol)
             texts.append(anon_text)

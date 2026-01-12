@@ -737,7 +737,7 @@ def render_dashboard(
             print(f"  {'Symbol':<8} {'Date':<12} {'Entry':<10} {'Exit':<10} {'P&L':<12} {'Return':<10}")
             print("  " + "-" * 118)
 
-            for trade in completed_trades[-10:]:  # Last 10
+            for trade in completed_trades[:10]:  # Most recent 10 (ordered by entry_datetime DESC)
                 entry = trade.premium_paid or 0
                 exit_val = trade.exit_pnl or 0
                 pnl = exit_val

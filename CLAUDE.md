@@ -304,7 +304,8 @@ notebooks/
 ├── 1.0 feature_engineering.ipynb         # Build ML features (55 total)
 ├── 1.1 model_training.ipynb              # Train quantile models
 ├── 1.2 calibration_analysis.ipynb        # Model calibration study
-└── 3.0_edge_analysis.ipynb               # Edge/P&L analysis
+├── 3.0_edge_analysis.ipynb               # Edge/P&L analysis
+└── kelly_position_sizing.ipynb           # Kelly criterion position sizing analysis
 ```
 
 ### Running the System
@@ -437,6 +438,35 @@ The calibration notebook (`notebooks/1.2 calibration_analysis.ipynb`) includes c
 
 **Recommendation:** 8% edge threshold under realistic assumptions (vs 7% with optimistic 1.0x).
 
+### Position Sizing Analysis
+
+**Notebook:** `notebooks/kelly_position_sizing.ipynb`
+
+Analyzed Kelly criterion and variants for position sizing (950 trades, 6% edge threshold):
+
+| Strategy | Return | CAGR | Max DD | Sharpe | Avg Position |
+|----------|--------|------|--------|--------|--------------|
+| Fixed (2%) | 23.8% | 5.6% | -3.4% | 1.31 | 2.3% |
+| Edge Linear | 41.0% | 9.2% | -3.7% | 1.46 | 3.1% |
+| **Half Kelly** | 28.2% | 6.6% | **-2.2%** | **1.56** | 1.8% |
+| Quarter Kelly | 14.1% | 3.4% | -1.6% | 1.45 | 1.1% |
+| Tiered | 41.5% | 9.3% | -3.3% | 1.51 | 2.9% |
+
+**Key findings:**
+- Half Kelly (0.5) has best Sharpe (1.56) and return/drawdown ratio
+- Optimal Kelly fraction: 0.50-0.75 range
+- Tiered sizing is practical alternative with similar Sharpe
+
+**Tiered Sizing Rules (for implementation after validation):**
+| Edge | Multiplier | Position Size |
+|------|------------|---------------|
+| 6-8% | 1.0x | 2% of bankroll |
+| 8-10% | 1.5x | 3% of bankroll |
+| 10-15% | 2.0x | 4% of bankroll |
+| 15%+ | 2.5x | 5% of bankroll |
+
+**Note:** Start with fixed sizing during paper trading. Implement tiered sizing once edge is validated with 30+ trades.
+
 ### Known Remaining Issues
 
 #### 1. Edge Threshold Test-Set Overfitting
@@ -523,12 +553,13 @@ Do NOT proceed to Phase 1 until:
 - Naked options / undefined risk
 - Intraday delta hedging
 - News-only events (non-earnings)
-- Variable position sizing / Kelly criterion
 - Multiple entry points (only T-1 close)
 - Complex Greeks management
 - IV surface arbitrage
 
 These are V2+ features.
+
+**Note:** Kelly/tiered position sizing has been analyzed (see Position Sizing Analysis section) but not yet implemented. Start with fixed sizing during paper trading.
 
 ---
 

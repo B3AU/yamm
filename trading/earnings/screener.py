@@ -455,6 +455,7 @@ def get_tradeable_candidates(
     trade_logger=None,
     fill_timing: bool = True,
     verify_dates: bool = True,
+    screening_date: date = None,
 ) -> tuple[list[EarningsEvent], list[EarningsEvent]]:
     """Get tradeable earnings candidates with timing fill and date verification.
 
@@ -465,11 +466,14 @@ def get_tradeable_candidates(
         trade_logger: TradeLogger instance (required for date verification)
         fill_timing: Whether to fill unknown timing from yfinance
         verify_dates: Whether to verify dates against FMP
+        screening_date: Date to use as "today" for categorization. If None,
+                       uses date.today(). Pass tomorrow's date after market
+                       close to preview next screening session's candidates.
 
     Returns:
         (bmo_tomorrow, amc_today) - lists of verified candidates
     """
-    today = date.today()
+    today = screening_date or date.today()
     tomorrow = today + timedelta(days=1)
 
     # Fetch Nasdaq events

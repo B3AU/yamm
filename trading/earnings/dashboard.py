@@ -846,11 +846,26 @@ def render_dashboard(
 
     # === Candidate Preview ===
     try:
+        # Determine screening date perspective based on market hours
+        et_now = now.astimezone(ET)
+        market_closed = et_now.hour >= 16
+
+        # After market close, show NEXT screening session's targets (tomorrow's perspective)
+        if market_closed:
+            screening_date = date.today() + timedelta(days=1)
+            amc_label = "Tmrw AMC:"   # Tomorrow's AMC (next screening)
+            bmo_label = "Day+2 BMO:"  # Day after tomorrow's BMO
+        else:
+            screening_date = date.today()
+            amc_label = "Today AMC:"
+            bmo_label = "Tmrw BMO:"
+
         bmo_tomorrow, amc_today = get_tradeable_candidates(
-            days_ahead=3,
+            days_ahead=4,  # Look further ahead for after-hours preview
             trade_logger=None,
             fill_timing=True,
             verify_dates=False,
+            screening_date=screening_date,
         )
 
         # Filter out symbols that already have open positions
@@ -858,22 +873,18 @@ def render_dashboard(
         bmo_tomorrow = [c for c in bmo_tomorrow if c.symbol not in open_symbols]
         amc_today = [c for c in amc_today if c.symbol not in open_symbols]
 
-        # After market close (16:00 ET), don't show "Today AMC" - it's too late
-        et_now = now.astimezone(ET)
-        market_closed = et_now.hour >= 16
-
-        if bmo_tomorrow or (amc_today and not market_closed):
+        if bmo_tomorrow or amc_today:
             print(bold("  UPCOMING CANDIDATES"))
 
-            # Show AMC today first (more urgent) - only during market hours
-            if amc_today and not market_closed:
-                print(f"  {dim('Today AMC:')} ", end="")
+            # Show AMC first (more urgent)
+            if amc_today:
+                print(f"  {dim(amc_label)} ", end="")
                 symbols = [c.symbol for c in amc_today[:10]]
                 print(", ".join(symbols) + (f" (+{len(amc_today)-10})" if len(amc_today) > 10 else ""))
 
-            # Then BMO tomorrow
+            # Then BMO
             if bmo_tomorrow:
-                print(f"  {dim('Tmrw BMO:')}  ", end="")
+                print(f"  {dim(bmo_label)}  ", end="")
                 symbols = [c.symbol for c in bmo_tomorrow[:10]]
                 print(", ".join(symbols) + (f" (+{len(bmo_tomorrow)-10})" if len(bmo_tomorrow) > 10 else ""))
     except Exception:

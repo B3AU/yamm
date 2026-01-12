@@ -853,11 +853,20 @@ def render_dashboard(
             verify_dates=False,
         )
 
-        if bmo_tomorrow or amc_today:
+        # Filter out symbols that already have open positions
+        open_symbols = {t.ticker for t in open_trades} if open_trades else set()
+        bmo_tomorrow = [c for c in bmo_tomorrow if c.symbol not in open_symbols]
+        amc_today = [c for c in amc_today if c.symbol not in open_symbols]
+
+        # After market close (16:00 ET), don't show "Today AMC" - it's too late
+        et_now = now.astimezone(ET)
+        market_closed = et_now.hour >= 16
+
+        if bmo_tomorrow or (amc_today and not market_closed):
             print(bold("  UPCOMING CANDIDATES"))
 
-            # Show AMC today first (more urgent)
-            if amc_today:
+            # Show AMC today first (more urgent) - only during market hours
+            if amc_today and not market_closed:
                 print(f"  {dim('Today AMC:')} ", end="")
                 symbols = [c.symbol for c in amc_today[:10]]
                 print(", ".join(symbols) + (f" (+{len(amc_today)-10})" if len(amc_today) > 10 else ""))

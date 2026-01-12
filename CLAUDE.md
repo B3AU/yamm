@@ -13,7 +13,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 **Core edge:** Vol + tails, not direction.
 
-**V1 in one sentence:** Earnings-only, T-1 close entry, T+1 close exit, strict option liquidity gates, straddles/strangles only, fixed position sizing, mechanical risk controls, execution-first validation.
+**V1 in one sentence:** Earnings-only, T-1 afternoon entry, T+0 afternoon exit (~24h hold), strict option liquidity gates, straddles/strangles only, fixed position sizing, mechanical risk controls, execution-first validation.
 
 ---
 
@@ -22,13 +22,21 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 ### What's Built
 
 #### Trading Daemon (`trading/earnings/daemon.py`)
-- APScheduler-based daemon running on configurable schedule
+- Async APScheduler-based daemon with asyncio architecture
 - **Schedule (all times ET):**
-  - **09:25** - Morning IBKR connection check
-  - **14:00** - Screen candidates + place new orders (combined for more fill time)
-  - **14:45** - Exit existing positions
-  - **15:55** - Check fills, cancel unfilled orders near close
+  - **09:25** - Connect to IB Gateway, load positions to exit
+  - **09:30-16:00** - Position snapshots every 5 minutes (intraday P&L tracking)
+  - **14:00** - Exit positions from previous day (free up capital first)
+  - **14:00-16:00** - Monitor fills every minute
+  - **14:15** - Screen upcoming earnings + place new orders
+  - **14:25, 14:35, 14:45, 14:55** - Price improvement loop (aggression: 0.4→0.5→0.6→0.7)
+  - **15:55** - Final fill check, reprice unfilled exits to bid
+  - **15:58** - Cancel unfilled entry orders, force exit remaining positions with market orders
+  - **16:05** - Disconnect from IB Gateway
+  - **16:30** - Backfill counterfactuals for non-trades
 - Order recovery on restart (persists IBKR order IDs to DB)
+- Exit order recovery for orphaned positions
+- Startup catch-up: runs screening immediately if started between 14:00-21:00 ET
 - Graceful shutdown handling
 
 #### Screener (`trading/earnings/screener.py`)
@@ -70,6 +78,14 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Non-trade logging (rejections with reasons)
 - Execution metrics (fill rate, slippage stats)
 - IBKR order ID persistence for recovery
+- **Database tables:**
+  - `trades` - Main trade log with fill/exit/P&L data
+  - `non_trades` - Rejected candidates with reasons
+  - `price_snapshots` - Intraday position tracking (every 5 min)
+  - `order_events` - IB order status changes and fills
+  - `llm_checks` - LLM sanity check decisions and reasoning
+  - `earnings_calendar` - Multi-source calendar (Nasdaq + FMP)
+- **New fields:** `decision_latency_ms`, `fill_latency_seconds`, `spread_at_fill`, `markout_1min/5min/30min`
 
 #### Dashboard (`trading/earnings/dashboard.py`)
 - CLI dashboard with ANSI colors
@@ -125,6 +141,18 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 9. **Counterfactual logging** - After market close, backfill realized moves for non-traded candidates to measure what we missed.
 
+10. **Price improvement loop** - 4-step progressive repricing (14:25-14:55) with increasing aggression (0.4→0.7) to maximize fills.
+
+11. **Intraday position snapshots** - Every 5 minutes during market hours for P&L tracking and exit timing analysis.
+
+12. **Post-fill markouts** - Automatic 1min, 5min, 30min price recordings after each fill for slippage analysis.
+
+13. **Exit-first scheduling** - Exits now run at 14:00, before screening (14:15), to free up capital first.
+
+14. **Startup catch-up** - If daemon starts during 14:00-21:00 ET, immediately runs screening to catch missed window.
+
+15. **Force exit at close** - 15:58 job forces remaining exits to market orders to avoid overnight positions.
+
 ### Current Limitations / TODO
 
 #### Medium Priority
@@ -149,6 +177,15 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] LLM sanity check before order placement (Tavily + OpenRouter)
 - [x] Intraday price snapshots for exit timing analysis
 - [x] Orphan leg retry logic for failed exits
+- [x] Price improvement loop (progressive repricing 14:25-14:55)
+- [x] Post-fill markouts (1min, 5min, 30min price recordings)
+- [x] Exit order recovery on daemon restart
+- [x] Startup catch-up screening (missed window detection)
+- [x] Force exit to market at 15:58 (avoid overnight positions)
+- [x] Async daemon architecture (asyncio + AsyncIOScheduler)
+- [x] Order event logging (IB status changes)
+- [x] Decision/fill latency tracking
+- [x] Dry run mode for testing
 
 ---
 
@@ -238,16 +275,25 @@ models/
 ├── earnings_q90.txt
 ├── earnings_q95.txt
 ├── feature_config.json
-└── news_pca.joblib    # PCA model for news
+└── news_pca.joblib    # PCA model for news (768-dim → 10)
 
 data/
 ├── earnings_trades.db # SQLite trade log
 ├── prices.pqt         # Historical prices (fallback)
 ├── earnings/
-│   └── historical_earnings_moves.parquet
+│   ├── historical_earnings_moves.parquet  # With timing + corrected moves
+│   └── ml_features.parquet                # Training dataset (69k rows)
 └── news_ranking/
-    ├── news_embeddings.pqt
-    └── all_the_news_anon.pqt
+    ├── news_embeddings.pqt   # 1.7M embeddings (768-dim)
+    └── all_the_news_anon.pqt # Anonymized news articles
+
+notebooks/
+├── 0.2 historical_earnings_moves.ipynb   # Fetch earnings + compute moves
+├── 0.2c_infer_earnings_timing.ipynb      # BMO/AMC timing inference fix
+├── 1.0 feature_engineering.ipynb         # Build ML features (55 total)
+├── 1.1 model_training.ipynb              # Train quantile models
+├── 1.2 calibration_analysis.ipynb        # Model calibration study
+└── 3.0_edge_analysis.ipynb               # Edge/P&L analysis
 ```
 
 ### Running the System
@@ -282,6 +328,7 @@ python -m trading.earnings.test_screening --no-ibkr --ticker AAPL
 FMP_API_KEY=xxx              # Financial Modeling Prep API
 
 # IBKR
+IB_HOST=127.0.0.1            # Gateway host
 IB_PORT=4002                 # Gateway port (4002=paper, 7497=live)
 IB_CLIENT_ID=1               # Client ID
 
@@ -296,10 +343,18 @@ PAPER_LLM_SANITY_THRESHOLD=NO_TRADE    # Paper default
 
 # Trading config
 PAPER_MODE=true              # Paper trading mode
+DRY_RUN=false                # Dry run (no actual orders)
 SPREAD_THRESHOLD=15.0        # Max spread %
 EDGE_THRESHOLD=0.05          # Min edge (5%)
 MAX_DAILY_TRADES=5           # Daily trade limit
-TARGET_POSITION_DOLLARS=500  # Position size target
+TARGET_ENTRY_AMOUNT=2000     # Target $ per trade
+MIN_CONTRACTS=1              # Minimum contract size
+MAX_CONTRACTS=5              # Maximum contract size (safety cap)
+
+# Paper mode overrides (optional, use PAPER_ prefix)
+PAPER_SPREAD_THRESHOLD=20.0
+PAPER_EDGE_THRESHOLD=0.03
+PAPER_MAX_DAILY_TRADES=10
 ```
 
 ---
@@ -319,9 +374,39 @@ TARGET_POSITION_DOLLARS=500  # Position size target
 
 ### Training Data
 
-- **Period:** 2024-03-30 to 2025-12-18 (~21 months)
-- **Samples:** 3,350 earnings events, 1,419 symbols
-- **Out-of-sample for backtest:** Re-train on earlier period to get true OOS
+- **Period:** 2021-02-16 to 2025-12-18 (~4 years)
+- **Samples:** 69,783 earnings events, 4,228 symbols (after filtering)
+- **Walk-forward validation:** 5 time-based folds, expanding window
+
+### BMO/AMC Timing Alignment Fix (Critical)
+
+**Problem discovered:** Historical Nasdaq data has ~0% BMO/AMC timing coverage (Nasdaq only provides timing for *upcoming* earnings, not historical). Without timing, ~50% of training data had misaligned price moves.
+
+**The bug:** For AMC (After Market Close) earnings, the original code computed:
+- `Close_T-1 → Close_T` which captures the move **before** earnings (wrong)
+
+**Correct calculation by timing:**
+- **BMO:** Reaction is `Close_T-1 → Open_T → Close_T` (original was correct)
+- **AMC:** Reaction is `Close_T → Open_T+1 → Close_T+1` (needed correction)
+
+**Solution (notebook `0.2c_infer_earnings_timing.ipynb`):**
+1. Infer timing from overnight gap magnitudes:
+   - `gap_T` = |Close_T-1 → Open_T| (gap on earnings day)
+   - `gap_T+1` = |Close_T → Open_T+1| (gap on day after)
+   - `gap_ratio = gap_T / gap_T+1`
+2. Classification thresholds:
+   - `gap_ratio > 2.0` → **BMO** (large gap on T)
+   - `gap_ratio < 0.5` → **AMC** (large gap on T+1)
+   - Otherwise → unknown
+3. Coverage: ~60% of historical data now has inferred timing
+
+**Data changes:**
+- Added `timing` column to `historical_earnings_moves.parquet` (BMO/AMC/unknown)
+- Added `corrected_gap`, `corrected_full` columns with timing-aligned moves
+- Feature engineering (`1.0 feature_engineering.ipynb`) uses `corrected_full_abs` as target
+- Model retrained on timing-corrected data (`1.1 model_training.ipynb`)
+
+**Why "overnight_move" still works:** The `Close_T-1 → Close_T+1` move captures the full window for both BMO and AMC, making it robust to timing uncertainty. However, the gap/full moves needed correction for proper feature engineering.
 
 ---
 
@@ -364,7 +449,7 @@ Do NOT proceed to Phase 1 until:
 - **Events:** Earnings announcements only
 - **Markets:** US equities
 - **Instruments:** Listed equity options
-- **Holding period:** T-1 close → T+1 close (single overnight hold through earnings)
+- **Holding period:** T-1 afternoon (14:15 ET) → T+0 afternoon (14:00 ET), ~24h hold through earnings
 - **Structures:** Straddles and strangles only
 - **Risk posture:** Long volatility, defined risk
 - **Position sizing:** Fixed risk per trade, binary trade/no-trade decision

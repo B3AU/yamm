@@ -54,8 +54,8 @@ from trading.earnings.screener import (
     ScreenedCandidate,
 )
 from trading.earnings.executor import (
-    Phase0Executor, close_position, ExitComboOrder, check_exit_fills,
-    reprice_exit_to_bid, convert_exit_to_market
+    Phase0Executor, close_position, close_position_market, ExitComboOrder,
+    check_exit_fills, reprice_exit_to_bid, convert_exit_to_market
 )
 from trading.earnings.logging import TradeLogger, SnapshotLog
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
@@ -953,17 +953,13 @@ class TradingDaemon:
             return
 
         try:
-            # Check for any remaining unfilled exit orders
-            if not self.active_exit_orders:
-                logger.info("No unfilled exit orders")
-                return
+            # First check if any active exit orders filled since last check
+            if self.active_exit_orders:
+                exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
+                for exit_pair in exit_filled:
+                    self.active_exit_orders.pop(exit_pair.trade_id, None)
 
-            # First check if any filled since last check
-            exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
-            for exit_pair in exit_filled:
-                self.active_exit_orders.pop(exit_pair.trade_id, None)
-
-            # Convert remaining unfilled to market orders
+            # Convert remaining unfilled active exit orders to market orders
             unfilled_exits = [
                 (tid, eo) for tid, eo in self.active_exit_orders.items()
                 if eo.status not in ('filled', 'cancelled')
@@ -977,11 +973,74 @@ class TradingDaemon:
                         self.active_exit_orders[trade_id] = converted
                     else:
                         logger.error(f"{exit_order.symbol}: Failed to convert to market order - MANUAL CLOSE REQUIRED")
-            else:
-                logger.info("All exit orders filled")
+
+            # CRITICAL: Also check for orphaned "exiting" positions in DB
+            # These are positions where exit orders were placed but daemon restarted
+            # and couldn't recover them (e.g., orders in limbo state)
+            await self._force_exit_orphaned_positions()
 
         except Exception as e:
             logger.exception(f"Force exit failed: {e}")
+
+    async def _force_exit_orphaned_positions(self):
+        """Force exit positions that are stuck in 'exiting' status."""
+        import json
+
+        try:
+            # Get actual positions from IBKR
+            positions = self.ib.positions()
+            position_symbols = {
+                p.contract.symbol for p in positions
+                if p.contract.secType == 'OPT' and p.position != 0
+            }
+
+            if not position_symbols:
+                return
+
+            # Check for trades marked 'exiting' that still have positions
+            exiting_trades = self.trade_logger.get_trades(status='exiting')
+
+            for trade in exiting_trades:
+                # Skip if we're already tracking this exit
+                if trade.trade_id in self.active_exit_orders:
+                    continue
+
+                # Check if position actually exists
+                if trade.ticker not in position_symbols:
+                    # Position gone but status not updated - mark as exited
+                    logger.info(f"{trade.ticker}: Position closed (manually?), updating status")
+                    self.trade_logger.update_trade(trade.trade_id, status='exited')
+                    continue
+
+                # Position exists but we're not tracking it - force exit with market order
+                logger.warning(f"{trade.ticker}: Orphaned position found - forcing market exit")
+
+                # Parse strike
+                strike = 0.0
+                try:
+                    if trade.strikes:
+                        strikes_list = json.loads(trade.strikes)
+                        if strikes_list:
+                            strike = float(strikes_list[0])
+                except Exception:
+                    pass
+
+                # Use market order exit (no quotes needed)
+                exit_order = await close_position_market(
+                    self.ib, self.trade_logger, trade.trade_id,
+                    trade.ticker, trade.expiration, strike, trade.contracts,
+                    entry_fill_price=trade.entry_fill_price,
+                    spot_at_entry=trade.spot_at_entry
+                )
+
+                if exit_order:
+                    self.active_exit_orders[trade.trade_id] = exit_order
+                    logger.info(f"{trade.ticker}: Market exit order placed")
+                else:
+                    logger.error(f"{trade.ticker}: FAILED to place market exit - MANUAL CLOSE REQUIRED")
+
+        except Exception as e:
+            logger.error(f"Failed to force exit orphaned positions: {e}")
 
     async def task_evening_disconnect(self):
         """4:05 PM ET - Disconnect."""
@@ -1208,7 +1267,7 @@ class TradingDaemon:
                             logger.warning(
                                 f"Exit order for {trade.ticker} not found but position exists - placing new exit order"
                             )
-                            # Place new exit order at bid for quick fill
+                            # Try limit order first (requires quotes)
                             exit_order = await close_position(
                                 self.ib, self.trade_logger, trade.trade_id,
                                 trade.ticker, trade.expiration, strike, trade.contracts,
@@ -1221,7 +1280,22 @@ class TradingDaemon:
                                 new_exit_count += 1
                                 logger.info(f"{trade.ticker}: New exit order placed successfully")
                             else:
-                                logger.error(f"{trade.ticker}: Failed to place new exit order")
+                                # Quotes unavailable (market closed?) - track for later
+                                # Create placeholder ExitComboOrder so force exit can find it
+                                logger.warning(
+                                    f"{trade.ticker}: No quotes available - will retry at next exit window"
+                                )
+                                # Add to positions_to_exit for next task_exit_positions run
+                                self.positions_to_exit.append({
+                                    'trade_id': trade.trade_id,
+                                    'symbol': trade.ticker,
+                                    'expiry': trade.expiration,
+                                    'strike': strike,
+                                    'contracts': trade.contracts,
+                                    'entry_fill_price': trade.entry_fill_price,
+                                    'spot_at_entry': trade.spot_at_entry,
+                                    'orphaned': True,  # Flag for special handling
+                                })
                         else:
                             # No position and no fills - position may have been closed manually
                             logger.warning(
@@ -1238,6 +1312,87 @@ class TradingDaemon:
 
         except Exception as e:
             logger.error(f"Failed to recover exit orders: {e}")
+
+    async def _reconcile_positions(self):
+        """Reconcile IBKR positions with database state on startup."""
+        import json
+
+        logger.info("=== POSITION RECONCILIATION ===")
+
+        try:
+            # Get actual positions from IBKR
+            positions = self.ib.positions()
+            ibkr_options = {}
+            for p in positions:
+                if p.contract.secType == 'OPT' and p.position != 0:
+                    symbol = p.contract.symbol
+                    if symbol not in ibkr_options:
+                        ibkr_options[symbol] = []
+                    ibkr_options[symbol].append({
+                        'right': p.contract.right,
+                        'strike': p.contract.strike,
+                        'expiry': p.contract.lastTradeDateOrContractMonth,
+                        'qty': abs(p.position),
+                        'avg_cost': p.avgCost,
+                    })
+
+            if not ibkr_options:
+                logger.info("No option positions in IBKR")
+                return
+
+            logger.info(f"IBKR option positions: {list(ibkr_options.keys())}")
+
+            # Get trades from DB that should have positions
+            filled_trades = self.trade_logger.get_trades(status='filled')
+            exiting_trades = self.trade_logger.get_trades(status='exiting')
+            db_positions = {t.ticker: t for t in filled_trades + exiting_trades}
+
+            # Also check "exited" trades - they might have orphaned positions
+            exited_trades = self.trade_logger.get_trades(status='exited')
+            db_exited = {t.ticker: t for t in exited_trades}
+
+            # Check for mismatches
+            mismatches = []
+
+            # 1. Positions in IBKR but not in DB (filled/exiting)
+            for symbol in ibkr_options:
+                if symbol not in db_positions:
+                    # Check if it's marked as "exited" but still has position
+                    if symbol in db_exited:
+                        trade = db_exited[symbol]
+                        logger.warning(
+                            f"{symbol}: Marked 'exited' but IBKR still has position - reopening as 'exiting'"
+                        )
+                        self.trade_logger.update_trade(
+                            trade.trade_id,
+                            status='exiting',
+                            notes='Reopened: position still exists in IBKR'
+                        )
+                        # Add to db_positions for further processing
+                        db_positions[symbol] = trade
+                    else:
+                        mismatches.append(f"IBKR has {symbol} but no matching DB trade")
+
+            # 2. DB says we have position but IBKR doesn't
+            for ticker, trade in db_positions.items():
+                if ticker not in ibkr_options:
+                    mismatches.append(
+                        f"DB trade {trade.trade_id} ({ticker}) is {trade.status} but no IBKR position"
+                    )
+                    # If exiting with no position, mark as exited
+                    if trade.status == 'exiting':
+                        logger.info(f"{ticker}: Marking as exited (position closed)")
+                        self.trade_logger.update_trade(trade.trade_id, status='exited')
+
+            if mismatches:
+                logger.warning("POSITION MISMATCHES DETECTED:")
+                for m in mismatches:
+                    logger.warning(f"  - {m}")
+            else:
+                logger.info("Positions reconciled - no mismatches")
+
+        except Exception as e:
+            logger.error(f"Position reconciliation failed: {e}")
 
     async def _log_account_summary(self):
         """Log account info (Async)."""
@@ -1408,6 +1563,9 @@ class TradingDaemon:
         if self.executor:
             self.executor.recover_orders()
             await self._recover_exit_orders()
+
+        # Reconcile positions (detect IBKR vs DB mismatches)
+        await self._reconcile_positions()
 
         # Startup checks
         await self._run_screening_if_needed()

@@ -1099,3 +1099,88 @@ async def convert_exit_to_market(
     except Exception as e:
         logger.error(f"{symbol}: Failed to place market exit orders: {e}")
         return None
+
+
+async def close_position_market(
+    ib: IB,
+    trade_logger: TradeLogger,
+    trade_id: str,
+    symbol: str,
+    expiry: str,
+    strike: float,
+    contracts: int,
+    entry_fill_price: Optional[float] = None,
+    spot_at_entry: Optional[float] = None,
+) -> Optional[ExitComboOrder]:
+    """
+    Close position using market orders - no quotes required.
+
+    Use this for force exits at market close or when quotes are unavailable.
+    Returns ExitComboOrder for tracking, or None on failure.
+    """
+    # Create option contracts
+    call = Option(symbol, expiry, strike, 'C', 'SMART', tradingClass=symbol)
+    put = Option(symbol, expiry, strike, 'P', 'SMART', tradingClass=symbol)
+
+    try:
+        await ib.qualifyContractsAsync(call, put)
+    except Exception as e:
+        logger.error(f"{symbol}: Could not qualify options for market close: {e}")
+        return None
+
+    # Place market orders (no quotes needed)
+    call_order = MarketOrder('SELL', contracts)
+    put_order = MarketOrder('SELL', contracts)
+
+    try:
+        call_trade = ib.placeOrder(call, call_order)
+        put_trade = ib.placeOrder(put, put_order)
+
+        logger.warning(
+            f"{symbol}: Market exit orders placed "
+            f"(call={call_trade.order.orderId}, put={put_trade.order.orderId})"
+        )
+
+        # Update trade logger with new order IDs
+        trade_logger.update_trade(
+            trade_id,
+            exit_call_order_id=call_trade.order.orderId,
+            exit_put_order_id=put_trade.order.orderId,
+            notes="Force market exit",
+        )
+
+        # Log order events
+        trade_logger.log_order_event(
+            trade_id=trade_id,
+            ib_order_id=call_trade.order.orderId,
+            event='placed',
+            status=call_trade.orderStatus.status,
+            remaining=call_trade.orderStatus.remaining,
+            limit_price=0,  # Market order
+        )
+        trade_logger.log_order_event(
+            trade_id=trade_id,
+            ib_order_id=put_trade.order.orderId,
+            event='placed',
+            status=put_trade.orderStatus.status,
+            remaining=put_trade.orderStatus.remaining,
+            limit_price=0,
+        )
+
+        return ExitComboOrder(
+            trade_id=trade_id,
+            symbol=symbol,
+            expiry=expiry,
+            strike=strike,
+            contracts=contracts,
+            order_id=call_trade.order.orderId,
+            trade=call_trade,
+            put_trade=put_trade,
+            entry_fill_price=entry_fill_price,
+            spot_at_entry=spot_at_entry,
+            status='pending',
+        )
+
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to place market exit orders: {e}")
+        return None

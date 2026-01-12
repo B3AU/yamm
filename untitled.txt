@@ -1,0 +1,112 @@
+  Code Review: trading/earnings/ Module
+
+     Summary
+
+     - 4 Critical, 8 High, 12 Medium, 10 Low severity issues found
+
+     ---
+     URGENT: Exit Orders Rejected by IBKR
+
+     Error: Order rejected - reason: Riskless combination orders are not allowed.
+
+     Root cause: IBKR doesn't allow closing straddles as BAG (combo) orders when it's considered "riskless". This happened for ALL exit orders (HELE, NEOG, APLD, JEF, STZ, AYI).
+
+     Fix: For exits, place two separate leg orders instead of a combo:
+     - SELL call leg
+     - SELL put leg
+
+     File: trading/earnings/executor.py - close_position() function (line ~532)
+
+     Change: Instead of creating a single BAG order with _create_exit_combo(), place two individual Option SELL orders.
+
+     ---
+     Critical Issues (Fix Before Production)
+
+     1. Signal Handler Exception Risk (daemon.py:1031)
+
+     loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+     Risk: Daemon may hang during shutdown if shutdown() raises.
+
+     Fix: Wrap in try/except, or use call_soon_threadsafe.
+
+     2. SQL Injection in Column Names (logging.py:329-340)
+
+     set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+     Risk: Column names from **updates are interpolated. Validate against whitelist.
+
+     Fix: Add whitelist of allowed column names.
+
+     3. No Market Data Timeout Validation (executor.py:556-560, screener.py:237-241)
+
+     for _ in range(20):
+         if (call_ticker.bid > 0 ...): break
+         await asyncio.sleep(0.1)
+     # Continues even if no data received!
+     Risk: Orders placed with invalid/stale prices.
+
+     Fix: Check after loop and raise error if no valid data.
+
+     4. Singleton Cannot Recover (ml_predictor.py:840-845)
+
+     Risk: Corrupted predictor state persists until restart.
+
+     Fix: Add reset_predictor() function or health check.
+
+     ---
+     High Priority Issues
+     ┌─────┬─────────────────────┬───────────────────────────────────────┬─────────────────────────────────┐
+     │  #  │        File         │                 Issue                 │               Fix               │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 5   │ executor.py:321     │ Partial fills not recovered           │ Add partial fill recovery logic │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 6   │ executor.py:467     │ Silent JSON parse failure -> strike=0 │ Raise error on invalid strike   │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 7   │ ml_predictor.py:681 │ No FMP rate limiting                  │ Add global rate limiter         │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 8   │ dashboard.py:305    │ Hardcoded port 4002                   │ Make configurable               │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 9   │ daemon.py:552       │ Market data leaks on exception        │ Use try/finally                 │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 10  │ daemon.py:271       │ Uses local time, not ET               │ Use pytz.timezone('US/Eastern') │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 11  │ daemon.py:267       │ Blocking HTTP in thread pool          │ Add timeout to requests         │
+     ├─────┼─────────────────────┼───────────────────────────────────────┼─────────────────────────────────┤
+     │ 12  │ screener.py:99      │ No API response validation            │ Check expected structure        │
+     └─────┴─────────────────────┴───────────────────────────────────────┴─────────────────────────────────┘
+     ---
+     Files to Modify
+
+     1. trading/earnings/daemon.py - Signal handler, timezone, market data cleanup
+     2. trading/earnings/logging.py - SQL column name whitelist
+     3. trading/earnings/executor.py - Market data validation, JSON error handling
+     4. trading/earnings/screener.py - Market data validation, API response check
+     5. trading/earnings/ml_predictor.py - Rate limiting, singleton reset
+
+     ---
+     Recommended Fixes (Prioritized)
+
+     Phase 1: Critical Safety (do first)
+
+     1. Add market data validation after wait loops
+     2. Add SQL column name whitelist
+     3. Fix signal handler exception handling
+
+     Phase 2: Reliability
+
+     4. Add try/finally for market data cancellation
+     5. Fix timezone to use ET consistently
+     6. Add JSON parse error handling with proper fallback
+
+     Phase 3: Operations
+
+     7. Make dashboard IBKR port configurable
+     8. Add FMP rate limiting
+     9. Add singleton health check/reset
+
+     ---
+     Verification
+
+     After each fix:
+     1. Run daemon and verify no startup errors
+     2. Check logs during market hours for normal operation
+     3. Test shutdown with Ctrl+C - should exit cleanly

@@ -768,7 +768,7 @@ class TradeLogger:
 
                 # Filter row_dict to only include keys that match TradeLog fields
                 # This makes the logger robust to schema drifts
-                valid_fields = set(TradeLog.__match_args__)
+                valid_fields = set(TradeLog.__dataclass_fields__.keys())
                 filtered_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
 
                 results.append(TradeLog(**filtered_dict))
@@ -831,7 +831,7 @@ class TradeLogger:
                 row_dict.pop('created_at', None)
                 row_dict.pop('updated_at', None)
 
-                valid_fields = set(TradeLog.__match_args__)
+                valid_fields = set(TradeLog.__dataclass_fields__.keys())
                 filtered_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
 
                 results.append(TradeLog(**filtered_dict))

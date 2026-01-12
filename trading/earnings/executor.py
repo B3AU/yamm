@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -72,6 +73,7 @@ class ComboOrder:
     put_conId: Optional[int] = None
 
     fill_price: Optional[float] = None  # Combined straddle fill price
+    placement_time: Optional[datetime] = None  # For fill latency tracking
 
     status: str = 'pending'  # pending, filled, cancelled
 
@@ -114,6 +116,7 @@ class Phase0Executor:
         self.logger = trade_logger
         self.limit_aggression = limit_aggression
         self.active_orders: dict[str, ComboOrder] = {}
+        self._fill_lock = threading.Lock()  # Prevents race conditions in fill detection
 
     def _create_straddle_combo(
         self,
@@ -199,13 +202,16 @@ class Phase0Executor:
         # Generate trade ID
         trade_id = generate_trade_id(candidate.symbol, str(candidate.earnings_date))
 
-        # Log the trade entry
+        # Capture timestamp for decision latency tracking
+        decision_time = datetime.now()
+
+        # Log the trade entry with all quantiles for calibration tracking
         trade_log = TradeLog(
             trade_id=trade_id,
             ticker=candidate.symbol,
             earnings_date=str(candidate.earnings_date),
             earnings_timing=candidate.timing,
-            entry_datetime=datetime.now().isoformat(),
+            entry_datetime=decision_time.isoformat(),
             entry_quoted_bid=straddle_bid,
             entry_quoted_ask=straddle_ask,
             entry_quoted_mid=straddle_mid,
@@ -218,8 +224,12 @@ class Phase0Executor:
             contracts=contracts,
             premium_paid=0,  # Updated on fill
             max_loss=straddle_limit * contracts * 100,
+            predicted_q50=candidate.pred_q50,
             predicted_q75=candidate.pred_q75,
+            predicted_q90=candidate.pred_q90,
+            predicted_q95=candidate.pred_q95,
             edge_q75=candidate.edge_q75,
+            edge_q90=candidate.edge_q90,
             implied_move=candidate.implied_move_pct / 100,
             spot_at_entry=candidate.spot_price,
             status='pending',
@@ -260,6 +270,7 @@ class Phase0Executor:
             trade=trade,
             call_conId=call.conId,
             put_conId=put.conId,
+            placement_time=datetime.now(),  # For fill latency tracking
             status='pending',
         )
 
@@ -280,76 +291,89 @@ class Phase0Executor:
         return combo_order
 
     def check_fills(self) -> list[ComboOrder]:
-        """Check status of all active combo orders and update logs."""
-        filled = []
+        """Check status of all active combo orders and update logs.
 
-        for trade_id, combo_order in list(self.active_orders.items()):
-            if not combo_order.trade:
-                continue
+        Thread-safe: uses lock to prevent race conditions when called
+        concurrently from multiple scheduler jobs.
+        """
+        with self._fill_lock:
+            filled = []
 
-            status = combo_order.trade.orderStatus.status
-            filled_qty = combo_order.trade.orderStatus.filled
-            total_qty = combo_order.trade.order.totalQuantity
-            remaining_qty = combo_order.trade.orderStatus.remaining
-            last_fill_price = combo_order.trade.orderStatus.lastFillPrice
-            avg_fill_price = combo_order.trade.orderStatus.avgFillPrice
+            for trade_id, combo_order in list(self.active_orders.items()):
+                if not combo_order.trade:
+                    continue
 
-            # Log granular status update if status changed or filled qty increased
-            prev_status = getattr(combo_order, '_last_log_status', None)
-            prev_filled = getattr(combo_order, '_last_log_filled', 0)
+                status = combo_order.trade.orderStatus.status
+                filled_qty = combo_order.trade.orderStatus.filled
+                total_qty = combo_order.trade.order.totalQuantity
+                remaining_qty = combo_order.trade.orderStatus.remaining
+                last_fill_price = combo_order.trade.orderStatus.lastFillPrice
+                avg_fill_price = combo_order.trade.orderStatus.avgFillPrice
 
-            if status != prev_status or filled_qty > prev_filled:
-                self.logger.log_order_event(
-                    trade_id=trade_id,
-                    ib_order_id=combo_order.trade.order.orderId,
-                    event='status_update' if filled_qty == prev_filled else 'fill',
-                    status=status,
-                    filled=filled_qty,
-                    remaining=remaining_qty,
-                    avg_fill_price=avg_fill_price,
-                    limit_price=combo_order.trade.order.lmtPrice,
-                    last_fill_price=last_fill_price,
-                    last_fill_qty=filled_qty - prev_filled if filled_qty > prev_filled else 0
-                )
-                combo_order._last_log_status = status
-                combo_order._last_log_filled = filled_qty
+                # Log granular status update if status changed or filled qty increased
+                prev_status = getattr(combo_order, '_last_log_status', None)
+                prev_filled = getattr(combo_order, '_last_log_filled', 0)
 
-            if status == 'Filled' and combo_order.fill_price is None:
-                combo_order.fill_price = avg_fill_price
-                combo_order.status = 'filled'
-                filled.append(combo_order)
+                if status != prev_status or filled_qty > prev_filled:
+                    self.logger.log_order_event(
+                        trade_id=trade_id,
+                        ib_order_id=combo_order.trade.order.orderId,
+                        event='status_update' if filled_qty == prev_filled else 'fill',
+                        status=status,
+                        filled=filled_qty,
+                        remaining=remaining_qty,
+                        avg_fill_price=avg_fill_price,
+                        limit_price=combo_order.trade.order.lmtPrice,
+                        last_fill_price=last_fill_price,
+                        last_fill_qty=filled_qty - prev_filled if filled_qty > prev_filled else 0
+                    )
+                    combo_order._last_log_status = status
+                    combo_order._last_log_filled = filled_qty
 
-                logger.info(
-                    f"{combo_order.symbol}: Straddle filled @ ${combo_order.fill_price:.2f}"
-                )
+                if status == 'Filled' and combo_order.fill_price is None:
+                    combo_order.fill_price = avg_fill_price
+                    combo_order.status = 'filled'
+                    filled.append(combo_order)
 
-                # Update trade log
-                self.logger.update_trade(
-                    trade_id,
-                    status='filled',
-                    entry_fill_price=combo_order.fill_price,
-                    entry_fill_time=datetime.now().isoformat(),
-                    entry_slippage=combo_order.fill_price - combo_order.trade.order.lmtPrice,
-                    premium_paid=combo_order.fill_price * filled_qty * 100,  # Use actual filled quantity
-                )
+                    # Calculate fill latency
+                    fill_time = datetime.now()
+                    fill_latency_seconds = None
+                    if combo_order.placement_time:
+                        fill_latency_seconds = (fill_time - combo_order.placement_time).total_seconds()
 
-            elif status in ('Cancelled', 'Inactive'):
-                combo_order.status = 'cancelled'
-                self.logger.update_trade(trade_id, status='cancelled')
-                logger.info(f"{combo_order.symbol}: Order cancelled/inactive")
+                    logger.info(
+                        f"{combo_order.symbol}: Straddle filled @ ${combo_order.fill_price:.2f}"
+                        f" (latency: {fill_latency_seconds:.0f}s)" if fill_latency_seconds else ""
+                    )
 
-            elif filled_qty > 0 and filled_qty < total_qty:
-                # Partial fill on combo (rare but possible)
-                if combo_order.status != 'partial':
-                    combo_order.status = 'partial'
-                    self.logger.update_trade(trade_id, status='partial')
+                    # Update trade log with fill details and timing
+                    self.logger.update_trade(
+                        trade_id,
+                        status='filled',
+                        entry_fill_price=combo_order.fill_price,
+                        entry_fill_time=fill_time.isoformat(),
+                        entry_slippage=combo_order.fill_price - combo_order.trade.order.lmtPrice,
+                        premium_paid=combo_order.fill_price * filled_qty * 100,  # Use actual filled quantity
+                        fill_latency_seconds=fill_latency_seconds,
+                    )
 
-                logger.warning(
-                    f"{combo_order.symbol}: PARTIAL COMBO FILL - "
-                    f"{int(filled_qty)}/{int(total_qty)} ({status})"
-                )
+                elif status in ('Cancelled', 'Inactive'):
+                    combo_order.status = 'cancelled'
+                    self.logger.update_trade(trade_id, status='cancelled')
+                    logger.info(f"{combo_order.symbol}: Order cancelled/inactive")
 
-        return filled
+                elif filled_qty > 0 and filled_qty < total_qty:
+                    # Partial fill on combo (rare but possible)
+                    if combo_order.status != 'partial':
+                        combo_order.status = 'partial'
+                        self.logger.update_trade(trade_id, status='partial')
+
+                    logger.warning(
+                        f"{combo_order.symbol}: PARTIAL COMBO FILL - "
+                        f"{int(filled_qty)}/{int(total_qty)} ({status})"
+                    )
+
+            return filled
 
     def get_partial_fills(self) -> list[ComboOrder]:
         """Get all orders with partial fills.
@@ -582,23 +606,36 @@ async def close_position(
         return None
 
     # Get current quotes
-    call_ticker = ib.reqMktData(call, '', False, False)
-    put_ticker = ib.reqMktData(put, '', False, False)
+    call_ticker = None
+    put_ticker = None
+    call_bid = call_ask = put_bid = put_ask = 0
+    try:
+        call_ticker = ib.reqMktData(call, '', False, False)
+        put_ticker = ib.reqMktData(put, '', False, False)
 
-    # Wait for data (up to 2s)
-    for _ in range(20):
-        if (call_ticker.bid > 0 and call_ticker.ask > 0 and
-            put_ticker.bid > 0 and put_ticker.ask > 0):
-            break
-        await asyncio.sleep(0.1)
+        # Wait for data (up to 2s)
+        for _ in range(20):
+            if (call_ticker.bid > 0 and call_ticker.ask > 0 and
+                put_ticker.bid > 0 and put_ticker.ask > 0):
+                break
+            await asyncio.sleep(0.1)
 
-    call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
-    call_ask = call_ticker.ask if call_ticker.ask == call_ticker.ask else 0
-    put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
-    put_ask = put_ticker.ask if put_ticker.ask == put_ticker.ask else 0
-
-    ib.cancelMktData(call)
-    ib.cancelMktData(put)
+        call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
+        call_ask = call_ticker.ask if call_ticker.ask == call_ticker.ask else 0
+        put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
+        put_ask = put_ticker.ask if put_ticker.ask == put_ticker.ask else 0
+    finally:
+        # Always cancel market data subscriptions to prevent leaks
+        if call_ticker is not None:
+            try:
+                ib.cancelMktData(call)
+            except Exception:
+                pass
+        if put_ticker is not None:
+            try:
+                ib.cancelMktData(put)
+            except Exception:
+                pass
 
     if call_bid <= 0 or put_bid <= 0:
         logger.error(f"No valid bids for close")
@@ -761,6 +798,17 @@ async def check_exit_fills(
     for trade_id, exit_order in list(exit_orders.items()):
         if not exit_order.trade:
             continue
+
+        # Skip already completed exits
+        if exit_order.status == 'filled':
+            continue
+
+        # Process pending, submitted, and retrying orders
+        # Note: 'retrying' orders need to be monitored for their retry fill
+        if exit_order.status not in ('pending', 'submitted', 'retrying', 'partial'):
+            # Skip cancelled, orphan, or other terminal states
+            if exit_order.status != 'exiting':  # 'exiting' is also valid to monitor
+                continue
 
         # Check call leg status
         call_status = exit_order.trade.orderStatus.status
@@ -967,19 +1015,32 @@ async def reprice_exit_to_bid(
         logger.error(f"{symbol}: Failed to qualify contracts for reprice: {e}")
         return None
 
-    call_ticker = ib.reqMktData(call, '', False, False)
-    put_ticker = ib.reqMktData(put, '', False, False)
+    call_ticker = None
+    put_ticker = None
+    call_bid = put_bid = 0
+    try:
+        call_ticker = ib.reqMktData(call, '', False, False)
+        put_ticker = ib.reqMktData(put, '', False, False)
 
-    for _ in range(20):
-        if (call_ticker.bid > 0 and put_ticker.bid > 0):
-            break
-        await asyncio.sleep(0.1)
+        for _ in range(20):
+            if (call_ticker.bid > 0 and put_ticker.bid > 0):
+                break
+            await asyncio.sleep(0.1)
 
-    call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
-    put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
-
-    ib.cancelMktData(call)
-    ib.cancelMktData(put)
+        call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
+        put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
+    finally:
+        # Always cancel market data subscriptions to prevent leaks
+        if call_ticker is not None:
+            try:
+                ib.cancelMktData(call)
+            except Exception:
+                pass
+        if put_ticker is not None:
+            try:
+                ib.cancelMktData(put)
+            except Exception:
+                pass
 
     if call_bid <= 0 or put_bid <= 0:
         logger.error(f"{symbol}: No valid bids for reprice (call={call_bid}, put={put_bid})")

@@ -85,6 +85,7 @@ class EarningsPredictor:
 
         self.feature_cols = config['feature_cols']
         self.quantiles = config['quantiles']
+        self.news_feature_medians = config.get('news_feature_medians', {})
 
         for q in self.quantiles:
             model_path = self.model_dir / f'earnings_q{int(q*100)}.txt'
@@ -477,10 +478,15 @@ class EarningsPredictor:
         """Fetch news and compute PCA features from FMP.
 
         Returns dict with pre_earnings_news_count, news_pca_0 through news_pca_9, and headlines.
+        Uses training medians as defaults (not zeros) to avoid feature space discontinuity.
         """
-        defaults = {'pre_earnings_news_count': 0, 'headlines': []}
+        # Use training medians as defaults instead of zeros
+        defaults = {
+            'pre_earnings_news_count': self.news_feature_medians.get('pre_earnings_news_count', 1.0),
+            'headlines': []
+        }
         for i in range(10):
-            defaults[f'news_pca_{i}'] = 0.0
+            defaults[f'news_pca_{i}'] = self.news_feature_medians.get(f'news_pca_{i}', 0.0)
 
         if not LIVE_DATA_ENABLED or self.news_pca is None:
             return defaults

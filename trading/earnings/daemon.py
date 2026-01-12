@@ -24,6 +24,7 @@ import sys
 import signal
 import logging
 import asyncio
+import math
 from datetime import datetime, date, timedelta
 from functools import partial
 from pathlib import Path
@@ -343,10 +344,14 @@ class TradingDaemon:
                         self.executor.log_non_trade(candidate)
                         continue
 
-                    # Add ML fields
+                    # Add ML fields (all quantiles for calibration tracking)
+                    candidate.pred_q50 = prediction.pred_q50
                     candidate.pred_q75 = prediction.pred_q75
+                    candidate.pred_q90 = prediction.pred_q90
+                    candidate.pred_q95 = prediction.pred_q95
                     candidate.hist_move_mean = prediction.hist_move_mean
                     candidate.edge_q75 = prediction.edge_q75
+                    candidate.edge_q90 = prediction.edge_q90
                     candidate.news_count = prediction.news_count
 
                     if prediction.edge_q75 >= edge_threshold:
@@ -371,11 +376,13 @@ class TradingDaemon:
                 logger.warning("ML predictor not available - using liquidity-only screening")
 
             # LLM sanity check (if not disabled)
+            # Thresholds: DISABLED (skip), LOG_ONLY (run but don't block), WARN, NO_TRADE, PASS
             llm_threshold = CONFIG['llm_sanity_threshold']
             if llm_threshold != 'DISABLED' and passed:
                 from trading.earnings.llm_sanity_check import check_with_llm, build_sanity_packet
 
-                logger.info(f"Running LLM sanity checks (threshold={llm_threshold})...")
+                log_only = llm_threshold == 'LOG_ONLY'
+                logger.info(f"Running LLM sanity checks (threshold={llm_threshold}{', log-only mode' if log_only else ''})...")
                 llm_passed = []
 
                 for candidate in passed:
@@ -394,7 +401,11 @@ class TradingDaemon:
                     packet = build_sanity_packet(candidate, prediction)
                     result = await check_with_llm(packet, self.trade_logger, ticker=candidate.symbol)
 
-                    if result.decision == "NO_TRADE":
+                    # LOG_ONLY mode: log results but always allow trade
+                    if log_only:
+                        logger.info(f"  {candidate.symbol}: LLM {result.decision} (log-only, proceeding) - {result.risk_flags}")
+                        llm_passed.append(candidate)
+                    elif result.decision == "NO_TRADE":
                         candidate.rejection_reason = f"LLM NO_TRADE: {result.reasons[0] if result.reasons else 'Unknown'}"
                         self.executor.log_non_trade(candidate)
                         logger.warning(f"  {candidate.symbol}: LLM NO_TRADE - {result.risk_flags}")
@@ -704,7 +715,7 @@ class TradingDaemon:
                 await asyncio.sleep(0.1)
 
             spot = ticker.marketPrice()
-            if spot != spot or spot <= 0:  # NaN check
+            if math.isnan(spot) or spot <= 0:
                 spot = ticker.last if ticker.last and ticker.last > 0 else ticker.close
 
             return spot if spot and spot > 0 else None
@@ -861,7 +872,7 @@ class TradingDaemon:
                         await asyncio.sleep(0.1)
 
                     def valid(p):
-                        return p is not None and p == p and p > 0
+                        return p is not None and not math.isnan(p) and p > 0
 
                     call_mid = (call_ticker.bid + call_ticker.ask) / 2 if valid(call_ticker.bid) and valid(call_ticker.ask) else None
                     put_mid = (put_ticker.bid + put_ticker.ask) / 2 if valid(put_ticker.bid) and valid(put_ticker.ask) else None

@@ -85,7 +85,7 @@ class IBOptionsClient:
     def __init__(
         self,
         host: str = '127.0.0.1',
-        port: int = 7497,  # Paper trading port
+        port: int = 7497,  # TWS live port (7496=TWS paper, 4001=Gateway live, 4002=Gateway paper)
         client_id: int = 1,
     ):
         self.host = host

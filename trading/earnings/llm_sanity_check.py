@@ -253,11 +253,11 @@ async def check_with_llm(
     ticker = ticker or packet.get("ticker", "UNKNOWN")
     start_time = time.time()
 
-    # Default result for errors
+    # Default result for errors - fail-closed for safety
     default_result = SanityResult(
-        decision="PASS",  # Fail open - don't block trades on LLM errors
-        risk_flags=[],
-        reasons=["LLM check failed, proceeding with trade"],
+        decision="NO_TRADE",  # Fail closed - block trades on LLM errors to prevent trading halted stocks etc.
+        risk_flags=["api_failure"],
+        reasons=["LLM check failed, blocking trade for safety"],
         search_queries=[],
         search_results=[],
         model=DEFAULT_MODEL,
@@ -313,15 +313,18 @@ async def check_with_llm(
 
     except json.JSONDecodeError as e:
         logger.error(f"{ticker}: LLM response not valid JSON: {e}")
-        default_result.reasons = [f"LLM response parse error: {e}"]
+        default_result.reasons = [f"LLM response parse error: {e}", "Trade blocked for safety"]
+        default_result.risk_flags = ["api_failure", "json_parse_error"]
         return default_result
 
     except requests.RequestException as e:
         logger.error(f"{ticker}: LLM API error: {e}")
-        default_result.reasons = [f"LLM API error: {e}"]
+        default_result.reasons = [f"LLM API error: {e}", "Trade blocked for safety"]
+        default_result.risk_flags = ["api_failure", "request_error"]
         return default_result
 
     except Exception as e:
         logger.exception(f"{ticker}: Unexpected error in LLM sanity check: {e}")
-        default_result.reasons = [f"Unexpected error: {e}"]
+        default_result.reasons = [f"Unexpected error: {e}", "Trade blocked for safety"]
+        default_result.risk_flags = ["api_failure", "unexpected_error"]
         return default_result

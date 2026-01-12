@@ -16,6 +16,7 @@ Interactive commands (in watch mode):
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import select
 import sys
@@ -411,9 +412,9 @@ async def get_live_option_price_async(ib, symbol: str, expiry: str, strike: floa
             await asyncio.sleep(0.1)
 
         # IBKR returns -1.0 when no quote is available (market closed, no liquidity)
-        # Also check for NaN (value != value)
+        # Also check for NaN
         def valid_price(p):
-            return p is not None and p == p and p > 0
+            return p is not None and not math.isnan(p) and p > 0
 
         result = {
             'bid': ticker.bid if valid_price(ticker.bid) else None,
@@ -1203,29 +1204,37 @@ def close_position_interactive(logger: TradeLogger):
             action = 'SELL' if pos.position > 0 else 'BUY'
 
             # Get current quote
-            ticker = ib.reqMktData(contract, '', False, False)
-            ib.sleep(1)
+            ticker = None
+            price = None
+            try:
+                ticker = ib.reqMktData(contract, '', False, False)
+                ib.sleep(1)
 
-            # Use bid for sells, ask for buys
-            def valid_price(p):
-                return p is not None and p == p and p > 0
+                # Use bid for sells, ask for buys
+                def valid_price(p):
+                    return p is not None and not math.isnan(p) and p > 0
 
-            if action == 'SELL':
-                if valid_price(ticker.bid):
-                    price = ticker.bid
-                elif valid_price(ticker.last):
-                    price = ticker.last
+                if action == 'SELL':
+                    if valid_price(ticker.bid):
+                        price = ticker.bid
+                    elif valid_price(ticker.last):
+                        price = ticker.last
+                    else:
+                        price = None
                 else:
-                    price = None
-            else:
-                if valid_price(ticker.ask):
-                    price = ticker.ask
-                elif valid_price(ticker.last):
-                    price = ticker.last
-                else:
-                    price = None
-
-            ib.cancelMktData(contract)
+                    if valid_price(ticker.ask):
+                        price = ticker.ask
+                    elif valid_price(ticker.last):
+                        price = ticker.last
+                    else:
+                        price = None
+            finally:
+                # Always cancel market data subscriptions to prevent leaks
+                if ticker is not None:
+                    try:
+                        ib.cancelMktData(contract)
+                    except Exception:
+                        pass
 
             if not price:
                 print(f"    No price available for {c.right} (market closed?)")
@@ -1290,6 +1299,26 @@ def close_position_interactive(logger: TradeLogger):
         contracts = trade.contracts or 1
         exit_fill_price = total_exit_value / contracts / 100 if contracts > 0 else 0
 
+        # Get spot price at exit for realized move calculation
+        spot_at_exit = None
+        realized_move = None
+        realized_move_pct = None
+        try:
+            stock = Stock(trade.ticker, 'SMART', 'USD')
+            ib.qualifyContracts(stock)
+            ticker = ib.reqMktData(stock, '', False, False)
+            ib.sleep(1)
+            spot_at_exit = ticker.marketPrice()
+            if spot_at_exit != spot_at_exit or spot_at_exit <= 0:  # NaN check
+                spot_at_exit = ticker.last if ticker.last and ticker.last > 0 else ticker.close
+            ib.cancelMktData(stock)
+
+            if spot_at_exit and spot_at_exit > 0 and trade.spot_at_entry:
+                realized_move = abs(spot_at_exit - trade.spot_at_entry)
+                realized_move_pct = realized_move / trade.spot_at_entry
+        except Exception as e:
+            print(f"    Warning: Could not fetch spot price: {e}")
+
         # Update database with exit info
         exit_datetime = datetime.now().isoformat()
         pnl_pct = exit_pnl / entry_value if entry_value > 0 else 0
@@ -1301,6 +1330,9 @@ def close_position_interactive(logger: TradeLogger):
             exit_fill_price=exit_fill_price,
             exit_pnl=exit_pnl,
             exit_pnl_pct=pnl_pct,
+            spot_at_exit=spot_at_exit,
+            realized_move=realized_move,
+            realized_move_pct=realized_move_pct,
             notes='Manually closed via dashboard'
         )
 
@@ -1311,6 +1343,8 @@ def close_position_interactive(logger: TradeLogger):
         print(f"    Entry:  {format_currency(entry_value)}")
         print(f"    Exit:   {format_currency(total_exit_value)}")
         print(f"    P&L:    {pnl_color}{format_currency(exit_pnl)} ({pnl_pct*100:+.1f}%){reset_color()}")
+        if realized_move_pct is not None:
+            print(f"    Move:   {realized_move_pct*100:.1f}% (implied: {trade.implied_move*100:.1f}%)" if trade.implied_move else f"    Move:   {realized_move_pct*100:.1f}%")
 
         if not all_filled:
             print()

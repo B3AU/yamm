@@ -11,6 +11,7 @@ import os
 import requests
 import asyncio
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -21,6 +22,47 @@ import pytz
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    max_retries: int = 3,
+    backoff_factor: float = 1.0,
+    **kwargs
+) -> requests.Response:
+    """Make HTTP request with exponential backoff retry on failure.
+
+    Args:
+        method: HTTP method ('GET', 'POST', etc.)
+        url: Request URL
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Base delay multiplier for exponential backoff
+        **kwargs: Additional arguments passed to requests.request()
+
+    Returns:
+        Response object
+
+    Raises:
+        requests.RequestException: If all retries fail
+    """
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                delay = backoff_factor * (2 ** attempt)  # 1s, 2s, 4s...
+                logger.warning(f"Request to {url} failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Request to {url} failed after {max_retries} attempts: {e}")
+
+    raise last_exception
 
 # Timezone for earnings timing
 ET = pytz.timezone('US/Eastern')
@@ -71,10 +113,14 @@ class ScreenedCandidate:
     call_iv: Optional[float] = None
     put_iv: Optional[float] = None
 
-    # ML predictions
+    # ML predictions (all quantiles for calibration tracking)
+    pred_q50: Optional[float] = None
     pred_q75: Optional[float] = None
+    pred_q90: Optional[float] = None
+    pred_q95: Optional[float] = None
     hist_move_mean: Optional[float] = None
     edge_q75: Optional[float] = None
+    edge_q90: Optional[float] = None
     news_count: Optional[int] = None  # number of FMP news articles found
 
     # Why it passed/failed
@@ -97,8 +143,7 @@ def fetch_upcoming_earnings(days_ahead: int = 7) -> list[EarningsEvent]:
         url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"
 
         try:
-            r = requests.get(url, headers=NASDAQ_HEADERS, timeout=10)
-            r.raise_for_status()
+            r = _request_with_retry('GET', url, headers=NASDAQ_HEADERS, timeout=10)
             data = r.json()
 
             rows = data.get('data', {}).get('rows', [])
@@ -173,8 +218,7 @@ def fetch_fmp_earnings(from_date: date = None, to_date: date = None, days_ahead:
 
     events = []
     try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
+        r = _request_with_retry('GET', url, params=params, timeout=15)
         data = r.json()
 
         for row in data:
@@ -482,23 +526,29 @@ async def screen_candidate_ibkr(
     except Exception as e:
         return _rejected_candidate(symbol, earnings_date, timing, f"Could not qualify stock: {e}")
 
-    ticker = ib.reqMktData(stock, '', False, False)
+    ticker = None
+    try:
+        ticker = ib.reqMktData(stock, '', False, False)
 
-    # Wait for price (max 2s)
-    for _ in range(20):
-        if ticker.last == ticker.last and ticker.last > 0:
-            break
-        if ticker.close == ticker.close and ticker.close > 0:
-            break
-        await asyncio.sleep(0.1)
+        # Wait for price (max 2s)
+        for _ in range(20):
+            if ticker.last and not math.isnan(ticker.last) and ticker.last > 0:
+                break
+            if ticker.close and not math.isnan(ticker.close) and ticker.close > 0:
+                break
+            await asyncio.sleep(0.1)
 
-    spot = ticker.marketPrice()
-    if math.isnan(spot) or spot <= 0:  # nan check
-        spot = ticker.last
-    if math.isnan(spot) or spot <= 0:
-        spot = ticker.close
-
-    ib.cancelMktData(stock)
+        spot = ticker.marketPrice()
+        if math.isnan(spot) or spot <= 0:  # nan check
+            spot = ticker.last
+        if math.isnan(spot) or spot <= 0:
+            spot = ticker.close
+    finally:
+        if ticker is not None:
+            try:
+                ib.cancelMktData(stock)
+            except Exception:
+                pass
 
     if not spot or spot <= 0 or math.isnan(spot):
         return _rejected_candidate(symbol, earnings_date, timing, "No spot price")
@@ -543,35 +593,47 @@ async def screen_candidate_ibkr(
     except Exception as e:
         return _rejected_candidate(symbol, earnings_date, timing, f"Option qualification error: {e}")
 
-    call_ticker = ib.reqMktData(call, '', False, False)
-    put_ticker = ib.reqMktData(put, '', False, False)
+    call_ticker = None
+    put_ticker = None
+    call_bid = call_ask = put_bid = put_ask = 0.0
+    call_iv = put_iv = None
+    try:
+        call_ticker = ib.reqMktData(call, '', False, False)
+        put_ticker = ib.reqMktData(put, '', False, False)
 
-    # Wait for quotes (max 2s)
-    for _ in range(20):
-        if (call_ticker.bid > 0 and call_ticker.ask > 0 and
-            put_ticker.bid > 0 and put_ticker.ask > 0):
-            break
-        await asyncio.sleep(0.1)
+        # Wait for quotes (max 2s)
+        for _ in range(20):
+            if (call_ticker.bid > 0 and call_ticker.ask > 0 and
+                put_ticker.bid > 0 and put_ticker.ask > 0):
+                break
+            await asyncio.sleep(0.1)
 
-    # Extract bid/ask
-    def _valid(p) -> float:
-        return 0.0 if (p is None or math.isnan(p)) else float(p)
+        # Extract bid/ask
+        def _valid(p) -> float:
+            return 0.0 if (p is None or math.isnan(p)) else float(p)
 
-    call_bid = _valid(call_ticker.bid)
-    call_ask = _valid(call_ticker.ask)
-    put_bid = _valid(put_ticker.bid)
-    put_ask = _valid(put_ticker.ask)
+        call_bid = _valid(call_ticker.bid)
+        call_ask = _valid(call_ticker.ask)
+        put_bid = _valid(put_ticker.bid)
+        put_ask = _valid(put_ticker.ask)
 
-    # Get IV if available
-    call_iv = None
-    put_iv = None
-    if call_ticker.modelGreeks:
-        call_iv = call_ticker.modelGreeks.impliedVol
-    if put_ticker.modelGreeks:
-        put_iv = put_ticker.modelGreeks.impliedVol
-
-    ib.cancelMktData(call)
-    ib.cancelMktData(put)
+        # Get IV if available
+        if call_ticker.modelGreeks:
+            call_iv = call_ticker.modelGreeks.impliedVol
+        if put_ticker.modelGreeks:
+            put_iv = put_ticker.modelGreeks.impliedVol
+    finally:
+        # Always cancel market data subscriptions to prevent leaks
+        if call_ticker is not None:
+            try:
+                ib.cancelMktData(call)
+            except Exception:
+                pass
+        if put_ticker is not None:
+            try:
+                ib.cancelMktData(put)
+            except Exception:
+                pass
 
     # Check if we have valid quotes
     if call_bid <= 0 or call_ask <= 0 or put_bid <= 0 or put_ask <= 0:

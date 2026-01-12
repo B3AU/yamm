@@ -337,7 +337,7 @@ def connect_ib(client_id: int = 20) -> Optional[object]:
         _ib = IB()
         # Note: If called within an async loop, this might be problematic if using run().
         # But we use simple connect() which blocks.
-        _ib.connect('127.0.0.1', 4002, clientId=client_id)
+        _ib.connect('127.0.0.1', 4002, clientId=client_id, timeout=10)
         _ib.reqMarketDataType(1)  # Live data
         return _ib
     except Exception as e:
@@ -354,7 +354,7 @@ async def connect_ib_async(client_id: int = 20) -> Optional[object]:
     try:
         from ib_insync import IB
         _ib = IB()
-        await _ib.connectAsync('127.0.0.1', 4002, clientId=client_id)
+        await _ib.connectAsync('127.0.0.1', 4002, clientId=client_id, timeout=10)
         _ib.reqMarketDataType(1)  # Live data
         return _ib
     except Exception as e:
@@ -889,36 +889,6 @@ def render_dashboard(
                 print(", ".join(symbols) + (f" (+{len(bmo_tomorrow)-10})" if len(bmo_tomorrow) > 10 else ""))
     except Exception:
         pass  # Don't fail dashboard if candidate fetch fails
-
-    # Visual timeline of earnings candidates
-    if open_trades and 'events' in locals() and events:
-        try:
-             # Sort relevant events by time
-             timeline_events = []
-             today = date.today()
-             tomorrow = today + timedelta(days=1)
-
-             for e in events:
-                 if e.earnings_date == today and e.timing == 'AMC':
-                     timeline_events.append((f"{e.symbol} (Today AMC)", 0)) # 0 = today
-                 elif e.earnings_date == tomorrow and e.timing == 'BMO':
-                     timeline_events.append((f"{e.symbol} (Tmw BMO)", 1)) # 1 = tomorrow
-
-             if timeline_events:
-                 print(dim("  " + "-" * 88))
-                 print(bold("  EARNINGS TIMELINE"))
-
-                 # Group by day
-                 today_list = [e[0] for e in timeline_events if e[1] == 0]
-                 tomorrow_list = [e[0] for e in timeline_events if e[1] == 1]
-
-                 if today_list:
-                     print(f"  Today AMC:  {', '.join(today_list[:8])}" + (f" (+{len(today_list)-8} more)" if len(today_list) > 8 else ""))
-                 if tomorrow_list:
-                     print(f"  Tmw BMO:    {', '.join(tomorrow_list[:8])}" + (f" (+{len(tomorrow_list)-8} more)" if len(tomorrow_list) > 8 else ""))
-        except:
-            pass
-
 
     # === Edge Realization (for completed trades) ===
     if completed_trades:

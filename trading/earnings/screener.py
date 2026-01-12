@@ -131,7 +131,7 @@ class ScreenedCandidate:
 
 def fetch_upcoming_earnings(days_ahead: int = 7) -> list[EarningsEvent]:
     """Fetch upcoming earnings from Nasdaq API (has BMO/AMC timing)."""
-    from_date = date.today()
+    from_date = datetime.now(ET).date()
     to_date = from_date + timedelta(days=days_ahead)
 
     events = []
@@ -205,7 +205,7 @@ def fetch_fmp_earnings(from_date: date = None, to_date: date = None, days_ahead:
         return []
 
     if from_date is None:
-        from_date = date.today()
+        from_date = datetime.now(ET).date()
     if to_date is None:
         to_date = from_date + timedelta(days=days_ahead)
 
@@ -303,7 +303,7 @@ def fetch_yahoo_earnings(
         return []
 
     if from_date is None:
-        from_date = date.today()
+        from_date = datetime.now(ET).date()
     if to_date is None:
         to_date = from_date + timedelta(days=days_ahead)
 
@@ -377,7 +377,7 @@ def fetch_all_earnings_sources(
 
     Returns dict mapping source name to list of events.
     """
-    from_date = date.today()
+    from_date = datetime.now(ET).date()
     to_date = from_date + timedelta(days=days_ahead)
 
     results = {}
@@ -467,13 +467,13 @@ def get_tradeable_candidates(
         fill_timing: Whether to fill unknown timing from yfinance
         verify_dates: Whether to verify dates against FMP
         screening_date: Date to use as "today" for categorization. If None,
-                       uses date.today(). Pass tomorrow's date after market
+                       uses datetime.now(ET).date(). Pass tomorrow's date after market
                        close to preview next screening session's candidates.
 
     Returns:
         (bmo_tomorrow, amc_today) - lists of verified candidates
     """
-    today = screening_date or date.today()
+    today = screening_date or datetime.now(ET).date()
     tomorrow = today + timedelta(days=1)
 
     # Fetch Nasdaq events

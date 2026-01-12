@@ -435,8 +435,11 @@ async def get_position_live_value_async(ib, trade) -> Optional[dict]:
 
     try:
         import json
-        strikes = json.loads(trade.strikes) if isinstance(trade.strikes, str) else trade.strikes
-        strike = strikes[0] if isinstance(strikes, list) else float(strikes)
+        try:
+            strikes = json.loads(trade.strikes) if isinstance(trade.strikes, str) else trade.strikes
+        except (json.JSONDecodeError, TypeError):
+            strikes = []
+        strike = strikes[0] if isinstance(strikes, list) and strikes else float(trade.strikes or 0)
         expiry = trade.expiration.replace('-', '')
 
         # Fetch in parallel
@@ -628,7 +631,10 @@ def render_dashboard(
             if compact:
                 # Compact: single line with key info
                 import json
-                strikes = json.loads(trade.strikes) if trade.strikes else []
+                try:
+                    strikes = json.loads(trade.strikes) if trade.strikes else []
+                except (json.JSONDecodeError, TypeError):
+                    strikes = []
                 strike_str = f"{strikes[0]:.0f}" if strikes else "?"
                 expiry_short = trade.expiration[5:] if trade.expiration else "?"  # MM-DD
                 age_str = format_age_compact(trade.entry_datetime, now)
@@ -1145,7 +1151,10 @@ def close_position_interactive(logger: TradeLogger):
 
         # Parse trade details
         import json
-        strikes = json.loads(trade.strikes) if trade.strikes else []
+        try:
+            strikes = json.loads(trade.strikes) if trade.strikes else []
+        except (json.JSONDecodeError, TypeError):
+            strikes = []
         strike = strikes[0] if strikes else 0
         expiry = trade.expiration
 

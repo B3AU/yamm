@@ -53,6 +53,7 @@ from trading.earnings.screener import (
     get_tradeable_candidates,
     screen_all_candidates,
     ScreenedCandidate,
+    is_valid_price,
 )
 from trading.earnings.executor import (
     Phase0Executor, close_position, close_position_market, ExitComboOrder,
@@ -161,6 +162,10 @@ class TradingDaemon:
 
         # Track connection state
         self.connected = False
+
+        # Async locks for shared state protection
+        self._trades_lock = asyncio.Lock()  # Protects todays_trades
+        self._exit_orders_lock = asyncio.Lock()  # Protects active_exit_orders
 
     async def connect_async(self):
         """Connect to IB Gateway asynchronously."""
@@ -482,7 +487,8 @@ class TradingDaemon:
                 )
 
                 if order_pair:
-                    self.todays_trades.append(order_pair.trade_id)
+                    async with self._trades_lock:
+                        self.todays_trades.append(order_pair.trade_id)
                     logger.info(f"  Order placed: {order_pair.trade_id}")
                 else:
                     logger.error(f"  Order failed for {candidate.symbol}")
@@ -537,8 +543,8 @@ class TradingDaemon:
             return
 
         try:
-            # Sync check_fills is safe (checks internal state)
-            filled = self.executor.check_fills()
+            # check_fills is async to properly handle the fill lock
+            filled = await self.executor.check_fills()
 
             if filled:
                 logger.info(f"Found {len(filled)} late fills, scheduling markouts...")
@@ -599,7 +605,7 @@ class TradingDaemon:
         # Monitor entry fills
         if self.executor.get_active_count() > 0:
             try:
-                filled = self.executor.check_fills()
+                filled = await self.executor.check_fills()
                 for order in filled:
                     logger.info(f"New fill detected for {order.symbol}, scheduling markouts...")
                     self._schedule_markouts(order)
@@ -708,17 +714,17 @@ class TradingDaemon:
 
             # Wait for data
             for _ in range(20):
-                if ticker.last and ticker.last > 0:
+                if is_valid_price(ticker.last):
                     break
-                if ticker.close and ticker.close > 0:
+                if is_valid_price(ticker.close):
                     break
                 await asyncio.sleep(0.1)
 
             spot = ticker.marketPrice()
-            if math.isnan(spot) or spot <= 0:
-                spot = ticker.last if ticker.last and ticker.last > 0 else ticker.close
+            if not is_valid_price(spot):
+                spot = ticker.last if is_valid_price(ticker.last) else ticker.close
 
-            return spot if spot and spot > 0 else None
+            return spot if is_valid_price(spot) else None
 
         except Exception as e:
             logger.error(f"Error fetching spot price for {symbol}: {e}")
@@ -1483,6 +1489,8 @@ class TradingDaemon:
             CronTrigger(day_of_week='mon-fri', hour='14-16', minute='*', timezone=ET),
             id='monitor_fills',
             name='Monitor Fills (Every min)',
+            misfire_grace_time=30,  # Allow 30s delay, skip if too late
+            coalesce=True,  # Combine missed jobs into one
         )
 
         # Position snapshots every 5 minutes from 9:30-16:00 for intraday P&L tracking

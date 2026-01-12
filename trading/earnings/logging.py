@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 import json
@@ -563,7 +563,7 @@ class TradeLogger:
                     latency_ms, model
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
                 ticker,
                 trade_id,
                 decision,
@@ -605,7 +605,7 @@ class TradeLogger:
                 eps_estimate,
                 revenue_estimate,
                 source,
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
             ))
             conn.commit()
 

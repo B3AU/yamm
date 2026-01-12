@@ -13,10 +13,11 @@ from __future__ import annotations
 import logging
 import asyncio
 import math
-import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
+
+import pytz
 
 from ib_insync import IB, Option, Stock, LimitOrder, MarketOrder, Trade, Contract, ComboLeg
 
@@ -117,7 +118,7 @@ class Phase0Executor:
         self.logger = trade_logger
         self.limit_aggression = limit_aggression
         self.active_orders: dict[str, ComboOrder] = {}
-        self._fill_lock = threading.Lock()  # Prevents race conditions in fill detection
+        self._fill_lock = asyncio.Lock()  # Prevents race conditions in fill detection (async-safe)
 
     def _create_straddle_combo(
         self,
@@ -203,8 +204,9 @@ class Phase0Executor:
         # Generate trade ID
         trade_id = generate_trade_id(candidate.symbol, str(candidate.earnings_date))
 
-        # Capture timestamp for decision latency tracking
-        decision_time = datetime.now()
+        # Capture timestamp for decision latency tracking (ET timezone)
+        ET = pytz.timezone('US/Eastern')
+        decision_time = datetime.now(ET)
 
         # Log the trade entry with all quantiles for calibration tracking
         trade_log = TradeLog(
@@ -291,13 +293,13 @@ class Phase0Executor:
 
         return combo_order
 
-    def check_fills(self) -> list[ComboOrder]:
+    async def check_fills(self) -> list[ComboOrder]:
         """Check status of all active combo orders and update logs.
 
-        Thread-safe: uses lock to prevent race conditions when called
+        Async-safe: uses lock to prevent race conditions when called
         concurrently from multiple scheduler jobs.
         """
-        with self._fill_lock:
+        async with self._fill_lock:
             filled = []
 
             for trade_id, combo_order in list(self.active_orders.items()):
@@ -525,6 +527,20 @@ class Phase0Executor:
                 if trade.status == 'filled':
                     logger.info(f"{trade.ticker}: Already filled, skipping recovery")
                     continue
+
+                # Check fills history before assuming the order is truly gone
+                fills = self.ib.fills()
+                order_filled = any(f.execution.orderId == order_id for f in fills)
+
+                if order_filled:
+                    logger.info(f"{trade.ticker}: Order {order_id} found in fills, marking as filled")
+                    self.logger.update_trade(
+                        trade.trade_id,
+                        status='filled',
+                        notes='Recovered from fills history'
+                    )
+                    continue
+
                 # Only cancel truly pending orders that aren't in IBKR
                 logger.warning(f"{trade.ticker}: Order not found in IBKR (ID: {order_id}) - marking as cancelled")
                 self.logger.update_trade(

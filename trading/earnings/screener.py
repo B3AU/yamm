@@ -24,6 +24,20 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+def is_valid_price(p) -> bool:
+    """Check if price is a valid positive number.
+
+    Handles None, NaN, and non-numeric values safely.
+    """
+    if p is None:
+        return False
+    try:
+        f = float(p)
+        return not math.isnan(f) and f > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _request_with_retry(
     method: str,
     url: str,
@@ -536,16 +550,16 @@ async def screen_candidate_ibkr(
 
         # Wait for price (max 2s)
         for _ in range(20):
-            if ticker.last and not math.isnan(ticker.last) and ticker.last > 0:
+            if is_valid_price(ticker.last):
                 break
-            if ticker.close and not math.isnan(ticker.close) and ticker.close > 0:
+            if is_valid_price(ticker.close):
                 break
             await asyncio.sleep(0.1)
 
         spot = ticker.marketPrice()
-        if math.isnan(spot) or spot <= 0:  # nan check
+        if not is_valid_price(spot):
             spot = ticker.last
-        if math.isnan(spot) or spot <= 0:
+        if not is_valid_price(spot):
             spot = ticker.close
     finally:
         if ticker is not None:
@@ -554,7 +568,7 @@ async def screen_candidate_ibkr(
             except Exception:
                 pass
 
-    if not spot or spot <= 0 or math.isnan(spot):
+    if not is_valid_price(spot):
         return _rejected_candidate(symbol, earnings_date, timing, "No spot price")
 
     # Get option chain

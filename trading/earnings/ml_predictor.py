@@ -262,7 +262,7 @@ class EarningsPredictor:
                 'hist_move_max': float(np.max(moves)),
                 'hist_move_min': float(np.min(moves)),
                 'hist_move_cv': float(np.std(moves) / np.mean(moves)) if np.mean(moves) > 0 else 0.0,
-                'recent_move_mean': float(np.mean(moves[-2:])) if len(moves) >= 1 else float(np.mean(moves)),
+                'recent_move_mean': float(np.mean(moves[-2:])) if len(moves) >= 2 else float(np.mean(moves)),
                 'move_trend': float(moves[-1] - moves[0]) if len(moves) >= 2 else 0.0,
                 'gap_continuation_ratio': float(np.mean(moves) / np.mean(gap_moves)) if np.mean(gap_moves) > 0 else 1.0,
                 'n_past_earnings': len(moves),
@@ -549,7 +549,7 @@ class EarningsPredictor:
             'hist_move_max': float(np.max(moves)),
             'hist_move_min': float(np.min(moves)),
             'hist_move_cv': float(np.std(moves) / np.mean(moves)) if np.mean(moves) > 0 else 0.0,
-            'recent_move_mean': float(np.mean(moves[-2:])) if len(moves) >= 1 else float(np.mean(moves)),
+            'recent_move_mean': float(np.mean(moves[-2:])) if len(moves) >= 2 else float(np.mean(moves)),
             'move_trend': float(moves[-1] - moves[0]) if len(moves) >= 2 else 0.0,
             'n_past_earnings': len(moves),
         }
@@ -667,12 +667,36 @@ class EarningsPredictor:
             future_surprise = executor.submit(self._fetch_earnings_surprises, symbol, earnings_date)
             future_news = executor.submit(self._compute_news_features, symbol, earnings_date)
 
-            # Retrieve results (will raise if any function raised, handled by caller or logged inside)
-            hist_features = future_hist.result()
-            price_features = future_prices.result()
-            fund_data = future_fund.result()
-            surprise_data = future_surprise.result()
-            news_features = future_news.result()
+            # Retrieve results with individual error handling
+            try:
+                hist_features = future_hist.result()
+            except Exception as e:
+                logger.error(f"{symbol}: Error fetching historical features: {e}")
+                hist_features = None
+
+            try:
+                price_features = future_prices.result()
+            except Exception as e:
+                logger.error(f"{symbol}: Error fetching price features: {e}")
+                price_features = {}
+
+            try:
+                fund_data = future_fund.result()
+            except Exception as e:
+                logger.error(f"{symbol}: Error fetching fundamentals: {e}")
+                fund_data = {}
+
+            try:
+                surprise_data = future_surprise.result()
+            except Exception as e:
+                logger.error(f"{symbol}: Error fetching earnings surprises: {e}")
+                surprise_data = {'surprise_pct_mean': 0.0, 'beat_rate': 0.5, 'surprise_streak': 0}
+
+            try:
+                news_features = future_news.result()
+            except Exception as e:
+                logger.error(f"{symbol}: Error fetching news features: {e}")
+                news_features = {}
 
         # Check required data
         if hist_features is None:

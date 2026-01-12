@@ -199,6 +199,37 @@ def format_time_since(past_dt: datetime, now: datetime = None) -> str:
         return f"{minutes}m ago"
 
 
+def format_age_compact(past_dt: datetime, now: datetime = None) -> str:
+    """Format age as compact string (e.g., '12h', '1.5d')."""
+    if past_dt is None:
+        return "?"
+
+    if now is None:
+        now = datetime.now()
+
+    if isinstance(past_dt, str):
+        past_dt = datetime.fromisoformat(past_dt)
+
+    # Handle timezones
+    if past_dt.tzinfo and not now.tzinfo:
+        past_dt = past_dt.replace(tzinfo=None)
+    elif not past_dt.tzinfo and now.tzinfo:
+        now = now.replace(tzinfo=None)
+
+    diff = now - past_dt
+    total_hours = diff.total_seconds() / 3600
+
+    if total_hours < 1:
+        return f"{int(diff.total_seconds() // 60)}m"
+    elif total_hours < 24:
+        return f"{total_hours:.0f}h"
+    else:
+        days = total_hours / 24
+        if days < 10:
+            return f"{days:.1f}d"
+        return f"{int(days)}d"
+
+
 def get_next_screen_time() -> Optional[datetime]:
     """Get next screening time (3:00 PM ET on weekdays)."""
     now_et = datetime.now(ET)
@@ -542,10 +573,10 @@ def render_dashboard(
     if open_trades:
         if compact:
             # Compact format: 1 line per position
-            print(f"  {'Sym':<5} {'Status':<7} {'Strike':<7} {'Exp':<5} {'Time':<4} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<6}")
+            print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'LLM':<4}")
             print("  " + "-" * 88)
         else:
-            print(f"  {'Symbol':<8} {'Earnings':<12} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<12} {'LLM':<6}")
+            print(f"  {'Symbol':<8} {'Earnings':<12} {'Age':<6} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<10} {'LLM':<4}")
             print("  " + "-" * 88)
 
         for trade in open_trades:
@@ -598,17 +629,10 @@ def render_dashboard(
                 import json
                 strikes = json.loads(trade.strikes) if trade.strikes else []
                 strike_str = f"{strikes[0]:.0f}" if strikes else "?"
-                expiry_short = trade.expiration[5:] if trade.expiration else "?"  # MM-DD (shorter)
-                timing = (trade.earnings_timing or "?")[:3]
+                expiry_short = trade.expiration[5:] if trade.expiration else "?"  # MM-DD
+                age_str = format_age_compact(trade.entry_datetime, now)
                 edge_str = f"{trade.edge_q75*100:.0f}%" if trade.edge_q75 else "."
                 impl_str = f"{trade.implied_move*100:.0f}%" if trade.implied_move else "."
-
-                # Calculate spread %
-                spread_str = "."
-                if trade.entry_quoted_bid and trade.entry_quoted_ask and trade.entry_quoted_mid:
-                    spread = trade.entry_quoted_ask - trade.entry_quoted_bid
-                    spread_pct = (spread / trade.entry_quoted_mid) * 100
-                    spread_str = f"{spread_pct:.0f}%"
 
                 # LLM check result with color
                 llm_check = llm_check_map.get(trade.trade_id)
@@ -624,9 +648,9 @@ def render_dashboard(
                 sym = trade.ticker[:5]
 
                 print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
-                      f"{strike_str:<7} {expiry_short:<5} {timing:<4} "
+                      f"{age_str:<5} {strike_str:<7} {expiry_short:<5} "
                       f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
-                      f"{edge_str:<5} {impl_str:<5} {spread_str:<5} {llm_str:<6}")
+                      f"{edge_str:<5} {impl_str:<5} {llm_str:<4}")
 
 
                 # Only show errors/warnings on second line if critical
@@ -644,9 +668,10 @@ def render_dashboard(
                 else:
                     llm_str = "."
 
+                age_str = format_age_compact(trade.entry_datetime, now)
                 print(f"  {trade.ticker:<8} {trade.earnings_date:<12} "
-                      f"{status_color}{status_display:<10}{reset_color()} "
-                      f"{entry_price:<10} {current_price:<10} {pnl_color}{pnl_str:<12}{reset_color()} {llm_str:<6}")
+                      f"{age_str:<6} {status_color}{status_display:<10}{reset_color()} "
+                      f"{entry_price:<10} {current_price:<10} {pnl_color}{pnl_str:<10}{reset_color()} {llm_str:<4}")
 
                 # Show partial fill warning with details
                 if trade.status == 'partial' and trade.notes:
@@ -769,6 +794,28 @@ def render_dashboard(
         summary_parts.append(f"P&L: {format_currency(stats['total_pnl'])} ({stats['avg_pnl_pct']*100:.1f}% avg)")
     print("  " + "  |  ".join(summary_parts))
 
+    # Performance by timing (BMO vs AMC)
+    if completed_trades:
+        from collections import defaultdict
+        timing_stats = defaultdict(lambda: {'count': 0, 'pnl': 0, 'wins': 0})
+        for t in completed_trades:
+            timing = t.earnings_timing or 'UNK'
+            timing_stats[timing]['count'] += 1
+            pnl = t.exit_pnl or 0
+            timing_stats[timing]['pnl'] += pnl
+            if pnl > 0:
+                timing_stats[timing]['wins'] += 1
+
+        timing_parts = []
+        for timing in ['BMO', 'AMC']:
+            if timing in timing_stats:
+                s = timing_stats[timing]
+                win_rate = s['wins'] / s['count'] * 100 if s['count'] > 0 else 0
+                color = '\033[92m' if s['pnl'] >= 0 else '\033[91m'
+                timing_parts.append(f"{timing}: {color}{format_currency(s['pnl'])}{reset_color()} ({s['count']} trades, {win_rate:.0f}% win)")
+        if timing_parts:
+            print("  " + "  |  ".join(timing_parts))
+
     # Next exit and screen countdown
     next_exit = get_next_exit_time()
     next_screen = get_next_screen_time()
@@ -778,27 +825,34 @@ def render_dashboard(
         schedule_str += f"Next Exit: {format_time_until(next_exit, now)}  |  "
     if next_screen:
         schedule_str += f"Next Screen: {format_time_until(next_screen, now)}"
-
-        # Fetch upcoming earnings count using unified function
-        try:
-            # Use unified screening logic (with timing fill, no date verification for speed)
-            bmo_tomorrow, amc_today = get_tradeable_candidates(
-                days_ahead=3,
-                trade_logger=None,  # Skip date verification for dashboard preview
-                fill_timing=True,
-                verify_dates=False,
-            )
-            total_candidates = len(bmo_tomorrow) + len(amc_today)
-
-            if total_candidates > 0:
-                schedule_str += f"  |  Candidates: {total_candidates} ({len(bmo_tomorrow)} BMO tmrw, {len(amc_today)} AMC today)"
-            else:
-                schedule_str += f"  |  No candidates today"
-        except Exception:
-            pass  # Don't fail dashboard if earnings fetch fails
-
     if schedule_str:
         print(f"  {schedule_str}")
+
+    # === Candidate Preview ===
+    try:
+        bmo_tomorrow, amc_today = get_tradeable_candidates(
+            days_ahead=3,
+            trade_logger=None,
+            fill_timing=True,
+            verify_dates=False,
+        )
+
+        if bmo_tomorrow or amc_today:
+            print(bold("  UPCOMING CANDIDATES"))
+
+            # Show AMC today first (more urgent)
+            if amc_today:
+                print(f"  {dim('Today AMC:')} ", end="")
+                symbols = [c.symbol for c in amc_today[:10]]
+                print(", ".join(symbols) + (f" (+{len(amc_today)-10})" if len(amc_today) > 10 else ""))
+
+            # Then BMO tomorrow
+            if bmo_tomorrow:
+                print(f"  {dim('Tmrw BMO:')}  ", end="")
+                symbols = [c.symbol for c in bmo_tomorrow[:10]]
+                print(", ".join(symbols) + (f" (+{len(bmo_tomorrow)-10})" if len(bmo_tomorrow) > 10 else ""))
+    except Exception:
+        pass  # Don't fail dashboard if candidate fetch fails
 
     # Visual timeline of earnings candidates
     if open_trades and 'events' in locals() and events:

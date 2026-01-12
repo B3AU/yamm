@@ -36,6 +36,8 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
   - **16:30** - Backfill counterfactuals for non-trades
 - Order recovery on restart (persists IBKR order IDs to DB)
 - Exit order recovery for orphaned positions
+- **Position reconciliation** - Detects DB/IBKR state mismatches on startup
+- **Force exit with market orders** - Handles positions stuck without quotes
 - Startup catch-up: runs screening immediately if started between 14:00-21:00 ET
 - Graceful shutdown handling
 
@@ -71,6 +73,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Fill monitoring (simplified - combo fills or doesn't)
 - Order cancellation for unfilled orders
 - Order recovery after daemon restart
+- **Market order fallback** - `close_position_market()` for force exits without quotes
 
 #### Trade Logging (`trading/earnings/logging.py`)
 - SQLite database (`data/earnings_trades.db`)
@@ -90,10 +93,13 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 #### Dashboard (`trading/earnings/dashboard.py`)
 - CLI dashboard with ANSI colors
 - Shows open positions, completed trades, summary stats
+- **Position age indicator** - Shows "4.8d", "12h" for each position
+- **BMO vs AMC breakdown** - Performance split by earnings timing
+- **Upcoming candidates preview** - Shows Today AMC / Tomorrow BMO symbols
 - **Recent warnings/errors from daemon log** (fallback warnings, connection errors)
 - Live IBKR prices with `--live` flag
 - Watch mode with auto-refresh (`--watch`)
-- **Interactive commands:** c=close position, r=refresh, q=quit
+- **Interactive commands:** c=close position, l=llm details, r=refresh, q=quit
 - Manual position closing (for partial fills or emergencies)
 
 #### Live News (`trading/earnings/live_news.py`)
@@ -186,6 +192,11 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Order event logging (IB status changes)
 - [x] Decision/fill latency tracking
 - [x] Dry run mode for testing
+- [x] Market order fallback for orphaned exit positions
+- [x] Position reconciliation on daemon startup
+- [x] Dashboard: position age indicator
+- [x] Dashboard: BMO vs AMC timing breakdown
+- [x] Dashboard: upcoming candidates preview
 
 ---
 

@@ -728,6 +728,21 @@ def render_dashboard(
                           f"Implied: {format_pct(trade.implied_move)}{spread_str}")
                 elif trade.implied_move is not None:
                     print(f"           Implied Move: {format_pct(trade.implied_move)}{spread_str}")
+
+                # Show intraday sparkline if snapshots available
+                try:
+                    snapshots = logger.get_snapshots(trade.trade_id)
+                    if snapshots and len(snapshots) >= 2:
+                        values = [s.straddle_mid for s in snapshots if s.straddle_mid]
+                        if len(values) >= 2:
+                            sparkline = make_sparkline(values, width=20)
+                            start_val = values[0]
+                            end_val = values[-1]
+                            change_pct = (end_val / start_val - 1) * 100 if start_val else 0
+                            change_color = '\033[92m' if change_pct >= 0 else '\033[91m'
+                            print(f"           Intraday: {sparkline} {change_color}{change_pct:+.1f}%{reset_color()} ({len(values)} pts)")
+                except Exception:
+                    pass  # Don't fail if snapshots unavailable
                 print()
 
         # Show total unrealized P&L and risk summary
@@ -1342,6 +1357,7 @@ def main():
     parser.add_argument('--live', '-l', action='store_true', help='Connect to IBKR for live prices')
     parser.add_argument('--compact', '-c', action='store_true', help='Compact 1-line per position format')
     parser.add_argument('--interval', '-i', type=int, default=30, help='Refresh interval in seconds (default: 30)')
+    parser.add_argument('--sound', '-s', action='store_true', help='Play sound on fills (watch mode)')
     args = parser.parse_args()
 
     if not DB_PATH.exists():
@@ -1356,6 +1372,8 @@ def main():
             try:
                 # Use cached data for flickering prevention
                 live_data_cache = {}
+                # Track trade states for sound alerts
+                prev_trade_states = {}
 
                 while True:
                     # In live mode with cached data, clear screen ONLY before new render
@@ -1391,9 +1409,22 @@ def main():
                         clear_screen()
                         render_dashboard(logger, show_all=args.all, live=False, compact=args.compact)
 
+                    # Sound alerts on state changes (fills, exits)
+                    if args.sound:
+                        trades = logger.get_trades()
+                        current_states = {t.trade_id: t.status for t in trades}
+                        for trade_id, status in current_states.items():
+                            prev_status = prev_trade_states.get(trade_id)
+                            if prev_status and prev_status != status:
+                                # State changed - check if it's a fill or exit
+                                if status in ('filled', 'exited'):
+                                    print('\a', end='', flush=True)  # Terminal bell
+                        prev_trade_states.update(current_states)
+
                     mode = "LIVE" if args.live else "DB only"
                     compact_str = " | COMPACT" if args.compact else ""
-                    print(f"  [{mode}{compact_str} | Refreshing every {args.interval}s | c=close, l=llm, r=refresh, q=quit]")
+                    sound_str = " | SOUND" if args.sound else ""
+                    print(f"  [{mode}{compact_str}{sound_str} | Refreshing every {args.interval}s | c=close, l=llm, r=refresh, q=quit]")
 
                     # Wait for interval...
                     start = time.time()

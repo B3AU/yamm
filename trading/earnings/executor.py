@@ -929,3 +929,173 @@ async def check_exit_fills(
             logger.warning(f"{exit_order.symbol}: Exit order cancelled/inactive (call={call_status}, put={put_status})")
 
     return filled
+
+
+async def reprice_exit_to_bid(
+    exit_order: ExitComboOrder,
+    ib: IB,
+    trade_logger: TradeLogger,
+) -> Optional[ExitComboOrder]:
+    """
+    Cancel existing exit orders and resubmit at current bid price.
+
+    Used when initial limit orders haven't filled and we need more aggressive pricing.
+    Returns updated ExitComboOrder, or None on failure.
+    """
+    symbol = exit_order.symbol
+    logger.info(f"{symbol}: Repricing exit orders to bid...")
+
+    # Cancel existing orders
+    cancelled = False
+    if exit_order.trade and exit_order.trade.orderStatus.status not in ('Filled', 'Cancelled', 'Inactive'):
+        ib.cancelOrder(exit_order.trade.order)
+        cancelled = True
+    if exit_order.put_trade and exit_order.put_trade.orderStatus.status not in ('Filled', 'Cancelled', 'Inactive'):
+        ib.cancelOrder(exit_order.put_trade.order)
+        cancelled = True
+
+    if cancelled:
+        await asyncio.sleep(0.5)  # Wait for cancellation to process
+
+    # Get fresh quotes
+    call = Option(symbol, exit_order.expiry, exit_order.strike, 'C', 'SMART', tradingClass=symbol)
+    put = Option(symbol, exit_order.expiry, exit_order.strike, 'P', 'SMART', tradingClass=symbol)
+
+    try:
+        await ib.qualifyContractsAsync(call, put)
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to qualify contracts for reprice: {e}")
+        return None
+
+    call_ticker = ib.reqMktData(call, '', False, False)
+    put_ticker = ib.reqMktData(put, '', False, False)
+
+    for _ in range(20):
+        if (call_ticker.bid > 0 and put_ticker.bid > 0):
+            break
+        await asyncio.sleep(0.1)
+
+    call_bid = call_ticker.bid if call_ticker.bid == call_ticker.bid else 0
+    put_bid = put_ticker.bid if put_ticker.bid == put_ticker.bid else 0
+
+    ib.cancelMktData(call)
+    ib.cancelMktData(put)
+
+    if call_bid <= 0 or put_bid <= 0:
+        logger.error(f"{symbol}: No valid bids for reprice (call={call_bid}, put={put_bid})")
+        return None
+
+    # Place new orders at bid
+    call_order = LimitOrder('SELL', exit_order.contracts, call_bid)
+    put_order = LimitOrder('SELL', exit_order.contracts, put_bid)
+
+    try:
+        call_trade = ib.placeOrder(call, call_order)
+        put_trade = ib.placeOrder(put, put_order)
+
+        straddle_bid = call_bid + put_bid
+        logger.info(
+            f"{symbol}: Repriced exit to bid - "
+            f"Call ${call_bid:.2f}, Put ${put_bid:.2f}, Combined ${straddle_bid:.2f}"
+        )
+
+        # Update trade_logger with new order IDs
+        trade_logger.update_trade(
+            exit_order.trade_id,
+            exit_call_order_id=call_trade.order.orderId,
+            exit_put_order_id=put_trade.order.orderId,
+            exit_limit_price=straddle_bid,
+        )
+
+        # Return updated ExitComboOrder
+        return ExitComboOrder(
+            trade_id=exit_order.trade_id,
+            symbol=symbol,
+            expiry=exit_order.expiry,
+            strike=exit_order.strike,
+            contracts=exit_order.contracts,
+            order_id=call_trade.order.orderId,
+            trade=call_trade,
+            put_trade=put_trade,
+            entry_fill_price=exit_order.entry_fill_price,
+            spot_at_entry=exit_order.spot_at_entry,
+            status='pending',
+        )
+
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to place repriced exit orders: {e}")
+        return None
+
+
+async def convert_exit_to_market(
+    exit_order: ExitComboOrder,
+    ib: IB,
+    trade_logger: TradeLogger,
+) -> Optional[ExitComboOrder]:
+    """
+    Cancel limit exit orders and submit market orders.
+
+    Used as last resort when limit orders haven't filled and market close is imminent.
+    Returns updated ExitComboOrder, or None on failure.
+    """
+    symbol = exit_order.symbol
+    logger.warning(f"{symbol}: Converting exit to MARKET ORDER (last resort)...")
+
+    # Cancel existing orders
+    cancelled = False
+    if exit_order.trade and exit_order.trade.orderStatus.status not in ('Filled', 'Cancelled', 'Inactive'):
+        ib.cancelOrder(exit_order.trade.order)
+        cancelled = True
+    if exit_order.put_trade and exit_order.put_trade.orderStatus.status not in ('Filled', 'Cancelled', 'Inactive'):
+        ib.cancelOrder(exit_order.put_trade.order)
+        cancelled = True
+
+    if cancelled:
+        await asyncio.sleep(0.5)  # Wait for cancellation to process
+
+    # Create option contracts
+    call = Option(symbol, exit_order.expiry, exit_order.strike, 'C', 'SMART', tradingClass=symbol)
+    put = Option(symbol, exit_order.expiry, exit_order.strike, 'P', 'SMART', tradingClass=symbol)
+
+    try:
+        await ib.qualifyContractsAsync(call, put)
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to qualify contracts for market order: {e}")
+        return None
+
+    # Place market orders
+    call_order = MarketOrder('SELL', exit_order.contracts)
+    put_order = MarketOrder('SELL', exit_order.contracts)
+
+    try:
+        call_trade = ib.placeOrder(call, call_order)
+        put_trade = ib.placeOrder(put, put_order)
+
+        logger.warning(f"{symbol}: Market exit orders placed (call={call_trade.order.orderId}, put={put_trade.order.orderId})")
+
+        # Update trade_logger with new order IDs
+        trade_logger.update_trade(
+            exit_order.trade_id,
+            exit_call_order_id=call_trade.order.orderId,
+            exit_put_order_id=put_trade.order.orderId,
+            notes="Converted to market order at close",
+        )
+
+        # Return updated ExitComboOrder
+        return ExitComboOrder(
+            trade_id=exit_order.trade_id,
+            symbol=symbol,
+            expiry=exit_order.expiry,
+            strike=exit_order.strike,
+            contracts=exit_order.contracts,
+            order_id=call_trade.order.orderId,
+            trade=call_trade,
+            put_trade=put_trade,
+            entry_fill_price=exit_order.entry_fill_price,
+            spot_at_entry=exit_order.spot_at_entry,
+            status='pending',
+        )
+
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to place market exit orders: {e}")
+        return None

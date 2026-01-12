@@ -26,6 +26,9 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+import nest_asyncio
+nest_asyncio.apply()
+
 from dotenv import load_dotenv
 import pytz
 
@@ -36,7 +39,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / '.env')
 
 from trading.earnings.logging import TradeLogger
-from trading.earnings.screener import fetch_upcoming_earnings
+from trading.earnings.screener import get_tradeable_candidates
 
 DB_PATH = PROJECT_ROOT / 'data' / 'earnings_trades.db'
 LOG_PATH = PROJECT_ROOT / 'logs' / 'daemon.log'
@@ -793,20 +796,19 @@ def render_dashboard(
     if next_screen:
         schedule_str += f"Next Screen: {format_time_until(next_screen, now)}"
 
-        # Fetch upcoming earnings count
+        # Fetch upcoming earnings count using unified function
         try:
-            tomorrow = date.today() + timedelta(days=1)
-            # Just do a quick check, don't fail if DB locked or API down
-            # Using 3 days ahead as in original
-            events = fetch_upcoming_earnings(days_ahead=3)
-
-            # Count tradeable candidates (BMO tomorrow + AMC today)
-            bmo_tomorrow = sum(1 for e in events if e.earnings_date == tomorrow and e.timing == 'BMO')
-            amc_today = sum(1 for e in events if e.earnings_date == date.today() and e.timing == 'AMC')
-            total_candidates = bmo_tomorrow + amc_today
+            # Use unified screening logic (with timing fill, no date verification for speed)
+            bmo_tomorrow, amc_today = get_tradeable_candidates(
+                days_ahead=3,
+                trade_logger=None,  # Skip date verification for dashboard preview
+                fill_timing=True,
+                verify_dates=False,
+            )
+            total_candidates = len(bmo_tomorrow) + len(amc_today)
 
             if total_candidates > 0:
-                schedule_str += f"  |  Candidates: {total_candidates} ({bmo_tomorrow} BMO tmrw, {amc_today} AMC today)"
+                schedule_str += f"  |  Candidates: {total_candidates} ({len(bmo_tomorrow)} BMO tmrw, {len(amc_today)} AMC today)"
             else:
                 schedule_str += f"  |  No candidates today"
         except Exception:

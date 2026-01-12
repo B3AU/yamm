@@ -8,8 +8,8 @@ Schedule (all times ET):
 - 14:00: Exit positions from previous day (free up capital first)
 - 14:15: Screen upcoming earnings AND place new orders
 - 14:25-14:55: Price improvements (every 10 min)
-- 15:55: Final fill check
-- 15:58: Cancel unfilled orders
+- 15:55: Final fill check, reprice unfilled exits to bid
+- 15:58: Cancel unfilled entry orders, force exit with market orders
 - 16:05: Disconnect (after market close)
 
 Exit positions are handled the next trading day at 14:00.
@@ -49,12 +49,13 @@ except ImportError:
 from ib_insync import IB
 
 from trading.earnings.screener import (
-    fetch_upcoming_earnings,
+    get_tradeable_candidates,
     screen_all_candidates,
     ScreenedCandidate,
 )
 from trading.earnings.executor import (
-    Phase0Executor, close_position, ExitComboOrder, check_exit_fills
+    Phase0Executor, close_position, ExitComboOrder, check_exit_fills,
+    reprice_exit_to_bid, convert_exit_to_market
 )
 from trading.earnings.logging import TradeLogger, SnapshotLog
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
@@ -254,7 +255,7 @@ class TradingDaemon:
 
             # Recover active exit orders
             if self.executor:
-                self._recover_exit_orders()
+                await self._recover_exit_orders()
 
             await self.connect_async()
 
@@ -279,24 +280,21 @@ class TradingDaemon:
                 logger.info(f"Daily trade limit reached ({already_placed} placed). Skipping screening.")
                 return
 
-            # Fetch earnings for tomorrow (T+1)
-            # Nasdaq API call is sync, run in executor to not block loop
+            # Fetch tradeable candidates using unified function
+            # Handles: Nasdaq fetch, timing fill from yfinance, date verification against FMP
             loop = asyncio.get_running_loop()
-            events = await loop.run_in_executor(None, lambda: fetch_upcoming_earnings(days_ahead=3))
-
-            # Filter to events happening tomorrow or day after
-            tomorrow = today_et() + timedelta(days=1)
-
-            # For BMO earnings, we enter day before (today for tomorrow's BMO)
-            # For AMC earnings, we enter same day (today for today's AMC)
-            relevant_events = []
-            for e in events:
-                if e.earnings_date == tomorrow and e.timing == 'BMO':
-                    relevant_events.append(e)  # Enter today for tomorrow BMO
-                elif e.earnings_date == today_et() and e.timing == 'AMC':
-                    relevant_events.append(e)  # Enter today for today AMC
-
-            logger.info(f"Found {len(relevant_events)} earnings events to consider")
+            logger.info("Fetching tradeable candidates (with timing fill + date verification)...")
+            bmo_tomorrow, amc_today = await loop.run_in_executor(
+                None,
+                lambda: get_tradeable_candidates(
+                    days_ahead=3,
+                    trade_logger=self.trade_logger,
+                    fill_timing=True,
+                    verify_dates=True,
+                )
+            )
+            relevant_events = bmo_tomorrow + amc_today
+            logger.info(f"Found {len(relevant_events)} earnings events to consider ({len(bmo_tomorrow)} BMO tmrw, {len(amc_today)} AMC today)")
 
             if not relevant_events:
                 logger.info("No earnings events requiring entry today")
@@ -486,7 +484,7 @@ class TradingDaemon:
             logger.exception(f"Order placement failed: {e}")
 
     async def task_cancel_unfilled(self):
-        """3:50 PM ET - Cancel unfilled orders."""
+        """3:58 PM ET - Cancel unfilled entry orders and force exit positions."""
         logger.info("=== CANCELLING UNFILLED ORDERS ===")
 
         if not await self.ensure_connected():
@@ -496,23 +494,26 @@ class TradingDaemon:
             return
 
         try:
+            # Cancel unfilled entry orders
             active_count = self.executor.get_active_count()
             if active_count == 0:
-                logger.info("No active orders to cancel")
-                return
+                logger.info("No active entry orders to cancel")
+            else:
+                logger.info(f"Checking {active_count} active orders for cancellation...")
 
-            logger.info(f"Checking {active_count} active orders for cancellation...")
+                for trade_id, combo_order in list(self.executor.active_orders.items()):
+                    # Handle partial fills
+                    if combo_order.status == 'partial':
+                        logger.info(f"  {combo_order.symbol}: Order is partially filled, keeping open until close.")
+                        continue
 
-            for trade_id, combo_order in list(self.executor.active_orders.items()):
-                # Handle partial fills
-                if combo_order.status == 'partial':
-                    logger.info(f"  {combo_order.symbol}: Order is partially filled, keeping open until close.")
-                    continue
+                    if combo_order.status == 'pending':
+                        result = self.executor.cancel_unfilled_orders(trade_id)
+                        if result.get('cancelled'):
+                            logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
 
-                if combo_order.status == 'pending':
-                    result = self.executor.cancel_unfilled_orders(trade_id)
-                    if result.get('cancelled'):
-                        logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
+            # Force exit unfilled positions with market orders
+            await self.task_force_exit_market()
 
         except Exception as e:
             logger.exception(f"Cancel unfilled failed: {e}")
@@ -554,6 +555,20 @@ class TradingDaemon:
                 for exit_pair in exit_filled:
                     self.active_exit_orders.pop(exit_pair.trade_id, None)
 
+                # Reprice unfilled exit orders to bid
+                unfilled_exits = [
+                    (tid, eo) for tid, eo in self.active_exit_orders.items()
+                    if eo.status not in ('filled', 'cancelled')
+                ]
+                if unfilled_exits:
+                    logger.warning(f"=== REPRICING {len(unfilled_exits)} UNFILLED EXIT ORDERS TO BID ===")
+                    for trade_id, exit_order in unfilled_exits:
+                        repriced = await reprice_exit_to_bid(exit_order, self.ib, self.trade_logger)
+                        if repriced:
+                            self.active_exit_orders[trade_id] = repriced
+                        else:
+                            logger.error(f"{exit_order.symbol}: Failed to reprice exit order")
+
             # Log metrics
             metrics = self.trade_logger.get_execution_metrics()
             logger.info(f"Execution metrics: fill_rate={metrics.fill_rate*100:.1f}%, "
@@ -570,17 +585,24 @@ class TradingDaemon:
         if not self.executor:
             return
 
-        # Skip if no pending orders to monitor
-        if self.executor.get_active_count() == 0:
-            return
+        # Monitor entry fills
+        if self.executor.get_active_count() > 0:
+            try:
+                filled = self.executor.check_fills()
+                for order in filled:
+                    logger.info(f"New fill detected for {order.symbol}, scheduling markouts...")
+                    self._schedule_markouts(order)
+            except Exception as e:
+                logger.error(f"Monitor entry fills failed: {e}")
 
-        try:
-            filled = self.executor.check_fills()
-            for order in filled:
-                logger.info(f"New fill detected for {order.symbol}, scheduling markouts...")
-                self._schedule_markouts(order)
-        except Exception as e:
-            logger.error(f"Monitor fills failed: {e}")
+        # Monitor exit fills
+        if self.active_exit_orders:
+            try:
+                exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
+                if exit_filled:
+                    logger.info(f"Exit fills detected: {list(exit_filled.keys())}")
+            except Exception as e:
+                logger.error(f"Monitor exit fills failed: {e}")
 
     def _schedule_markouts(self, order):
         """Schedule 1m, 5m, 30m markout checks for a filled order."""
@@ -923,6 +945,44 @@ class TradingDaemon:
         except Exception as e:
             logger.exception(f"Position exit failed: {e}")
 
+    async def task_force_exit_market(self):
+        """3:58 PM ET - Force close remaining positions with market orders."""
+        logger.info("=== FORCE EXIT (MARKET ORDERS) ===")
+
+        if not await self.ensure_connected():
+            return
+
+        try:
+            # Check for any remaining unfilled exit orders
+            if not self.active_exit_orders:
+                logger.info("No unfilled exit orders")
+                return
+
+            # First check if any filled since last check
+            exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
+            for exit_pair in exit_filled:
+                self.active_exit_orders.pop(exit_pair.trade_id, None)
+
+            # Convert remaining unfilled to market orders
+            unfilled_exits = [
+                (tid, eo) for tid, eo in self.active_exit_orders.items()
+                if eo.status not in ('filled', 'cancelled')
+            ]
+
+            if unfilled_exits:
+                logger.warning(f"Converting {len(unfilled_exits)} unfilled exits to MARKET ORDERS")
+                for trade_id, exit_order in unfilled_exits:
+                    converted = await convert_exit_to_market(exit_order, self.ib, self.trade_logger)
+                    if converted:
+                        self.active_exit_orders[trade_id] = converted
+                    else:
+                        logger.error(f"{exit_order.symbol}: Failed to convert to market order - MANUAL CLOSE REQUIRED")
+            else:
+                logger.info("All exit orders filled")
+
+        except Exception as e:
+            logger.exception(f"Force exit failed: {e}")
+
     async def task_evening_disconnect(self):
         """4:05 PM ET - Disconnect."""
         logger.info("=== EVENING DISCONNECT ===")
@@ -1031,47 +1091,46 @@ class TradingDaemon:
         except Exception as e:
             logger.error(f"Failed to load today's activity: {e}")
 
-    def _recover_exit_orders(self):
+    async def _recover_exit_orders(self):
         """Recover active exit orders from database after restart."""
         try:
             # Find trades that are exiting/exited but we want to track
-            # 'exited' might be useful if we want to confirm fill details,
-            # but mainly we care about 'exiting' (placed but not confirmed filled by daemon)
-            # OR 'exited' if we just restarted and want to catch up on fill events.
-            # For simplicity, look for trades with exit order IDs.
+            # 'exiting' (placed but not confirmed filled by daemon)
 
             trades = self.trade_logger.get_trades()
             recovered_count = 0
+            filled_count = 0
+            new_exit_count = 0
 
             # Get open orders from IB to map orderId -> Trade object
             open_orders = {t.order.orderId: t for t in self.ib.openTrades()}
 
+            # Get recent fills to check for already-filled exit orders
+            fills = self.ib.fills()
+            fills_by_order = {}
+            for fill in fills:
+                order_id = fill.execution.orderId
+                if order_id not in fills_by_order:
+                    fills_by_order[order_id] = []
+                fills_by_order[order_id].append(fill)
+
+            # Get current positions for fallback
+            positions = self.ib.positions()
+
             for trade in trades:
                 # We only care if:
                 # 1. It has an exit order ID
-                # 2. It's not fully finalized in our memory (though here we start fresh)
-                # 3. Status is 'exiting' OR 'exited' (to catch up)
+                # 2. Status is 'exiting' (not yet confirmed filled)
                 if not trade.exit_call_order_id:
+                    continue
+
+                if trade.status != 'exiting':
                     continue
 
                 if trade.trade_id in self.active_exit_orders:
                     continue
 
-                # Check if this exit order is still open in IB
-                order_id = trade.exit_call_order_id
-                ib_trade = open_orders.get(order_id)
-
-                if not ib_trade:
-                    # Not in open orders. Check if it's filled or cancelled according to DB
-                    # If DB says 'exiting' but IB doesn't have it, it might be filled or cancelled.
-                    # We can't easily reconstruct the ExitComboOrder without the IB Trade object
-                    # unless we create a dummy one, which is risky.
-                    # For now, skip if not in open orders.
-                    # Ideally we should query execution details, but that's complex for combo.
-                    continue
-
-                # Reconstruct ExitComboOrder
-                # Need to parse strikes/expiry from trade log
+                # Parse strike for later use
                 try:
                     import json
                     strikes = json.loads(trade.strikes) if trade.strikes else []
@@ -1079,24 +1138,103 @@ class TradingDaemon:
                 except Exception:
                     strike = 0.0
 
-                exit_order = ExitComboOrder(
-                    trade_id=trade.trade_id,
-                    symbol=trade.ticker,
-                    expiry=trade.expiration,
-                    strike=strike,
-                    contracts=trade.contracts,
-                    order_id=order_id,
-                    trade=ib_trade,
-                    entry_fill_price=trade.entry_fill_price,
-                    spot_at_entry=trade.spot_at_entry,
-                    status=ib_trade.orderStatus.status.lower()
-                )
+                call_order_id = trade.exit_call_order_id
+                put_order_id = trade.exit_put_order_id
 
-                self.active_exit_orders[trade.trade_id] = exit_order
-                recovered_count += 1
+                # Check if exit orders are still open in IB
+                call_ib_trade = open_orders.get(call_order_id)
+                put_ib_trade = open_orders.get(put_order_id)
+
+                if call_ib_trade or put_ib_trade:
+                    # At least one leg is still open - recover for monitoring
+                    exit_order = ExitComboOrder(
+                        trade_id=trade.trade_id,
+                        symbol=trade.ticker,
+                        expiry=trade.expiration,
+                        strike=strike,
+                        contracts=trade.contracts,
+                        order_id=call_order_id,
+                        trade=call_ib_trade,
+                        put_trade=put_ib_trade,
+                        entry_fill_price=trade.entry_fill_price,
+                        spot_at_entry=trade.spot_at_entry,
+                        status='pending'
+                    )
+
+                    self.active_exit_orders[trade.trade_id] = exit_order
+                    recovered_count += 1
+                else:
+                    # Not in open orders - check if both legs filled
+                    call_fills = fills_by_order.get(call_order_id, [])
+                    put_fills = fills_by_order.get(put_order_id, [])
+
+                    if call_fills and put_fills:
+                        # Both legs filled - calculate P&L and update DB
+                        call_fill_price = sum(f.execution.price * f.execution.shares for f in call_fills) / sum(f.execution.shares for f in call_fills)
+                        put_fill_price = sum(f.execution.price * f.execution.shares for f in put_fills) / sum(f.execution.shares for f in put_fills)
+                        combined_fill = call_fill_price + put_fill_price
+
+                        if trade.entry_fill_price:
+                            exit_pnl = (combined_fill - trade.entry_fill_price) * trade.contracts * 100
+                            exit_pnl_pct = (combined_fill - trade.entry_fill_price) / trade.entry_fill_price
+                        else:
+                            exit_pnl = None
+                            exit_pnl_pct = None
+
+                        self.trade_logger.update_trade(
+                            trade.trade_id,
+                            status='exited',
+                            exit_fill_price=combined_fill,
+                            exit_pnl=exit_pnl,
+                            exit_pnl_pct=exit_pnl_pct,
+                        )
+                        logger.info(
+                            f"Recovered filled exit for {trade.ticker}: "
+                            f"Call ${call_fill_price:.2f} + Put ${put_fill_price:.2f} = ${combined_fill:.2f}, "
+                            f"P&L: ${exit_pnl:.2f}" if exit_pnl else f"Recovered filled exit for {trade.ticker}"
+                        )
+                        filled_count += 1
+                    else:
+                        # Order not in open trades and not in fills
+                        # Check if position still exists - if so, place new exit order
+                        has_position = any(
+                            p.contract.symbol == trade.ticker and
+                            p.contract.secType == 'OPT' and
+                            p.position != 0
+                            for p in positions
+                        )
+
+                        if has_position:
+                            logger.warning(
+                                f"Exit order for {trade.ticker} not found but position exists - placing new exit order"
+                            )
+                            # Place new exit order at bid for quick fill
+                            exit_order = await close_position(
+                                self.ib, self.trade_logger, trade.trade_id,
+                                trade.ticker, trade.expiration, strike, trade.contracts,
+                                limit_aggression=0.0,  # At bid for faster fill
+                                entry_fill_price=trade.entry_fill_price,
+                                spot_at_entry=trade.spot_at_entry
+                            )
+                            if exit_order:
+                                self.active_exit_orders[trade.trade_id] = exit_order
+                                new_exit_count += 1
+                                logger.info(f"{trade.ticker}: New exit order placed successfully")
+                            else:
+                                logger.error(f"{trade.ticker}: Failed to place new exit order")
+                        else:
+                            # No position and no fills - position may have been closed manually
+                            logger.warning(
+                                f"Exit order for {trade.ticker} not found and no position exists "
+                                f"(call_id={call_order_id}, put_id={put_order_id}) - may need manual DB update"
+                            )
 
             if recovered_count > 0:
                 logger.info(f"Recovered {recovered_count} active exit orders")
+            if filled_count > 0:
+                logger.info(f"Marked {filled_count} exit orders as filled from execution history")
+            if new_exit_count > 0:
+                logger.info(f"Placed {new_exit_count} new exit orders for orphaned positions")
 
         except Exception as e:
             logger.error(f"Failed to recover exit orders: {e}")
@@ -1269,7 +1407,7 @@ class TradingDaemon:
         # Recover any active orders (entry or exit) from DB if daemon restarted
         if self.executor:
             self.executor.recover_orders()
-            self._recover_exit_orders()
+            await self._recover_exit_orders()
 
         # Startup checks
         await self._run_screening_if_needed()

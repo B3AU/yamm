@@ -17,9 +17,13 @@ from typing import Optional
 import logging
 
 from dotenv import load_dotenv
+import pytz
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+# Timezone for earnings timing
+ET = pytz.timezone('US/Eastern')
 
 # Headers to mimic browser for Nasdaq API
 NASDAQ_HEADERS = {
@@ -146,6 +150,314 @@ def fetch_upcoming_earnings(days_ahead: int = 7) -> list[EarningsEvent]:
 
     logger.info(f"Fetched {len(events)} earnings events from Nasdaq API")
     return events
+
+
+def fetch_fmp_earnings(from_date: date = None, to_date: date = None, days_ahead: int = 7) -> list[EarningsEvent]:
+    """Fetch upcoming earnings from FMP API."""
+    FMP_API_KEY = os.getenv('FMP_API_KEY', '')
+    if not FMP_API_KEY:
+        logger.warning("FMP_API_KEY not set, skipping FMP earnings fetch")
+        return []
+
+    if from_date is None:
+        from_date = date.today()
+    if to_date is None:
+        to_date = from_date + timedelta(days=days_ahead)
+
+    url = "https://financialmodelingprep.com/stable/earnings-calendar"
+    params = {
+        'from': from_date.isoformat(),
+        'to': to_date.isoformat(),
+        'apikey': FMP_API_KEY
+    }
+
+    events = []
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        for row in data:
+            symbol = row.get('symbol', '')
+
+            # Filter to US stocks
+            if '.' in symbol or '-' in symbol or not symbol:
+                continue
+
+            # Parse date
+            date_str = row.get('date', '')
+            if not date_str:
+                continue
+            try:
+                earnings_dt = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                continue
+
+            # FMP doesn't provide timing (BMO/AMC) consistently
+            timing = 'unknown'
+
+            # Parse estimates
+            eps_estimate = row.get('epsEstimated')
+            revenue_estimate = row.get('revenueEstimated')
+
+            events.append(EarningsEvent(
+                symbol=symbol,
+                earnings_date=earnings_dt,
+                timing=timing,
+                eps_estimate=eps_estimate,
+                revenue_estimate=revenue_estimate,
+            ))
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch FMP earnings: {e}")
+
+    logger.info(f"Fetched {len(events)} earnings events from FMP API")
+    return events
+
+
+def fetch_timing_from_yfinance(symbol: str) -> Optional[str]:
+    """Get BMO/AMC timing from yfinance earningsTimestamp.
+
+    Returns 'BMO' if earnings before 10 AM ET, 'AMC' if after 4 PM ET,
+    'unknown' for during market hours, or None if no data.
+    """
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(symbol)
+        ts = ticker.info.get('earningsTimestamp')
+        if not ts:
+            return None
+
+        dt = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(ET)
+        if dt.hour < 10:
+            return 'BMO'
+        elif dt.hour >= 16:
+            return 'AMC'
+        return 'unknown'  # During market hours (rare)
+    except Exception:
+        return None
+
+
+def fetch_yahoo_earnings(
+    from_date: date = None,
+    to_date: date = None,
+    days_ahead: int = 7,
+    symbols: list[str] = None,
+) -> list[EarningsEvent]:
+    """Fetch earnings from Yahoo Finance using earningsTimestamp.
+
+    Uses info['earningsTimestamp'] instead of calendar for more accurate dates,
+    and derives BMO/AMC timing from the hour.
+
+    If symbols is provided, checks those specific symbols.
+    Otherwise, uses symbols from Nasdaq calendar as a reference list.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance not installed, skipping Yahoo earnings fetch")
+        return []
+
+    if from_date is None:
+        from_date = date.today()
+    if to_date is None:
+        to_date = from_date + timedelta(days=days_ahead)
+
+    # If no symbols provided, get them from Nasdaq
+    if symbols is None:
+        nasdaq_events = fetch_upcoming_earnings(days_ahead)
+        symbols = list(set(e.symbol for e in nasdaq_events))
+
+    events = []
+    checked = 0
+
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+
+            ts = info.get('earningsTimestamp')
+            if not ts:
+                checked += 1
+                continue
+
+            # Convert timestamp to datetime in ET
+            dt = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(ET)
+            earnings_dt = dt.date()
+
+            # Check if within range
+            if not (from_date <= earnings_dt <= to_date):
+                checked += 1
+                continue
+
+            # Derive timing from hour
+            if dt.hour < 10:
+                timing = 'BMO'
+            elif dt.hour >= 16:
+                timing = 'AMC'
+            else:
+                timing = 'unknown'
+
+            # Get estimates from calendar if available
+            cal = ticker.calendar
+            eps_est = cal.get('Earnings Average') if cal else None
+            rev_est = cal.get('Revenue Average') if cal else None
+
+            events.append(EarningsEvent(
+                symbol=symbol,
+                earnings_date=earnings_dt,
+                timing=timing,
+                eps_estimate=eps_est,
+                revenue_estimate=rev_est,
+            ))
+
+            checked += 1
+            if checked % 50 == 0:
+                logger.debug(f"Yahoo: checked {checked}/{len(symbols)} symbols")
+
+        except Exception as e:
+            logger.debug(f"Yahoo fetch failed for {symbol}: {e}")
+            checked += 1
+            continue
+
+    logger.info(f"Fetched {len(events)} earnings events from Yahoo Finance (earningsTimestamp, checked {checked} symbols)")
+    return events
+
+
+def fetch_all_earnings_sources(
+    days_ahead: int = 7,
+    trade_logger=None,
+) -> dict[str, list[EarningsEvent]]:
+    """
+    Fetch earnings from all sources and optionally log to DB.
+
+    Returns dict mapping source name to list of events.
+    """
+    from_date = date.today()
+    to_date = from_date + timedelta(days=days_ahead)
+
+    results = {}
+
+    # Nasdaq (primary source)
+    results['nasdaq'] = fetch_upcoming_earnings(days_ahead)
+
+    # FMP
+    results['fmp'] = fetch_fmp_earnings(from_date, to_date)
+
+    # Yahoo
+    results['yahoo'] = fetch_yahoo_earnings(from_date, to_date)
+
+    # Log to database if logger provided
+    if trade_logger:
+        for source, events in results.items():
+            for event in events:
+                try:
+                    trade_logger.log_earnings_calendar(
+                        symbol=event.symbol,
+                        earnings_date=event.earnings_date,
+                        timing=event.timing,
+                        source=source,
+                        eps_estimate=event.eps_estimate,
+                        revenue_estimate=event.revenue_estimate,
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to log {event.symbol} from {source}: {e}")
+
+    # Summary
+    for source, events in results.items():
+        logger.info(f"{source}: {len(events)} events")
+
+    return results
+
+
+def verify_earnings_date(symbol: str, nasdaq_date: date, trade_logger) -> tuple[bool, Optional[str]]:
+    """Verify Nasdaq earnings date against FMP.
+
+    Returns:
+        (is_verified, rejection_reason)
+        - (True, None) if dates agree or FMP has no data
+        - (False, reason) if dates disagree
+    """
+    # Query FMP date from DB (already fetched by fetch_all_earnings_sources)
+    fmp_events = trade_logger.get_earnings_calendar(
+        from_date=nasdaq_date - timedelta(days=3),
+        to_date=nasdaq_date + timedelta(days=3),
+        source='fmp'
+    )
+
+    fmp_date = None
+    for e in fmp_events:
+        if e['symbol'] == symbol:
+            fmp_date_str = e['earnings_date']
+            # Parse date string if needed
+            if isinstance(fmp_date_str, str):
+                fmp_date = datetime.strptime(fmp_date_str, '%Y-%m-%d').date()
+            else:
+                fmp_date = fmp_date_str
+            break
+
+    if fmp_date is None:
+        # FMP has no data for this symbol - accept Nasdaq (no verification available)
+        return True, None
+
+    if fmp_date == nasdaq_date:
+        return True, None
+
+    return False, f"Date mismatch: Nasdaq={nasdaq_date}, FMP={fmp_date}"
+
+
+def get_tradeable_candidates(
+    days_ahead: int = 3,
+    trade_logger=None,
+    fill_timing: bool = True,
+    verify_dates: bool = True,
+) -> tuple[list[EarningsEvent], list[EarningsEvent]]:
+    """Get tradeable earnings candidates with timing fill and date verification.
+
+    Unified function used by both daemon and dashboard.
+
+    Args:
+        days_ahead: How many days ahead to fetch earnings
+        trade_logger: TradeLogger instance (required for date verification)
+        fill_timing: Whether to fill unknown timing from yfinance
+        verify_dates: Whether to verify dates against FMP
+
+    Returns:
+        (bmo_tomorrow, amc_today) - lists of verified candidates
+    """
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+
+    # Fetch Nasdaq events
+    events = fetch_upcoming_earnings(days_ahead=days_ahead)
+
+    # Pre-fetch all sources for verification (if trade_logger provided)
+    if verify_dates and trade_logger:
+        fetch_all_earnings_sources(days_ahead=days_ahead, trade_logger=trade_logger)
+
+    bmo_tomorrow = []
+    amc_today = []
+
+    for e in events:
+        # Fill unknown timing from yfinance
+        if fill_timing and e.timing == 'unknown':
+            yf_timing = fetch_timing_from_yfinance(e.symbol)
+            if yf_timing and yf_timing != 'unknown':
+                e.timing = yf_timing
+
+        # Verify date against FMP (if trade_logger provided)
+        if verify_dates and trade_logger:
+            is_verified, _ = verify_earnings_date(e.symbol, e.earnings_date, trade_logger)
+            if not is_verified:
+                continue
+
+        # Categorize by timing
+        if e.earnings_date == tomorrow and e.timing == 'BMO':
+            bmo_tomorrow.append(e)
+        elif e.earnings_date == today and e.timing == 'AMC':
+            amc_today.append(e)
+
+    return bmo_tomorrow, amc_today
 
 
 async def screen_candidate_ibkr(

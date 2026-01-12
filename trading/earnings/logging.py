@@ -397,6 +397,25 @@ class TradeLogger:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_checks_ticker ON llm_checks(ticker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_checks_decision ON llm_checks(decision)")
 
+            # Earnings calendar table (multi-source)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS earnings_calendar (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    earnings_date TEXT NOT NULL,
+                    timing TEXT,
+                    eps_estimate REAL,
+                    revenue_estimate REAL,
+                    source TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, earnings_date, source)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_date ON earnings_calendar(earnings_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_symbol ON earnings_calendar(symbol)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_source ON earnings_calendar(source)")
+
             # Indexes for common queries
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(earnings_date)")
@@ -558,6 +577,66 @@ class TradeLogger:
                 model,
             ))
             conn.commit()
+
+    def log_earnings_calendar(
+        self,
+        symbol: str,
+        earnings_date,  # date or str
+        timing: str,
+        source: str,
+        eps_estimate: float = None,
+        revenue_estimate: float = None,
+    ) -> None:
+        """Log an earnings calendar entry from a specific source."""
+        # Convert date to string if needed
+        if hasattr(earnings_date, 'isoformat'):
+            earnings_date = earnings_date.isoformat()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO earnings_calendar (
+                    symbol, earnings_date, timing, eps_estimate, revenue_estimate,
+                    source, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                symbol,
+                earnings_date,
+                timing,
+                eps_estimate,
+                revenue_estimate,
+                source,
+                datetime.utcnow().isoformat(),
+            ))
+            conn.commit()
+
+    def get_earnings_calendar(self, from_date=None, to_date=None, source: str = None) -> list[dict]:
+        """Get earnings calendar entries, optionally filtered by date range and source."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+
+            query = "SELECT * FROM earnings_calendar WHERE 1=1"
+            params = []
+
+            if from_date:
+                if hasattr(from_date, 'isoformat'):
+                    from_date = from_date.isoformat()
+                query += " AND earnings_date >= ?"
+                params.append(from_date)
+
+            if to_date:
+                if hasattr(to_date, 'isoformat'):
+                    to_date = to_date.isoformat()
+                query += " AND earnings_date <= ?"
+                params.append(to_date)
+
+            if source:
+                query += " AND source = ?"
+                params.append(source)
+
+            query += " ORDER BY earnings_date, symbol"
+
+            rows = conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
 
     def get_snapshots(self, trade_id: str) -> list[SnapshotLog]:
         """Get all snapshots for a trade, ordered by time."""

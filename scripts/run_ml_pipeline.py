@@ -87,6 +87,7 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False):
                 str(input_path),
                 str(output_path),
                 kernel_name="python3",
+                cwd=str(NOTEBOOKS_DIR),  # Set working directory for relative paths
             )
             print(f"  ✓ Completed successfully")
         except pm.PapermillExecutionError as e:

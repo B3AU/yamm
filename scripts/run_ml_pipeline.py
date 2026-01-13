@@ -41,12 +41,13 @@ def list_pipeline():
     print(f"Total: {len(PIPELINE)} notebooks")
 
 
-def run_pipeline(start_from: int = 0, dry_run: bool = False):
+def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = True):
     """Run the ML pipeline notebooks in order.
 
     Args:
         start_from: Index of notebook to start from (0-indexed)
         dry_run: If True, only print what would be run
+        use_cache: If True, use cached data; if False, refetch from APIs
     """
     if start_from >= len(PIPELINE):
         print(f"Error: start_from ({start_from}) >= number of notebooks ({len(PIPELINE)})")
@@ -60,6 +61,7 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False):
     print(f"Start from: step {start_from} ({PIPELINE[start_from]})")
     print(f"Output dir: {OUTPUT_DIR}")
     print(f"Timestamp:  {timestamp}")
+    print(f"Use cache:  {use_cache}")
     if dry_run:
         print(f"Mode:       DRY RUN (no execution)")
     print(f"=" * 60)
@@ -88,6 +90,7 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False):
                 str(output_path),
                 kernel_name="python3",
                 cwd=str(NOTEBOOKS_DIR),  # Set working directory for relative paths
+                parameters={"USE_CACHE": use_cache},
             )
             print(f"  ✓ Completed successfully")
         except pm.PapermillExecutionError as e:
@@ -114,8 +117,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 scripts/run_ml_pipeline.py           # Run full pipeline
+  python3 scripts/run_ml_pipeline.py           # Run full pipeline (uses cache)
   python3 scripts/run_ml_pipeline.py 2         # Start from step 2 (1.0 feature_engineering)
+  python3 scripts/run_ml_pipeline.py --refetch # Refetch data from APIs (slow)
   python3 scripts/run_ml_pipeline.py --list    # List notebooks
   python3 scripts/run_ml_pipeline.py --dry-run # Show what would run
         """
@@ -137,13 +141,22 @@ Examples:
         action="store_true",
         help="Print what would be run without executing"
     )
+    parser.add_argument(
+        "--refetch",
+        action="store_true",
+        help="Refetch data from APIs instead of using cache"
+    )
 
     args = parser.parse_args()
 
     if args.list:
         list_pipeline()
     else:
-        run_pipeline(start_from=args.start_from, dry_run=args.dry_run)
+        run_pipeline(
+            start_from=args.start_from,
+            dry_run=args.dry_run,
+            use_cache=not args.refetch,
+        )
 
 
 if __name__ == "__main__":

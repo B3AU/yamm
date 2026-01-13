@@ -675,13 +675,24 @@ class TradeLogger:
 
     def get_llm_check_for_trade(self, ticker: str, entry_datetime: str) -> Optional[dict]:
         """Get most recent LLM check for a ticker before entry time."""
+        # Convert entry_datetime to UTC for proper comparison with llm_checks.ts (stored in UTC)
+        entry_datetime_utc = entry_datetime
+        if entry_datetime:
+            try:
+                dt = datetime.fromisoformat(entry_datetime)
+                if dt.tzinfo:
+                    dt = dt.astimezone(timezone.utc)
+                entry_datetime_utc = dt.isoformat()
+            except (ValueError, TypeError):
+                pass  # Keep original if parsing fails
+
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("""
                 SELECT * FROM llm_checks
                 WHERE ticker = ? AND ts <= ?
                 ORDER BY ts DESC LIMIT 1
-            """, (ticker, entry_datetime)).fetchone()
+            """, (ticker, entry_datetime_utc)).fetchone()
             if row:
                 result = dict(row)
                 # Parse JSON fields

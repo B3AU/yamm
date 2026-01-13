@@ -23,7 +23,7 @@ import sys
 import time
 import asyncio
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -163,24 +163,23 @@ def format_time_until(target_dt: datetime, now: datetime = None) -> str:
 
 
 def format_time_since(past_dt: datetime, now: datetime = None) -> str:
-    """Format time since a past datetime.
-
-    Shows absolute time in Portugal timezone (Europe/Lisbon) if requested.
-    """
+    """Format time since a past datetime."""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
     if isinstance(past_dt, str):
         past_dt = datetime.fromisoformat(past_dt)
 
-    # Handle timezones for calculation
-    if past_dt.tzinfo and not now.tzinfo:
-        past_dt = past_dt.replace(tzinfo=None)
-    elif not past_dt.tzinfo and now.tzinfo:
-        now = now.replace(tzinfo=None)
-    elif past_dt.tzinfo != now.tzinfo:
-        past_dt = past_dt.replace(tzinfo=None)
-        now = now.replace(tzinfo=None)
+    # Convert both to UTC for proper comparison
+    if past_dt.tzinfo:
+        past_dt = past_dt.astimezone(timezone.utc)
+    else:
+        past_dt = past_dt.replace(tzinfo=timezone.utc)
+
+    if now.tzinfo:
+        now = now.astimezone(timezone.utc)
+    else:
+        now = now.replace(tzinfo=timezone.utc)
 
     diff = now - past_dt
     total_seconds = diff.total_seconds()
@@ -206,16 +205,21 @@ def format_age_compact(past_dt: datetime, now: datetime = None) -> str:
         return "?"
 
     if now is None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
     if isinstance(past_dt, str):
         past_dt = datetime.fromisoformat(past_dt)
 
-    # Handle timezones
-    if past_dt.tzinfo and not now.tzinfo:
-        past_dt = past_dt.replace(tzinfo=None)
-    elif not past_dt.tzinfo and now.tzinfo:
-        now = now.replace(tzinfo=None)
+    # Convert both to UTC for proper comparison
+    if past_dt.tzinfo:
+        past_dt = past_dt.astimezone(timezone.utc)
+    else:
+        past_dt = past_dt.replace(tzinfo=timezone.utc)
+
+    if now.tzinfo:
+        now = now.astimezone(timezone.utc)
+    else:
+        now = now.replace(tzinfo=timezone.utc)
 
     diff = now - past_dt
     total_hours = diff.total_seconds() / 3600
@@ -232,12 +236,12 @@ def format_age_compact(past_dt: datetime, now: datetime = None) -> str:
 
 
 def get_next_screen_time() -> Optional[datetime]:
-    """Get next screening time (3:00 PM ET on weekdays)."""
+    """Get next screening time (14:15 ET on weekdays)."""
     now_et = datetime.now(ET)
-    screen_time = now_et.replace(hour=15, minute=0, second=0, microsecond=0)
+    screen_time = now_et.replace(hour=14, minute=15, second=0, microsecond=0)
 
-    # If past 3 PM today, next screen is tomorrow
-    if now_et.hour >= 15:
+    # If past 14:15 today, next screen is tomorrow
+    if now_et.hour > 14 or (now_et.hour == 14 and now_et.minute >= 15):
         screen_time += timedelta(days=1)
 
     # Skip weekends
@@ -249,12 +253,12 @@ def get_next_screen_time() -> Optional[datetime]:
 
 
 def get_next_exit_time() -> Optional[datetime]:
-    """Get next exit time (2:45 PM ET on weekdays)."""
+    """Get next exit time (14:00 ET on weekdays)."""
     now_et = datetime.now(ET)
-    exit_time = now_et.replace(hour=14, minute=45, second=0, microsecond=0)
+    exit_time = now_et.replace(hour=14, minute=0, second=0, microsecond=0)
 
-    # If past 2:45 PM today, next exit is tomorrow
-    if now_et.hour > 14 or (now_et.hour == 14 and now_et.minute >= 45):
+    # If past 14:00 today, next exit is tomorrow
+    if now_et.hour >= 14:
         exit_time += timedelta(days=1)
 
     # Skip weekends

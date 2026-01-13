@@ -1,0 +1,8 @@
+[
+  {"date": "2026-01-25", "symbol": "AAPL", "open": 225.50, "high": 227.00, "low": 224.80, "close": 226.30, "adjClose": 226.30, "volume": 42000000},
+  {"date": "2026-01-27", "symbol": "AAPL", "open": 226.80, "high": 228.50, "low": 226.20, "close": 227.90, "adjClose": 227.90, "volume": 38000000},
+  {"date": "2026-01-28", "symbol": "AAPL", "open": 228.00, "high": 229.20, "low": 227.50, "close": 228.80, "adjClose": 228.80, "volume": 41000000},
+  {"date": "2026-01-29", "symbol": "AAPL", "open": 228.50, "high": 230.00, "low": 227.80, "close": 229.50, "adjClose": 229.50, "volume": 45000000},
+  {"date": "2026-01-30", "symbol": "AAPL", "open": 235.00, "high": 238.50, "low": 234.00, "close": 237.20, "adjClose": 237.20, "volume": 85000000},
+  {"date": "2026-01-31", "symbol": "AAPL", "open": 236.50, "high": 239.00, "low": 235.80, "close": 238.50, "adjClose": 238.50, "volume": 52000000}
+]

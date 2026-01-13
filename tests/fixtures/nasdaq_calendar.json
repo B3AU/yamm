@@ -1,0 +1,30 @@
+{
+  "data": {
+    "rows": [
+      {
+        "symbol": "AAPL",
+        "time": "After Market Close",
+        "epsForecast": "$6.05",
+        "noOfEsts": "42"
+      },
+      {
+        "symbol": "MSFT",
+        "time": "Before Market Open",
+        "epsForecast": "$3.12",
+        "noOfEsts": "38"
+      },
+      {
+        "symbol": "GOOGL",
+        "time": "After Market Close",
+        "epsForecast": "$2.05",
+        "noOfEsts": "35"
+      },
+      {
+        "symbol": "META",
+        "time": "time-not-supplied",
+        "epsForecast": "$5.85",
+        "noOfEsts": "40"
+      }
+    ]
+  }
+}

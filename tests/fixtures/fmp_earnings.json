@@ -1,0 +1,26 @@
+[
+  {
+    "symbol": "AAPL",
+    "date": "2026-01-30",
+    "epsActual": 6.12,
+    "epsEstimated": 6.05,
+    "revenueActual": 124500000000,
+    "revenueEstimated": 123400000000
+  },
+  {
+    "symbol": "MSFT",
+    "date": "2026-01-30",
+    "epsActual": 3.18,
+    "epsEstimated": 3.12,
+    "revenueActual": 65200000000,
+    "revenueEstimated": 64800000000
+  },
+  {
+    "symbol": "GOOGL",
+    "date": "2026-01-31",
+    "epsActual": null,
+    "epsEstimated": 2.05,
+    "revenueActual": null,
+    "revenueEstimated": 96000000000
+  }
+]

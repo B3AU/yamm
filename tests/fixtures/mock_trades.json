@@ -1,0 +1,58 @@
+{
+  "trades": [
+    {
+      "trade_id": "AAPL_2026-01-30_20260129143000",
+      "ticker": "AAPL",
+      "earnings_date": "2026-01-30",
+      "earnings_timing": "AMC",
+      "entry_datetime": "2026-01-29T14:30:00",
+      "entry_quoted_bid": 6.90,
+      "entry_quoted_ask": 7.30,
+      "entry_quoted_mid": 7.10,
+      "entry_limit_price": 7.15,
+      "entry_fill_price": 7.12,
+      "structure": "straddle",
+      "strikes": "[230.0]",
+      "expiration": "2026-01-31",
+      "contracts": 2,
+      "premium_paid": 1424.0,
+      "status": "filled"
+    },
+    {
+      "trade_id": "NVDA_2026-01-28_20260127142500",
+      "ticker": "NVDA",
+      "earnings_date": "2026-01-28",
+      "earnings_timing": "AMC",
+      "entry_datetime": "2026-01-27T14:25:00",
+      "entry_quoted_bid": 12.50,
+      "entry_quoted_ask": 13.20,
+      "entry_quoted_mid": 12.85,
+      "entry_limit_price": 12.95,
+      "entry_fill_price": 12.90,
+      "exit_fill_price": 15.20,
+      "exit_pnl": 230.0,
+      "exit_pnl_pct": 0.178,
+      "structure": "straddle",
+      "strikes": "[850.0]",
+      "expiration": "2026-01-31",
+      "contracts": 1,
+      "premium_paid": 1290.0,
+      "status": "exited"
+    }
+  ],
+  "non_trades": [
+    {
+      "log_id": "NT_TSLA_20260129143000000000",
+      "ticker": "TSLA",
+      "earnings_date": "2026-01-30",
+      "earnings_timing": "AMC",
+      "log_datetime": "2026-01-29T14:30:00",
+      "rejection_reason": "Spread too wide: 22.5% > 15.0%",
+      "quoted_bid": 8.50,
+      "quoted_ask": 10.80,
+      "quoted_spread_pct": 22.5,
+      "spot_price": 245.00,
+      "implied_move": 0.039
+    }
+  ]
+}

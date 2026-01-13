@@ -28,3 +28,11 @@ ipykernel>=6.0
 
 # Utilities
 python-dateutil>=2.8
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-mock>=3.12
+pytest-cov>=4.1
+responses>=0.25
+freezegun>=1.4

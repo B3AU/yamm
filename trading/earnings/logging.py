@@ -303,6 +303,13 @@ class TradeLogger:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+            # Add combo bid/ask columns for tracking combined straddle pricing (migration)
+            for col in ['entry_combo_bid', 'entry_combo_ask']:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
             # Non-trades table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS non_trades (
@@ -734,7 +741,14 @@ class TradeLogger:
                 "SELECT * FROM trades WHERE trade_id = ?", (trade_id,)
             ).fetchone()
             if row:
-                return TradeLog(**dict(row))
+                row_dict = dict(row)
+                # Remove DB-only columns not in dataclass
+                row_dict.pop('created_at', None)
+                row_dict.pop('updated_at', None)
+                # Filter to only include keys that match TradeLog fields
+                valid_fields = set(TradeLog.__dataclass_fields__.keys())
+                filtered_dict = {k: v for k, v in row_dict.items() if k in valid_fields}
+                return TradeLog(**filtered_dict)
         return None
 
     def get_trades(

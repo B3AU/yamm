@@ -182,3 +182,96 @@ class TestCalculateCounterfactualPnl:
         # P&L = $15 - $5 = $10
         assert result["pnl_at_mid"] == pytest.approx(10.0)
         assert result["profitable"] is True
+
+
+# ============================================================================
+# Tests Using Real Price Data (prices.pqt)
+# ============================================================================
+
+class TestWithRealPriceData:
+    """Tests using production prices.pqt file."""
+
+    def test_prices_parquet_structure(self, prices_parquet):
+        """Verify prices parquet has expected structure."""
+        import pandas as pd
+
+        # Should have date index
+        assert prices_parquet.index.name == 'date' or 'date' in prices_parquet.columns
+
+        # Should have typical OHLCV columns
+        expected_cols = {'open', 'high', 'low', 'close', 'volume'}
+        actual_cols = set(c.lower() for c in prices_parquet.columns)
+        assert expected_cols.issubset(actual_cols), f"Missing columns: {expected_cols - actual_cols}"
+
+    def test_prices_parquet_has_data(self, prices_parquet):
+        """Verify prices parquet has meaningful data."""
+        assert len(prices_parquet) > 0
+
+        # Should have multiple symbols (multi-index or symbol column)
+        if 'symbol' in prices_parquet.columns:
+            unique_symbols = prices_parquet['symbol'].nunique()
+            assert unique_symbols > 100, f"Expected many symbols, got {unique_symbols}"
+
+    def test_find_closest_price_with_real_data(self, prices_parquet):
+        """Test _find_closest_price with real historical prices."""
+        import pandas as pd
+
+        # Get AAPL prices if available
+        if 'symbol' in prices_parquet.columns:
+            aapl_prices = prices_parquet[prices_parquet['symbol'] == 'AAPL']
+        else:
+            # Try multi-index
+            try:
+                aapl_prices = prices_parquet.xs('AAPL', level='symbol')
+            except (KeyError, TypeError):
+                pytest.skip("Cannot extract AAPL prices from parquet")
+
+        if len(aapl_prices) == 0:
+            pytest.skip("No AAPL data in prices parquet")
+
+        # Build price dict like the function expects
+        if 'date' in aapl_prices.columns:
+            price_dict = {
+                str(row['date']): row['close']
+                for _, row in aapl_prices.iterrows()
+            }
+        else:
+            # Date is index
+            price_dict = {
+                str(idx): row['close']
+                for idx, row in aapl_prices.iterrows()
+            }
+
+        # Pick a date that should exist
+        dates = list(price_dict.keys())
+        if dates:
+            test_date = date.fromisoformat(dates[len(dates) // 2])
+            result = _find_closest_price(price_dict, test_date, direction="before")
+            assert result is not None
+            assert result[0] > 0  # Price should be positive
+
+
+class TestHistoricalEarningsData:
+    """Tests using historical_earnings_moves.parquet."""
+
+    def test_historical_earnings_structure(self, historical_earnings_parquet):
+        """Verify historical earnings parquet has expected columns."""
+        expected_cols = {'symbol', 'earnings_date'}
+        actual_cols = set(historical_earnings_parquet.columns)
+        assert expected_cols.issubset(actual_cols), f"Missing columns: {expected_cols - actual_cols}"
+
+    def test_historical_earnings_has_moves(self, historical_earnings_parquet):
+        """Should have realized move data."""
+        # Should have move columns
+        move_cols = [c for c in historical_earnings_parquet.columns if 'move' in c.lower()]
+        assert len(move_cols) > 0, "Expected move columns in historical earnings"
+
+    def test_historical_earnings_timing(self, historical_earnings_parquet):
+        """Should have BMO/AMC timing data."""
+        if 'timing' in historical_earnings_parquet.columns:
+            timings = historical_earnings_parquet['timing'].dropna().unique()
+            # Should have BMO and/or AMC
+            assert len(timings) > 0
+            valid_timings = {'BMO', 'AMC', 'unknown'}
+            for t in timings:
+                assert t in valid_timings or t is None

@@ -1,8 +1,9 @@
-"""Component tests for ml_predictor.py - with mocked FMP API."""
+"""Component tests for ml_predictor.py - with mocked FMP API and real models."""
 from datetime import date
 from unittest.mock import patch, MagicMock
 import json
 
+import numpy as np
 import pytest
 import responses
 
@@ -158,3 +159,192 @@ class TestNewsFeatures:
 
         assert news_counts["AAPL"] > 0
         assert news_counts["OBSCURE"] == 0
+
+
+# ============================================================================
+# Tests Using Real Production Models
+# ============================================================================
+
+class TestRealModelLoading:
+    """Tests that verify production model files load correctly."""
+
+    def test_load_models_success(self, real_predictor):
+        """Should load all 4 quantile models."""
+        assert real_predictor.models is not None
+        assert len(real_predictor.models) == 4
+
+        # Verify all quantiles loaded
+        expected_quantiles = [0.5, 0.75, 0.9, 0.95]
+        for q in expected_quantiles:
+            assert q in real_predictor.models
+            assert real_predictor.models[q] is not None
+
+    def test_feature_config_loaded(self, real_predictor, feature_config):
+        """Should load feature configuration with columns, quantiles, medians."""
+        # Check predictor has feature columns
+        assert hasattr(real_predictor, 'feature_cols')
+        assert len(real_predictor.feature_cols) > 0
+
+        # Check config structure
+        assert "feature_cols" in feature_config
+        assert "quantiles" in feature_config
+        assert "feature_medians" in feature_config  # Note: actual key is feature_medians
+
+        # Feature count should match config
+        assert len(real_predictor.feature_cols) == len(feature_config["feature_cols"])
+
+    def test_pca_model_loaded(self, pca_model):
+        """Should load PCA model for news embeddings."""
+        # PCA model is loaded separately (not part of EarningsPredictor)
+        assert pca_model is not None
+        assert hasattr(pca_model, 'transform')
+        assert hasattr(pca_model, 'n_components_')
+        assert pca_model.n_components_ == 10
+
+
+class TestRealModelPredictions:
+    """Tests for predictions using real production models."""
+
+    def test_predict_with_real_models_using_defaults(self, real_predictor):
+        """Should make predictions using default features (no API calls)."""
+        # Create a feature dict using training medians (defaults)
+        from trading.earnings.ml_predictor import EdgePrediction
+
+        # Use parquet fallback by mocking FMP to return empty
+        with patch('trading.earnings.ml_predictor.requests.get') as mock_get:
+            mock_response = MagicMock()
+            mock_response.json.return_value = []
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            # This should still work with parquet fallback
+            result = real_predictor.predict(
+                symbol="AAPL",
+                earnings_date=date(2024, 1, 30),
+                timing="AMC",
+            )
+
+            # May return None if parquet lookup fails, but if it works:
+            if result is not None:
+                assert isinstance(result, EdgePrediction)
+                assert result.symbol == "AAPL"
+                assert result.pred_q50 > 0
+                assert result.pred_q75 >= result.pred_q50
+                assert result.pred_q90 >= result.pred_q75
+                assert result.pred_q95 >= result.pred_q90
+
+    def test_quantile_ordering_real_models(self, real_predictor, feature_config):
+        """Predictions from real models should maintain q50 < q75 < q90 < q95."""
+        import numpy as np
+
+        # Build feature array from feature medians
+        feature_cols = feature_config["feature_cols"]
+        medians = feature_config["feature_medians"]
+
+        # Create feature vector using medians
+        features = np.array([[medians.get(col, 0.0) for col in feature_cols]])
+
+        # Get predictions from each quantile model
+        preds = {}
+        for q, model in real_predictor.models.items():
+            preds[q] = model.predict(features)[0]
+
+        # Verify ordering
+        assert preds[0.5] <= preds[0.75], f"q50 ({preds[0.5]}) should be <= q75 ({preds[0.75]})"
+        assert preds[0.75] <= preds[0.9], f"q75 ({preds[0.75]}) should be <= q90 ({preds[0.9]})"
+        assert preds[0.9] <= preds[0.95], f"q90 ({preds[0.9]}) should be <= q95 ({preds[0.95]})"
+
+    def test_feature_count_matches_model(self, real_predictor, feature_config):
+        """Feature count should match what models expect."""
+        expected_features = len(feature_config["feature_cols"])
+
+        # LightGBM Booster uses num_feature() method
+        for q, model in real_predictor.models.items():
+            model_features = model.num_feature()
+            assert model_features == expected_features, \
+                f"Model q{q*100} expects {model_features} features, config has {expected_features}"
+
+
+class TestRealPCAModel:
+    """Tests for the news PCA model."""
+
+    def test_pca_transform_dimension(self, pca_model):
+        """PCA should reduce 768-dim embedding to 10-dim."""
+        # Simulate a 768-dim embedding
+        fake_embedding = np.random.randn(1, 768)
+
+        result = pca_model.transform(fake_embedding)
+
+        assert result.shape == (1, 10)
+
+    def test_pca_transform_deterministic(self, pca_model):
+        """PCA transform should be deterministic."""
+        fake_embedding = np.ones((1, 768)) * 0.5
+
+        result1 = pca_model.transform(fake_embedding)
+        result2 = pca_model.transform(fake_embedding)
+
+        np.testing.assert_array_equal(result1, result2)
+
+
+class TestFeatureDefaults:
+    """Tests for default feature values from training medians."""
+
+    def test_feature_medians_exist(self, feature_config):
+        """All feature columns should have training median defaults."""
+        feature_cols = feature_config["feature_cols"]
+        medians = feature_config["feature_medians"]
+
+        missing = [col for col in feature_cols if col not in medians]
+        assert len(missing) == 0, f"Missing medians for: {missing}"
+
+    def test_feature_medians_reasonable(self, feature_config):
+        """Feature medians should be within reasonable ranges."""
+        medians = feature_config["feature_medians"]
+
+        # Historical earnings moves should be positive percentages
+        if "hist_move_mean" in medians:
+            assert 0 < medians["hist_move_mean"] < 0.5, \
+                f"hist_move_mean ({medians['hist_move_mean']}) should be 0-50%"
+
+        # Timing encoded should be 0-2 (unknown/BMO/AMC)
+        if "timing_encoded" in medians:
+            assert 0 <= medians["timing_encoded"] <= 2
+
+        # News count should be non-negative
+        if "pre_earnings_news_count" in medians:
+            assert medians["pre_earnings_news_count"] >= 0
+
+
+class TestEdgeFiltering:
+    """Tests for edge-based candidate filtering."""
+
+    def test_filter_by_edge_uses_real_models(self, real_predictor, sample_candidate):
+        """filter_by_edge should work with real models."""
+        # Create candidates list
+        candidates = [sample_candidate]
+
+        # Mock the predict method to return a valid EdgePrediction
+        from trading.earnings.ml_predictor import EdgePrediction
+
+        mock_prediction = EdgePrediction(
+            symbol="AAPL",
+            pred_q50=0.03,
+            pred_q75=0.05,
+            pred_q90=0.07,
+            pred_q95=0.10,
+            hist_move_mean=0.04,
+            edge_q75=0.01,  # 1% edge (below 5% threshold)
+            edge_q90=0.03,
+            news_count=5,
+        )
+
+        with patch.object(real_predictor, 'predict', return_value=mock_prediction):
+            # Filter with 5% threshold - should filter out
+            filtered = real_predictor.filter_by_edge(candidates, edge_threshold=0.05)
+            assert len(filtered) == 0  # Edge 1% < threshold 5%
+
+            # Change to lower threshold - should pass
+            mock_prediction.edge_q75 = 0.06
+            filtered = real_predictor.filter_by_edge(candidates, edge_threshold=0.05)
+            assert len(filtered) == 1

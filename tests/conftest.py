@@ -351,3 +351,87 @@ def event_loop():
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+
+# ============================================================================
+# Real Production Model Fixtures
+# ============================================================================
+
+@pytest.fixture
+def models_dir() -> Path:
+    """Path to production models directory."""
+    return PROJECT_ROOT / "models"
+
+
+@pytest.fixture
+def data_dir() -> Path:
+    """Path to production data directory."""
+    return PROJECT_ROOT / "data"
+
+
+@pytest.fixture
+def real_predictor(models_dir):
+    """Load EarningsPredictor with real production models.
+
+    Skips if model files don't exist.
+    """
+    # Check if model files exist
+    required_files = [
+        models_dir / "earnings_q50.txt",
+        models_dir / "earnings_q75.txt",
+        models_dir / "earnings_q90.txt",
+        models_dir / "earnings_q95.txt",
+        models_dir / "feature_config.json",
+        models_dir / "news_pca.joblib",
+    ]
+
+    for f in required_files:
+        if not f.exists():
+            pytest.skip(f"Model file not found: {f}")
+
+    from trading.earnings.ml_predictor import EarningsPredictor
+    return EarningsPredictor()
+
+
+@pytest.fixture
+def feature_config(models_dir):
+    """Load feature configuration from production models."""
+    config_path = models_dir / "feature_config.json"
+    if not config_path.exists():
+        pytest.skip("feature_config.json not found")
+
+    with open(config_path) as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def pca_model(models_dir):
+    """Load PCA model for news embeddings."""
+    pca_path = models_dir / "news_pca.joblib"
+    if not pca_path.exists():
+        pytest.skip("news_pca.joblib not found")
+
+    import joblib
+    return joblib.load(pca_path)
+
+
+@pytest.fixture
+def prices_parquet(data_dir):
+    """Load prices parquet file."""
+    prices_path = data_dir / "prices.pqt"
+    if not prices_path.exists():
+        pytest.skip("prices.pqt not found")
+
+    import pandas as pd
+    return pd.read_parquet(prices_path)
+
+
+@pytest.fixture
+def historical_earnings_parquet(data_dir):
+    """Load historical earnings moves parquet file."""
+    earnings_path = data_dir / "earnings" / "historical_earnings_moves.parquet"
+    if not earnings_path.exists():
+        pytest.skip("historical_earnings_moves.parquet not found")
+
+    import pandas as pd
+    return pd.read_parquet(earnings_path)

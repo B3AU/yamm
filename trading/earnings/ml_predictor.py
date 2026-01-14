@@ -570,10 +570,11 @@ class EarningsPredictor:
             'ret_5d': 0.0, 'ret_10d': 0.0, 'ret_20d': 0.0,
             'dist_from_high_20d': 0.0, 'dist_from_low_20d': 0.0,
             'gap_frequency': 0.0, 'volume_ratio': 1.0,
+            'rvol_percentile': 50.0,
         }
 
-        # Try live FMP first
-        prices_df = self._fetch_prices(symbol, earnings_date, lookback_days=30)
+        # Try live FMP first (280 days needed for rvol_percentile)
+        prices_df = self._fetch_prices(symbol, earnings_date, lookback_days=280)
 
         # Fallback to parquet
         if prices_df is None or len(prices_df) < 5:
@@ -595,6 +596,16 @@ class EarningsPredictor:
         result['rvol_5d'] = float(returns.tail(5).std() * np.sqrt(252)) if len(returns) >= 5 else 0.3
         result['rvol_10d'] = float(returns.tail(10).std() * np.sqrt(252)) if len(returns) >= 10 else 0.3
         result['rvol_20d'] = float(returns.tail(20).std() * np.sqrt(252)) if len(returns) >= 20 else 0.3
+
+        # Compute rvol_percentile - where current rvol_20d sits vs past year
+        if len(returns) >= 252:
+            from scipy.stats import percentileofscore
+            rolling_rvol = returns.rolling(20).std() * np.sqrt(252)
+            past_rvols = rolling_rvol.dropna().values[:-1]  # Exclude current to avoid lookahead
+            current_rvol = result['rvol_20d']
+            result['rvol_percentile'] = float(percentileofscore(past_rvols, current_rvol, kind='rank'))
+        else:
+            result['rvol_percentile'] = 50.0
 
         closes = prices_df['close'].values
         result['ret_5d'] = float(closes[-1] / closes[-5] - 1) if len(closes) >= 5 else 0.0

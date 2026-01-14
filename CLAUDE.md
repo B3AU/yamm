@@ -50,7 +50,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 #### ML Predictor (`trading/earnings/ml_predictor.py`)
 - LightGBM quantile regression (q50, q75, q90, q95)
-- **55 features** including:
+- **56 features** including:
   - Historical earnings moves (mean, std, max, trend, etc.)
   - Price/volatility features (realized vol, momentum, gaps)
   - Earnings surprises (beat rate, streak)
@@ -100,6 +100,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Live IBKR prices with `--live` flag
 - Watch mode with auto-refresh (`--watch`)
 - **Interactive commands:** c=close position, l=llm details, r=refresh, q=quit
+- **Entry spread display** - Shows spread % at entry in compact view
 - Manual position closing (for partial fills or emergencies)
 
 #### Live News (`trading/earnings/live_news.py`)
@@ -163,7 +164,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 #### Medium Priority
 - [ ] Strangle structure not implemented (straddles only)
-- [ ] No IV rank/percentile features
+- [x] rvol_percentile feature added (alternative to IV percentile since no historical IV data)
 - [ ] Model retraining pipeline not automated
 
 #### Low Priority
@@ -324,11 +325,12 @@ data/
 notebooks/
 ├── 0.2 historical_earnings_moves.ipynb   # Fetch earnings + compute moves
 ├── 0.2c_infer_earnings_timing.ipynb      # BMO/AMC timing inference fix
-├── 1.0 feature_engineering.ipynb         # Build ML features (55 total)
+├── 1.0 feature_engineering.ipynb         # Build ML features (56 total)
 ├── 1.1 model_training.ipynb              # Train quantile models
 ├── 1.2 calibration_analysis.ipynb        # Model calibration study
-├── 3.0_edge_analysis.ipynb               # Edge/P&L analysis
-└── kelly_position_sizing.ipynb           # Kelly criterion position sizing analysis
+├── 1.3 portfolio_simulation.ipynb        # Portfolio simulation backtest
+├── 1.4 kelly_position_sizing.ipynb       # Kelly criterion analysis
+└── 3.0_edge_analysis.ipynb               # Edge/P&L analysis
 ```
 
 ### Running the System
@@ -354,6 +356,15 @@ python -m trading.earnings.test_screening --ticker AAPL --earnings-date 2026-01-
 
 # Test ML only (no IBKR)
 python -m trading.earnings.test_screening --no-ibkr --ticker AAPL
+
+# Run full ML pipeline (all 7 notebooks)
+python3 scripts/run_ml_pipeline.py
+
+# Start from specific step (0-indexed)
+python3 scripts/run_ml_pipeline.py 3  # Start from model training
+
+# List pipeline notebooks
+python3 scripts/run_ml_pipeline.py --list
 ```
 
 ### Environment Variables
@@ -463,7 +474,7 @@ The calibration notebook (`notebooks/1.2 calibration_analysis.ipynb`) includes c
 
 ### Position Sizing Analysis
 
-**Notebook:** `notebooks/kelly_position_sizing.ipynb`
+**Notebook:** `notebooks/1.4 kelly_position_sizing.ipynb`
 
 Analyzed Kelly criterion and variants for position sizing (950 trades, 6% edge threshold):
 
@@ -480,13 +491,22 @@ Analyzed Kelly criterion and variants for position sizing (950 trades, 6% edge t
 - Optimal Kelly fraction: 0.50-0.75 range
 - Tiered sizing is practical alternative with similar Sharpe
 
+**Kelly Formula Calibration:**
+The `compute_kelly_multiplier` function uses a `/2.0` divisor to convert raw Kelly fractions into practical position multipliers. This is **not arbitrary** - it's calibrated so that Half Kelly at typical edge/variance produces ~1x base position:
+- Raw Kelly = edge / variance (can be very large, e.g., 0.07/0.01 = 7.0)
+- Fractional Kelly = raw × kelly_mult (e.g., 7.0 × 0.5 = 3.5)
+- Multiplier = fractional / 2.0 (e.g., 3.5 / 2 = 1.75x)
+- Position = 2% base × 1.75 = 3.5% of bankroll
+
+Without this divisor, position sizes explode to 10-15% per trade, causing 8x worse drawdowns and lower Sharpe despite higher raw returns.
+
 **Tiered Sizing Rules (for implementation after validation):**
 | Edge | Multiplier | Position Size |
 |------|------------|---------------|
 | 6-8% | 1.0x | 2% of bankroll |
-| 8-10% | 1.5x | 3% of bankroll |
-| 10-15% | 2.0x | 4% of bankroll |
-| 15%+ | 2.5x | 5% of bankroll |
+| 8-10% | 1.25x | 2.5% of bankroll |
+| 10-15% | 1.5x | 3% of bankroll |
+| 15%+ | 2.0x | 4% of bankroll |
 
 **Note:** Start with fixed sizing during paper trading. Implement tiered sizing once edge is validated with 30+ trades.
 
@@ -649,7 +669,7 @@ Quantiles of |return|:
 
 The key comparison: `predicted_q75` vs `implied_move`
 
-### Features (55 total)
+### Features (56 total)
 
 **Historical Earnings (10 features)**
 - hist_move_mean, hist_move_median, hist_move_std
@@ -657,8 +677,8 @@ The key comparison: `predicted_q75` vs `implied_move`
 - recent_move_mean, move_trend
 - gap_continuation_ratio, n_past_earnings
 
-**Price/Volatility (10 features)**
-- rvol_5d, rvol_10d, rvol_20d
+**Price/Volatility (11 features)**
+- rvol_5d, rvol_10d, rvol_20d, rvol_percentile
 - ret_5d, ret_10d, ret_20d
 - dist_from_high_20d, dist_from_low_20d
 - gap_frequency, volume_ratio

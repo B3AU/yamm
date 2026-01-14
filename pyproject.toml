@@ -6,3 +6,15 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks integration tests",
 ]
+
+[tool.coverage.run]
+omit = [
+    "trading/earnings/test_screening.py",  # Manual test utility, not production code
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "def main\\(\\):",
+]

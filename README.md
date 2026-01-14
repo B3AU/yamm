@@ -89,11 +89,14 @@ journalctl -u yamm-trading -f
 | Time | Task |
 |------|------|
 | 09:25 | Connect to IB Gateway |
-| 15:00 | Screen upcoming earnings |
-| 15:30 | Place straddle orders |
-| 15:45 | Exit previous day's positions |
-| 15:50 | Final fill check |
+| 09:30-16:00 | Position snapshots (every 5 min) |
+| 14:00 | Exit previous day's positions |
+| 14:15 | Screen + place orders |
+| 14:25, 14:35, 14:45, 14:55 | Price improvement loop |
+| 15:55 | Final fill check |
+| 15:58 | Cancel unfilled entries + force exit remaining |
 | 16:05 | Disconnect |
+| 16:30 | Counterfactual backfill |
 
 ---
 
@@ -105,7 +108,7 @@ Environment variables (set in `.env` or export):
 |----------|---------|-------------|
 | `FMP_API_KEY` | (required) | FMP API key for earnings calendar |
 | `IB_HOST` | 127.0.0.1 | IB Gateway host |
-| `IB_PORT` | 4002 | IB Gateway port (4002=paper, 4001=live) |
+| `IB_PORT` | 4002 | IB Gateway port (4002=paper, 7497=TWS live, 4001=gateway live) |
 | `IB_CLIENT_ID` | 1 | IB client ID |
 | `SPREAD_THRESHOLD` | 15.0 | Max spread % to trade |
 | `MAX_CONTRACTS` | 1 | Contracts per leg |

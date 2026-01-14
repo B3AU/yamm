@@ -402,3 +402,111 @@ class TestGetSummaryStats:
         assert stats["total_non_trades"] == 1
         assert stats["completed_trades"] == 1
         assert stats["total_pnl"] == 150.0
+
+
+class TestEarningsCalendar:
+    """Tests for earnings calendar logging."""
+
+    def test_log_earnings_calendar(self, test_db):
+        """Should log earnings calendar entry."""
+        from datetime import date
+
+        test_db.log_earnings_calendar(
+            symbol="AAPL",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+            source="nasdaq",
+            eps_estimate=6.05,
+        )
+
+        # Retrieve and verify
+        entries = test_db.get_earnings_calendar()
+        assert len(entries) == 1
+        assert entries[0]["symbol"] == "AAPL"
+        assert entries[0]["timing"] == "AMC"
+        assert entries[0]["source"] == "nasdaq"
+
+    def test_get_earnings_calendar_by_date(self, test_db):
+        """Should filter by date range."""
+        from datetime import date
+
+        test_db.log_earnings_calendar(
+            symbol="AAPL",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+            source="nasdaq",
+        )
+        test_db.log_earnings_calendar(
+            symbol="MSFT",
+            earnings_date=date(2026, 2, 5),
+            timing="BMO",
+            source="fmp",
+        )
+
+        # Filter by date range
+        entries = test_db.get_earnings_calendar(
+            from_date=date(2026, 1, 1),
+            to_date=date(2026, 1, 31),
+        )
+        assert len(entries) == 1
+        assert entries[0]["symbol"] == "AAPL"
+
+    def test_get_earnings_calendar_by_source(self, test_db):
+        """Should filter by source."""
+        from datetime import date
+
+        test_db.log_earnings_calendar(
+            symbol="AAPL",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+            source="nasdaq",
+        )
+        test_db.log_earnings_calendar(
+            symbol="MSFT",
+            earnings_date=date(2026, 1, 30),
+            timing="BMO",
+            source="fmp",
+        )
+
+        # Filter by source
+        nasdaq_entries = test_db.get_earnings_calendar(source="nasdaq")
+        fmp_entries = test_db.get_earnings_calendar(source="fmp")
+
+        assert len(nasdaq_entries) == 1
+        assert len(fmp_entries) == 1
+        assert nasdaq_entries[0]["symbol"] == "AAPL"
+        assert fmp_entries[0]["symbol"] == "MSFT"
+
+
+class TestGetTradesByDate:
+    """Tests for date-based trade queries."""
+
+    def test_filter_by_earnings_date(self, test_db, sample_trade_log):
+        """Should filter trades by earnings date."""
+        test_db.log_trade(sample_trade_log)
+
+        trades = test_db.get_trades(from_date="2026-01-29", to_date="2026-01-31")
+        assert len(trades) == 1
+
+        trades = test_db.get_trades(from_date="2026-02-01", to_date="2026-02-28")
+        assert len(trades) == 0
+
+
+class TestGetNonTradesDateRange:
+    """Tests for non-trade date range queries."""
+
+    def test_filter_non_trades_by_date(self, test_db, sample_non_trade_log):
+        """Should filter non-trades by date range."""
+        test_db.log_non_trade(sample_non_trade_log)
+
+        non_trades = test_db.get_non_trades(
+            from_date="2026-01-28",
+            to_date="2026-01-31",
+        )
+        assert len(non_trades) == 1
+
+        non_trades = test_db.get_non_trades(
+            from_date="2026-02-01",
+            to_date="2026-02-28",
+        )
+        assert len(non_trades) == 0

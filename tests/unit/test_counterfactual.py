@@ -1,11 +1,16 @@
 """Unit tests for counterfactual.py - pure functions for counterfactual P&L calculations."""
 from datetime import date, timedelta
+from unittest.mock import patch, MagicMock
 
 import pytest
+import responses
 
 from trading.earnings.counterfactual import (
     _find_closest_price,
     calculate_counterfactual_pnl,
+    fetch_realized_move,
+    backfill_counterfactuals,
+    get_recent_counterfactual_summary,
 )
 
 
@@ -275,3 +280,256 @@ class TestHistoricalEarningsData:
             valid_timings = {'BMO', 'AMC', 'unknown'}
             for t in timings:
                 assert t in valid_timings or t is None
+
+
+# ============================================================================
+# Tests for fetch_realized_move()
+# ============================================================================
+
+class TestFetchRealizedMove:
+    """Tests for fetch_realized_move function."""
+
+    def test_returns_none_without_api_key(self, monkeypatch):
+        """Should return None when no API key."""
+        from trading.earnings import counterfactual
+        monkeypatch.setattr(counterfactual, 'FMP_API_KEY', '')
+
+        result = fetch_realized_move("AAPL", date(2026, 1, 30), "AMC")
+        assert result is None
+
+    @responses.activate
+    def test_fetches_bmo_move(self, mock_env_vars):
+        """Should calculate correct move for BMO earnings."""
+        # BMO: Entry = T-1 close, Exit = T close
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted",
+            json=[
+                {"date": "2026-01-29", "close": 100.0, "adjClose": 100.0},  # Entry (T-1)
+                {"date": "2026-01-30", "close": 108.0, "adjClose": 108.0},  # Exit (T)
+            ],
+            status=200,
+        )
+
+        result = fetch_realized_move("AAPL", date(2026, 1, 30), "BMO")
+
+        assert result is not None
+        assert result["close_before"] == 100.0
+        assert result["close_after"] == 108.0
+        assert result["realized_move"] == pytest.approx(0.08)  # 8% move
+        assert result["direction"] == "up"
+
+    @responses.activate
+    def test_fetches_amc_move(self, mock_env_vars):
+        """Should calculate correct move for AMC earnings."""
+        # AMC: Entry = T close, Exit = T+1 close
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted",
+            json=[
+                {"date": "2026-01-30", "close": 100.0, "adjClose": 100.0},  # Entry (T)
+                {"date": "2026-01-31", "close": 95.0, "adjClose": 95.0},   # Exit (T+1)
+            ],
+            status=200,
+        )
+
+        result = fetch_realized_move("AAPL", date(2026, 1, 30), "AMC")
+
+        assert result is not None
+        assert result["realized_move"] == pytest.approx(0.05)  # 5% move
+        assert result["direction"] == "down"
+
+    @responses.activate
+    def test_returns_none_on_api_error(self, mock_env_vars):
+        """Should return None on API error."""
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted",
+            json={"error": "Rate limit"},
+            status=429,
+        )
+
+        result = fetch_realized_move("AAPL", date(2026, 1, 30), "AMC")
+        assert result is None
+
+    @responses.activate
+    def test_returns_none_on_empty_data(self, mock_env_vars):
+        """Should return None when no price data."""
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted",
+            json=[],
+            status=200,
+        )
+
+        result = fetch_realized_move("UNKNOWN", date(2026, 1, 30), "AMC")
+        assert result is None
+
+
+# ============================================================================
+# Tests for backfill_counterfactuals()
+# ============================================================================
+
+class TestBackfillCounterfactuals:
+    """Tests for backfill_counterfactuals function."""
+
+    def test_returns_zeros_when_no_pending(self):
+        """Should return zero counts when no pending non-trades."""
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades_pending_counterfactual.return_value = []
+
+        result = backfill_counterfactuals(mock_logger, date(2026, 1, 30))
+
+        assert result == {'updated': 0, 'skipped': 0, 'failed': 0}
+
+    @responses.activate
+    def test_updates_non_trade_with_realized_move(self, mock_env_vars):
+        """Should update non-trade with realized move data."""
+        # Mock non-trade record
+        mock_non_trade = MagicMock()
+        mock_non_trade.ticker = "AAPL"
+        mock_non_trade.earnings_timing = "AMC"
+        mock_non_trade.log_id = 123
+        mock_non_trade.quoted_bid = 4.50
+        mock_non_trade.quoted_ask = 5.50
+        mock_non_trade.spot_price = 100.0
+        mock_non_trade.implied_move = 0.05
+
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades_pending_counterfactual.return_value = [mock_non_trade]
+
+        # Mock API response
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/historical-price-eod/dividend-adjusted",
+            json=[
+                {"date": "2026-01-30", "close": 100.0, "adjClose": 100.0},
+                {"date": "2026-01-31", "close": 108.0, "adjClose": 108.0},
+            ],
+            status=200,
+        )
+
+        # Set exit date to past so it's processed
+        with patch('trading.earnings.counterfactual.date') as mock_date:
+            mock_date.today.return_value = date(2026, 2, 15)
+            mock_date.side_effect = lambda *args, **kwargs: date(*args, **kwargs)
+
+            result = backfill_counterfactuals(mock_logger, date(2026, 1, 30))
+
+        assert result['updated'] == 1
+        mock_logger.update_non_trade.assert_called_once()
+
+    def test_skips_future_exit_dates(self):
+        """Should skip non-trades with exit dates in the future."""
+        mock_non_trade = MagicMock()
+        mock_non_trade.ticker = "AAPL"
+        mock_non_trade.earnings_timing = "AMC"  # Exit = earnings_date + 1
+
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades_pending_counterfactual.return_value = [mock_non_trade]
+
+        # Exit date is in future
+        with patch('trading.earnings.counterfactual.date') as mock_date:
+            mock_date.today.return_value = date(2026, 1, 30)  # Same as earnings
+            mock_date.side_effect = lambda *args, **kwargs: date(*args, **kwargs)
+
+            result = backfill_counterfactuals(mock_logger, date(2026, 1, 30))
+
+        assert result['skipped'] == 1
+        assert result['updated'] == 0
+
+
+# ============================================================================
+# Tests for get_recent_counterfactual_summary()
+# ============================================================================
+
+class TestGetRecentCounterfactualSummary:
+    """Tests for get_recent_counterfactual_summary function."""
+
+    def test_returns_zeros_when_no_data(self):
+        """Should return zeros when no non-trades."""
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades.return_value = []
+
+        result = get_recent_counterfactual_summary(mock_logger, days=7)
+
+        assert result['total_non_trades'] == 0
+        assert result['with_counterfactual'] == 0
+        assert result['would_have_profited'] == 0
+        assert result['would_have_lost'] == 0
+
+    def test_counts_profitable_non_trades(self):
+        """Should count non-trades that would have been profitable."""
+        # Create mock non-trades
+        profitable_nt = MagicMock()
+        profitable_nt.counterfactual_realized_move = 0.08
+        profitable_nt.counterfactual_pnl_with_spread = 2.50
+        profitable_nt.rejection_reason = "spread_too_wide"
+
+        losing_nt = MagicMock()
+        losing_nt.counterfactual_realized_move = 0.02
+        losing_nt.counterfactual_pnl_with_spread = -3.00
+        losing_nt.rejection_reason = "low_edge"
+
+        no_cf_nt = MagicMock()
+        no_cf_nt.counterfactual_realized_move = None
+        no_cf_nt.counterfactual_pnl_with_spread = None
+
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades.return_value = [profitable_nt, losing_nt, no_cf_nt]
+
+        result = get_recent_counterfactual_summary(mock_logger, days=7)
+
+        assert result['total_non_trades'] == 3
+        assert result['with_counterfactual'] == 2
+        assert result['would_have_profited'] == 1
+        assert result['would_have_lost'] == 1
+
+    def test_groups_by_rejection_reason(self):
+        """Should group results by rejection reason."""
+        nt1 = MagicMock()
+        nt1.counterfactual_realized_move = 0.05
+        nt1.counterfactual_pnl_with_spread = 1.00
+        nt1.rejection_reason = "spread_too_wide"
+
+        nt2 = MagicMock()
+        nt2.counterfactual_realized_move = 0.03
+        nt2.counterfactual_pnl_with_spread = -2.00
+        nt2.rejection_reason = "spread_too_wide"
+
+        nt3 = MagicMock()
+        nt3.counterfactual_realized_move = 0.06
+        nt3.counterfactual_pnl_with_spread = 3.00
+        nt3.rejection_reason = "low_edge"
+
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades.return_value = [nt1, nt2, nt3]
+
+        result = get_recent_counterfactual_summary(mock_logger, days=7)
+
+        assert "spread_too_wide" in result['by_rejection_reason']
+        assert result['by_rejection_reason']['spread_too_wide']['count'] == 2
+        assert result['by_rejection_reason']['spread_too_wide']['profitable'] == 1
+
+        assert "low_edge" in result['by_rejection_reason']
+        assert result['by_rejection_reason']['low_edge']['count'] == 1
+
+    def test_calculates_avg_missed_pnl(self):
+        """Should calculate average missed P&L."""
+        nt1 = MagicMock()
+        nt1.counterfactual_realized_move = 0.05
+        nt1.counterfactual_pnl_with_spread = 2.00
+        nt1.rejection_reason = "test"
+
+        nt2 = MagicMock()
+        nt2.counterfactual_realized_move = 0.03
+        nt2.counterfactual_pnl_with_spread = -1.00
+        nt2.rejection_reason = "test"
+
+        mock_logger = MagicMock()
+        mock_logger.get_non_trades.return_value = [nt1, nt2]
+
+        result = get_recent_counterfactual_summary(mock_logger, days=7)
+
+        # Avg = (2.00 + -1.00) / 2 = 0.50
+        assert result['avg_missed_pnl'] == pytest.approx(0.5)

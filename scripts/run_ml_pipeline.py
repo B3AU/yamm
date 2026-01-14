@@ -28,6 +28,8 @@ PIPELINE = [
     "1.0 feature_engineering.ipynb",            # Build ML features
     "1.1 model_training.ipynb",                 # Train quantile models
     "1.2 calibration_analysis.ipynb",           # Analyze calibration
+    "1.3 portfolio_simulation.ipynb",           # Portfolio simulation backtest
+    "1.4 kelly_position_sizing.ipynb",          # Kelly criterion analysis
 ]
 
 
@@ -55,11 +57,13 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = T
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = OUTPUT_DIR / timestamp
+    run_dir.mkdir(exist_ok=True)
 
     print(f"ML Pipeline Runner")
     print(f"=" * 60)
     print(f"Start from: step {start_from} ({PIPELINE[start_from]})")
-    print(f"Output dir: {OUTPUT_DIR}")
+    print(f"Output dir: {run_dir}")
     print(f"Timestamp:  {timestamp}")
     print(f"Use cache:  {use_cache}")
     if dry_run:
@@ -68,7 +72,7 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = T
 
     for i, notebook in enumerate(PIPELINE[start_from:], start=start_from):
         input_path = NOTEBOOKS_DIR / notebook
-        output_path = OUTPUT_DIR / f"{timestamp}_{notebook}"
+        output_path = run_dir / notebook
 
         print(f"\n{'=' * 60}")
         print(f"[{i + 1}/{len(PIPELINE)}] {notebook}")
@@ -107,7 +111,7 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = T
         print("DRY RUN complete - no notebooks were executed")
     else:
         print("Pipeline complete!")
-        print(f"Outputs saved to: {OUTPUT_DIR}")
+        print(f"Outputs saved to: {run_dir}")
     print(f"{'=' * 60}")
 
 

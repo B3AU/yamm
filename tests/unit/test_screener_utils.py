@@ -10,11 +10,17 @@ class TestIsValidPrice:
     """Tests for is_valid_price validation function."""
 
     def test_valid_positive_price(self):
-        """Should return True for valid positive prices."""
+        """Should return True for valid positive prices within max_value."""
         assert is_valid_price(100.0) is True
         assert is_valid_price(0.01) is True
-        assert is_valid_price(1000000.0) is True
+        assert is_valid_price(99999.0) is True  # Just under default max_value
         assert is_valid_price(1) is True  # int
+
+    def test_exceeds_max_value_returns_false(self):
+        """Should return False for values exceeding max_value (data errors)."""
+        # Default max_value is 100000
+        assert is_valid_price(100000.0) is False  # At max is excluded
+        assert is_valid_price(1000000.0) is False  # Way over max
 
     def test_none_returns_false(self):
         """Should return False for None."""
@@ -36,11 +42,10 @@ class TestIsValidPrice:
         assert is_valid_price(float('nan')) is False
         assert is_valid_price(math.nan) is False
 
-    def test_inf_returns_true(self):
-        """Infinity is technically positive but unusual - test current behavior."""
-        # Current implementation returns True for inf
-        # This documents the behavior - may want to change in future
-        assert is_valid_price(float('inf')) is True
+    def test_inf_returns_false(self):
+        """Infinity should return False (treated as invalid data)."""
+        assert is_valid_price(float('inf')) is False
+        assert is_valid_price(float('-inf')) is False
 
     def test_string_number_converts(self):
         """String numbers should be converted and validated."""

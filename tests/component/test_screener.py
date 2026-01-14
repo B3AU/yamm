@@ -269,6 +269,89 @@ class TestRejectedCandidate:
         assert candidate.atm_strike == 230.0
 
 
+class TestEarningsEventDataclass:
+    """Tests for EarningsEvent dataclass."""
+
+    def test_create_earnings_event(self):
+        """Should create earnings event with required fields."""
+        event = EarningsEvent(
+            symbol="AAPL",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+            eps_estimate=6.05,
+        )
+
+        assert event.symbol == "AAPL"
+        assert event.earnings_date == date(2026, 1, 30)
+        assert event.timing == "AMC"
+        assert event.eps_estimate == 6.05
+
+    def test_create_event_with_defaults(self):
+        """Should create event with default optional values."""
+        event = EarningsEvent(
+            symbol="MSFT",
+            earnings_date=date(2026, 1, 31),
+            timing="BMO",
+        )
+
+        assert event.eps_estimate is None
+        assert event.revenue_estimate is None
+
+
+class TestScreenedCandidateDataclass:
+    """Tests for ScreenedCandidate dataclass."""
+
+    def test_create_screened_candidate(self):
+        """Should create candidate with all fields."""
+        candidate = ScreenedCandidate(
+            symbol="AAPL",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+            spot_price=229.50,
+            expiry="20260131",
+            atm_strike=230.0,
+            call_bid=3.50,
+            call_ask=3.70,
+            put_bid=3.40,
+            put_ask=3.60,
+            straddle_mid=7.10,
+            straddle_spread=0.40,
+            spread_pct=5.6,
+            implied_move_pct=3.1,
+        )
+
+        assert candidate.symbol == "AAPL"
+        assert candidate.straddle_mid == 7.10
+        assert candidate.implied_move_pct == 3.1
+
+    def test_candidate_with_ml_predictions(self):
+        """Should store ML prediction fields."""
+        candidate = ScreenedCandidate(
+            symbol="AAPL",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+            spot_price=229.50,
+            expiry="20260131",
+            atm_strike=230.0,
+            call_bid=3.50,
+            call_ask=3.70,
+            put_bid=3.40,
+            put_ask=3.60,
+            straddle_mid=7.10,
+            straddle_spread=0.40,
+            spread_pct=5.6,
+            implied_move_pct=3.1,
+            pred_q50=0.04,
+            pred_q75=0.06,
+            pred_q90=0.08,
+            pred_q95=0.10,
+            edge_q75=0.03,
+        )
+
+        assert candidate.pred_q75 == 0.06
+        assert candidate.edge_q75 == 0.03
+
+
 class TestScreenCandidateIBKR:
     """Tests for screen_candidate_ibkr async function."""
 
@@ -412,3 +495,186 @@ class TestScreenCandidateIBKR:
 
         assert candidate.passes_liquidity is False
         assert "option chain" in candidate.rejection_reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_handles_no_expiry_match(self, mock_ib):
+        """Should reject when no matching expiry available."""
+        stock_ticker = MagicMock()
+        stock_ticker.last = 100.0
+        stock_ticker.close = 100.0
+        stock_ticker.marketPrice.return_value = 100.0
+
+        mock_chain = MagicMock()
+        mock_chain.exchange = "SMART"
+        mock_chain.expirations = ["20260301"]  # Wrong expiry
+        mock_chain.strikes = [100.0]
+
+        mock_ib.qualifyContractsAsync = AsyncMock(return_value=[MagicMock()])
+        mock_ib.reqMktData.return_value = stock_ticker
+        mock_ib.reqSecDefOptParamsAsync = AsyncMock(return_value=[mock_chain])
+
+        candidate = await screen_candidate_ibkr(
+            ib=mock_ib,
+            symbol="WRONGEXP",
+            earnings_date=date(2026, 1, 30),
+            timing="AMC",
+        )
+
+        assert candidate.passes_liquidity is False
+
+
+# ============================================================================
+# Tests for request_with_retry
+# ============================================================================
+
+class TestRequestWithRetry:
+    """Tests for _request_with_retry helper."""
+
+    @responses.activate
+    def test_retries_on_failure(self, mock_env_vars):
+        """Should retry on transient failures."""
+        from trading.earnings.screener import _request_with_retry
+
+        # First request fails, second succeeds
+        responses.add(
+            responses.GET,
+            "https://example.com/api",
+            json={"error": "timeout"},
+            status=503,
+        )
+        responses.add(
+            responses.GET,
+            "https://example.com/api",
+            json={"data": "success"},
+            status=200,
+        )
+
+        # Method is first arg, then url
+        result = _request_with_retry("GET", "https://example.com/api")
+
+        assert result.status_code == 200
+
+    @responses.activate
+    def test_raises_after_max_retries(self, mock_env_vars):
+        """Should raise exception after all retries fail."""
+        from trading.earnings.screener import _request_with_retry
+        import requests
+
+        # All requests fail
+        for _ in range(5):
+            responses.add(
+                responses.GET,
+                "https://example.com/api",
+                json={"error": "server error"},
+                status=500,
+            )
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            _request_with_retry("GET", "https://example.com/api", max_retries=3)
+
+
+# ============================================================================
+# Additional EarningsEvent tests
+# ============================================================================
+
+class TestEarningsEventFromNasdaq:
+    """Tests for parsing Nasdaq earnings data."""
+
+    @responses.activate
+    def test_parses_empty_eps(self, mock_env_vars):
+        """Should handle missing/empty EPS estimate."""
+        responses.add(
+            responses.GET,
+            "https://api.nasdaq.com/api/calendar/earnings",
+            json={
+                "data": {
+                    "rows": [
+                        {"symbol": "XYZ", "time": "AMC", "epsForecast": ""},
+                    ]
+                }
+            },
+            status=200,
+        )
+        for _ in range(6):
+            responses.add(
+                responses.GET,
+                "https://api.nasdaq.com/api/calendar/earnings",
+                json={"data": {"rows": []}},
+                status=200,
+            )
+
+        events = fetch_upcoming_earnings(days_ahead=7)
+
+        assert len(events) == 1
+        assert events[0].symbol == "XYZ"
+        assert events[0].eps_estimate is None or events[0].eps_estimate == 0.0
+
+    @responses.activate
+    def test_handles_null_data(self, mock_env_vars):
+        """Should handle null data in response."""
+        responses.add(
+            responses.GET,
+            "https://api.nasdaq.com/api/calendar/earnings",
+            json={"data": None},
+            status=200,
+        )
+        for _ in range(6):
+            responses.add(
+                responses.GET,
+                "https://api.nasdaq.com/api/calendar/earnings",
+                json={"data": {"rows": []}},
+                status=200,
+            )
+
+        events = fetch_upcoming_earnings(days_ahead=7)
+
+        assert isinstance(events, list)
+
+
+# ============================================================================
+# Tests for screen_all_candidates
+# ============================================================================
+
+class TestScreenAllCandidates:
+    """Tests for screen_all_candidates async function."""
+
+    @pytest.mark.asyncio
+    async def test_screens_multiple_candidates(self, mock_ib):
+        """Should screen multiple candidates concurrently."""
+        from trading.earnings.screener import screen_all_candidates
+
+        # Create mock events
+        events = [
+            EarningsEvent(symbol="AAPL", earnings_date=date(2026, 1, 30), timing="AMC"),
+            EarningsEvent(symbol="MSFT", earnings_date=date(2026, 1, 30), timing="BMO"),
+        ]
+
+        # Mock all IB calls to return rejections
+        mock_ib.qualifyContractsAsync = AsyncMock(return_value=[MagicMock()])
+        stock_ticker = MagicMock()
+        stock_ticker.marketPrice.return_value = float('nan')
+        mock_ib.reqMktData.return_value = stock_ticker
+
+        passed, rejected = await screen_all_candidates(
+            ib=mock_ib,
+            events=events,
+            spread_threshold=15.0,
+        )
+
+        # All should be rejected (no valid prices)
+        assert len(rejected) == 2
+        assert len(passed) == 0
+
+    @pytest.mark.asyncio
+    async def test_handles_empty_events(self, mock_ib):
+        """Should return empty lists for empty events."""
+        from trading.earnings.screener import screen_all_candidates
+
+        passed, rejected = await screen_all_candidates(
+            ib=mock_ib,
+            events=[],
+            spread_threshold=15.0,
+        )
+
+        assert passed == []
+        assert rejected == []

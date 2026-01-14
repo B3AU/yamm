@@ -109,9 +109,11 @@ async def main():
     for c in candidates:
         prediction = predictor.predict(c.symbol, c.earnings_date, c.timing)
         if prediction:
-            edge = prediction.edge_q75
+            # Calculate edge vs implied move (not historical average!)
+            implied_move = c.implied_move_pct / 100
+            edge = prediction.pred_q75 - implied_move
             status = "PASS" if edge >= args.edge_threshold else "FAIL"
-            logger.info(f"{c.symbol}: q75={prediction.pred_q75:.1%}, implied={c.implied_move_pct:.1f}%, edge={edge:.1%} -> {status}")
+            logger.info(f"{c.symbol}: q75={prediction.pred_q75:.1%}, implied={implied_move:.1%}, edge={edge:.1%} -> {status}")
             if edge >= args.edge_threshold:
                 c.edge_q75 = edge
                 c.pred_q75 = prediction.pred_q75

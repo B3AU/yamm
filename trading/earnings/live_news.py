@@ -148,9 +148,14 @@ def anonymize_and_embed(
 
     try:
         anon = _get_anonymizer()
+    except Exception as e:
+        logger.error(f"{symbol}: Failed to load anonymizer: {e}")
+        return None
+
+    try:
         model = _get_sentence_model()
     except Exception as e:
-        logger.error(f"Failed to load embedding components: {e}")
+        logger.error(f"{symbol}: Failed to load sentence transformer model: {e}")
         return None
 
     # Combine title + text for each article (same as training)

@@ -266,3 +266,125 @@ class TestRealPCAWithLiveNews:
 
             assert news_count == 0
             np.testing.assert_array_equal(pca_features, np.zeros(10))
+
+
+# ============================================================================
+# Tests for API error handling
+# ============================================================================
+
+class TestFMPNewsErrors:
+    """Tests for fetch_fmp_news error handling."""
+
+    @responses.activate
+    def test_handles_api_error(self, mock_env_vars):
+        """Should return empty list on API error."""
+        from trading.earnings.live_news import fetch_fmp_news
+
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/news/stock",
+            json={"error": "Rate limit exceeded"},
+            status=429,
+        )
+
+        articles = fetch_fmp_news(
+            symbol="AAPL",
+            from_date=date(2026, 1, 22),
+            to_date=date(2026, 1, 29),
+            limit=10,
+        )
+
+        assert articles == []
+
+    @responses.activate
+    def test_handles_connection_error(self, mock_env_vars):
+        """Should return empty list on connection error."""
+        from trading.earnings.live_news import fetch_fmp_news
+        import requests
+
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/news/stock",
+            body=requests.exceptions.ConnectionError(),
+        )
+
+        articles = fetch_fmp_news(
+            symbol="AAPL",
+            from_date=date(2026, 1, 22),
+            to_date=date(2026, 1, 29),
+            limit=10,
+        )
+
+        assert articles == []
+
+    @responses.activate
+    def test_handles_invalid_json(self, mock_env_vars):
+        """Should return empty list on invalid JSON."""
+        from trading.earnings.live_news import fetch_fmp_news
+
+        responses.add(
+            responses.GET,
+            "https://financialmodelingprep.com/stable/news/stock",
+            body="not valid json",
+            status=200,
+            content_type="application/json",
+        )
+
+        articles = fetch_fmp_news(
+            symbol="AAPL",
+            from_date=date(2026, 1, 22),
+            to_date=date(2026, 1, 29),
+            limit=10,
+        )
+
+        assert articles == []
+
+
+# ============================================================================
+# Tests for anonymize_and_embed edge cases
+# ============================================================================
+
+class TestAnonymizeAndEmbedEdgeCases:
+    """Edge case tests for anonymize_and_embed."""
+
+    def test_returns_none_for_empty_articles(self):
+        """Should return None for empty article list."""
+        from trading.earnings.live_news import anonymize_and_embed
+
+        result = anonymize_and_embed([], "AAPL")
+
+        assert result is None
+
+    def test_returns_none_for_none_articles(self):
+        """Should return None for None input."""
+        from trading.earnings.live_news import anonymize_and_embed
+
+        result = anonymize_and_embed(None, "AAPL")
+
+        assert result is None
+
+
+# ============================================================================
+# Tests for PCA feature defaults
+# ============================================================================
+
+class TestPCAFeatureDefaults:
+    """Tests for default PCA feature handling."""
+
+    def test_returns_zeros_when_no_model(self):
+        """Should return zeros when no PCA model provided."""
+        from trading.earnings.live_news import get_live_news_pca_features
+
+        # Don't provide a PCA model
+        with patch('trading.earnings.live_news.fetch_fmp_news') as mock_fetch:
+            mock_fetch.return_value = []
+
+            news_count, pca_features = get_live_news_pca_features(
+                symbol="AAPL",
+                earnings_date=date(2026, 1, 30),
+                pca_model=None,
+            )
+
+            assert news_count == 0
+            assert len(pca_features) == 10
+            np.testing.assert_array_equal(pca_features, np.zeros(10))

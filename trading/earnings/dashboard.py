@@ -581,8 +581,8 @@ def render_dashboard(
     if open_trades:
         if compact:
             # Compact format: 1 line per position
-            print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'LLM':<4}")
-            print("  " + "-" * 88)
+            print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<4}")
+            print("  " + "-" * 94)
         else:
             print(f"  {'Symbol':<8} {'Earnings':<12} {'Age':<6} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<10} {'LLM':<4}")
             print("  " + "-" * 88)
@@ -645,6 +645,14 @@ def render_dashboard(
                 edge_str = f"{trade.edge_q75*100:.0f}%" if trade.edge_q75 else "."
                 impl_str = f"{trade.implied_move*100:.0f}%" if trade.implied_move else "."
 
+                # Entry spread %
+                if trade.entry_quoted_bid and trade.entry_quoted_ask and trade.entry_quoted_mid:
+                    spread = trade.entry_quoted_ask - trade.entry_quoted_bid
+                    spread_pct = (spread / trade.entry_quoted_mid) * 100
+                    sprd_str = f"{spread_pct:.0f}%"
+                else:
+                    sprd_str = "."
+
                 # LLM check result with color
                 llm_check = llm_check_map.get(trade.trade_id)
                 if llm_check:
@@ -661,7 +669,7 @@ def render_dashboard(
                 print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
                       f"{age_str:<5} {strike_str:<7} {expiry_short:<5} "
                       f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
-                      f"{edge_str:<5} {impl_str:<5} {llm_str:<4}")
+                      f"{edge_str:<5} {impl_str:<5} {sprd_str:<5} {llm_str:<4}")
 
 
                 # Only show errors/warnings on second line if critical

@@ -12,7 +12,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 **Core edge:** Vol + tails, not direction.
 
-**V1 in one sentence:** Earnings-only, T-1 afternoon entry, T+0 afternoon exit (~24h hold), strict option liquidity gates, straddles/strangles only, fixed position sizing, mechanical risk controls, execution-first validation.
+**V1 in one sentence:** Earnings-only, T-1 afternoon entry, T+0 afternoon exit (~24h hold), strict option liquidity gates, straddles only, fixed position sizing, mechanical risk controls, execution-first validation.
 
 ---
 
@@ -123,10 +123,6 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Can skip IBKR or LLM for targeted testing
 - Useful for debugging and pre-market validation
 
-#### IB Options Client (`trading/earnings/ib_options.py`)
-- Wrapper around `ib_insync` for option chains and market data
-- Handles connection maintenance and error recovery
-
 ### Changes from Original Plan
 
 1. **Combined screen + place orders** - Originally separate (15:00 screen, 15:30 place). Now combined at **14:00 ET** for maximum fill time before close.
@@ -161,13 +157,12 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 ### Current Limitations / TODO
 
-#### Medium Priority
-- [ ] Strangle structure not implemented (straddles only)
-- [x] rvol_percentile feature added (alternative to IV percentile since no historical IV data)
-- [ ] Model retraining pipeline not automated
-
 #### Low Priority
 - [ ] Early exit logic (profit taking, loss cutting)
+- [ ] Kill switches (calibration drift, drawdown throttle, execution degradation)
+
+#### Out of Scope (V1)
+- Strangle structure (IBKR account limitation - straddles only)
 
 #### Completed
 - [x] Combo (BAG) orders - eliminates orphan leg risk
@@ -197,6 +192,8 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Dashboard: position age indicator
 - [x] Dashboard: BMO vs AMC timing breakdown
 - [x] Dashboard: upcoming candidates preview
+- [x] rvol_percentile feature (alternative to IV percentile)
+- [x] Model retraining pipeline (manual via `scripts/run_ml_pipeline.py`)
 - [x] Code review fixes (Jan 2026) - see below
 
 ---
@@ -220,6 +217,26 @@ Critical bugs fixed from extensive code review:
 7. **Daemon race conditions** (`daemon.py:483,627`) - Added proper `_exit_orders_lock` usage when accessing `active_exit_orders` dict to prevent concurrent modification.
 
 8. **Exception logging** (`backfill_earnings_data.py`) - Previously silent `except: pass` blocks now log warnings for visibility.
+
+**Part 2 fixes (medium/low priority):**
+
+9. **DB timeout** (`logging.py`) - Added `DB_TIMEOUT=30s` constant and applied to all `sqlite3.connect()` calls to prevent hangs.
+
+10. **SQL injection prevention** (`logging.py`) - Added column whitelist validation to `log_non_trade()` matching `log_trade()` security.
+
+11. **API retry logic** (`llm_sanity_check.py`) - Added exponential backoff via urllib3 Retry for Tavily and OpenRouter API calls.
+
+12. **FMP rate limiting** (`live_news.py`) - Added 200ms minimum interval between FMP API calls to avoid rate limits.
+
+13. **Timezone handling** (`dashboard.py`) - Fixed `format_time_until()` to normalize both datetimes to UTC, and fixed `now.astimezone(ET)` crash on naive datetime.
+
+14. **conId preservation** (`executor.py`) - `reprice_exit_to_bid()` and `convert_exit_to_market()` now preserve `call_conId`/`put_conId` from original order.
+
+15. **ET timezone for counterfactuals** (`counterfactual.py`) - Added `today_et()` helper and explicit unknown timing handling to prevent UTC midnight issues.
+
+16. **Embedding validation** (`live_news.py`) - Added dimension check (768-dim expected) before PCA transform to catch model mismatches.
+
+17. **Dead code cleanup** - Deleted unused `ib_options.py` (488 lines) and `test_ib_options.py` (528 lines), removed exports from `__init__.py`.
 
 ---
 
@@ -300,7 +317,6 @@ trading/earnings/
 ├── live_news.py         # Live news embeddings
 ├── llm_sanity_check.py  # LLM + web search pre-trade validation
 ├── test_screening.py    # Standalone pipeline testing
-├── ib_options.py        # IBKR options client wrapper
 └── README.md            # Component documentation
 
 models/
@@ -613,7 +629,7 @@ Do NOT proceed to Phase 1 until:
 - **Markets:** US equities
 - **Instruments:** Listed equity options
 - **Holding period:** T-1 afternoon (14:15 ET) → T+0 afternoon (14:00 ET), ~24h hold through earnings
-- **Structures:** Straddles and strangles only
+- **Structures:** Straddles only (strangles out of scope due to IBKR account limitations)
 - **Risk posture:** Long volatility, defined risk
 - **Position sizing:** Fixed risk per trade, binary trade/no-trade decision
 

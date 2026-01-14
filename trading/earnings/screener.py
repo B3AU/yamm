@@ -39,6 +39,18 @@ def is_valid_price(p, max_value: float = 100000) -> bool:
         return False
 
 
+def next_trading_day(d: date) -> date:
+    """Get next trading day (skips weekends).
+    
+    Note: Does not account for market holidays.
+    """
+    next_d = d + timedelta(days=1)
+    # Skip Saturday (5) and Sunday (6)
+    while next_d.weekday() >= 5:
+        next_d += timedelta(days=1)
+    return next_d
+
+
 def _request_with_retry(
     method: str,
     url: str,
@@ -489,7 +501,7 @@ def get_tradeable_candidates(
         (bmo_tomorrow, amc_today) - lists of verified candidates
     """
     today = screening_date or datetime.now(ET).date()
-    tomorrow = today + timedelta(days=1)
+    tomorrow = next_trading_day(today)  # Skip weekends for BMO earnings
 
     # Fetch Nasdaq events
     events = fetch_upcoming_earnings(days_ahead=days_ahead)
@@ -627,13 +639,13 @@ async def screen_candidate_ibkr(
                 break
             await asyncio.sleep(0.1)
 
-        # Extract bid/ask - handle None, NaN, and inf
+        # Extract bid/ask - handle None, NaN, inf, and negative values
         def _valid(p) -> float:
             if p is None:
                 return 0.0
             try:
                 f = float(p)
-                return 0.0 if (math.isnan(f) or math.isinf(f)) else f
+                return 0.0 if (math.isnan(f) or math.isinf(f) or f < 0) else f
             except (TypeError, ValueError):
                 return 0.0
 

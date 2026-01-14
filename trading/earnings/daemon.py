@@ -246,18 +246,19 @@ class TradingDaemon:
             self._cleanup_stale_orders()
 
             # Load any trades already placed today (to prevent duplicates on restart)
-            self._load_todays_activity()
+            # Blocking I/O - run in thread
+            await asyncio.to_thread(self._load_todays_activity)
 
-            # Load ML predictor
+            # Load ML predictor (blocking I/O - run in thread)
             try:
-                self.predictor = get_predictor()
+                self.predictor = await asyncio.to_thread(get_predictor)
                 logger.info(f"ML predictor loaded: {len(self.predictor.models)} models")
             except Exception as e:
                 logger.error(f"Failed to load ML predictor: {e}")
                 self.predictor = None
 
-            # Load positions that need to be exited today
-            self._load_positions_to_exit()
+            # Load positions that need to be exited today (blocking I/O - run in thread)
+            await asyncio.to_thread(self._load_positions_to_exit)
 
             # Recover active exit orders
             if self.executor:
@@ -322,9 +323,9 @@ class TradingDaemon:
 
             # Apply ML edge filter
             if not self.predictor:
-                # Try reload
+                # Try reload (blocking I/O - run in thread)
                 try:
-                    self.predictor = get_predictor()
+                    self.predictor = await asyncio.to_thread(get_predictor)
                 except Exception as e:
                     logger.error(f"Failed to load ML predictor: {e}")
 
@@ -583,27 +584,28 @@ class TradingDaemon:
                             logger.info(f"  {combo_order.symbol}: Cancelled unfilled order")
 
             # Check exit order fills (with IB for spot price)
-            if self.active_exit_orders:
-                logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
-                exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
-                logger.info(f"Exit fills: {len(exit_filled)} completed")
+            async with self._exit_orders_lock:
+                if self.active_exit_orders:
+                    logger.info(f"Checking {len(self.active_exit_orders)} exit orders...")
+                    exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
+                    logger.info(f"Exit fills: {len(exit_filled)} completed")
 
-                for exit_pair in exit_filled:
-                    self.active_exit_orders.pop(exit_pair.trade_id, None)
+                    for exit_pair in exit_filled:
+                        self.active_exit_orders.pop(exit_pair.trade_id, None)
 
-                # Reprice unfilled exit orders to bid
-                unfilled_exits = [
-                    (tid, eo) for tid, eo in self.active_exit_orders.items()
-                    if eo.status not in ('filled', 'cancelled')
-                ]
-                if unfilled_exits:
-                    logger.warning(f"=== REPRICING {len(unfilled_exits)} UNFILLED EXIT ORDERS TO BID ===")
-                    for trade_id, exit_order in unfilled_exits:
-                        repriced = await reprice_exit_to_bid(exit_order, self.ib, self.trade_logger)
-                        if repriced:
-                            self.active_exit_orders[trade_id] = repriced
-                        else:
-                            logger.error(f"{exit_order.symbol}: Failed to reprice exit order")
+                    # Reprice unfilled exit orders to bid
+                    unfilled_exits = [
+                        (tid, eo) for tid, eo in self.active_exit_orders.items()
+                        if eo.status not in ('filled', 'cancelled')
+                    ]
+                    if unfilled_exits:
+                        logger.warning(f"=== REPRICING {len(unfilled_exits)} UNFILLED EXIT ORDERS TO BID ===")
+                        for trade_id, exit_order in unfilled_exits:
+                            repriced = await reprice_exit_to_bid(exit_order, self.ib, self.trade_logger)
+                            if repriced:
+                                self.active_exit_orders[trade_id] = repriced
+                            else:
+                                logger.error(f"{exit_order.symbol}: Failed to reprice exit order")
 
             # Log metrics
             metrics = self.trade_logger.get_execution_metrics()
@@ -639,6 +641,10 @@ class TradingDaemon:
                 exit_filled = await check_exit_fills(exit_orders_snapshot, self.trade_logger, self.ib)
                 if exit_filled:
                     logger.info(f"Exit fills detected: {[e.trade_id for e in exit_filled]}")
+                    # Remove filled orders from active_exit_orders
+                    async with self._exit_orders_lock:
+                        for exit_pair in exit_filled:
+                            self.active_exit_orders.pop(exit_pair.trade_id, None)
             except Exception as e:
                 logger.error(f"Monitor exit fills failed: {e}")
 
@@ -992,25 +998,26 @@ class TradingDaemon:
 
         try:
             # First check if any active exit orders filled since last check
-            if self.active_exit_orders:
-                exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
-                for exit_pair in exit_filled:
-                    self.active_exit_orders.pop(exit_pair.trade_id, None)
+            async with self._exit_orders_lock:
+                if self.active_exit_orders:
+                    exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
+                    for exit_pair in exit_filled:
+                        self.active_exit_orders.pop(exit_pair.trade_id, None)
 
-            # Convert remaining unfilled active exit orders to market orders
-            unfilled_exits = [
-                (tid, eo) for tid, eo in self.active_exit_orders.items()
-                if eo.status not in ('filled', 'cancelled')
-            ]
+                # Convert remaining unfilled active exit orders to market orders
+                unfilled_exits = [
+                    (tid, eo) for tid, eo in self.active_exit_orders.items()
+                    if eo.status not in ('filled', 'cancelled')
+                ]
 
-            if unfilled_exits:
-                logger.warning(f"Converting {len(unfilled_exits)} unfilled exits to MARKET ORDERS")
-                for trade_id, exit_order in unfilled_exits:
-                    converted = await convert_exit_to_market(exit_order, self.ib, self.trade_logger)
-                    if converted:
-                        self.active_exit_orders[trade_id] = converted
-                    else:
-                        logger.error(f"{exit_order.symbol}: Failed to convert to market order - MANUAL CLOSE REQUIRED")
+                if unfilled_exits:
+                    logger.warning(f"Converting {len(unfilled_exits)} unfilled exits to MARKET ORDERS")
+                    for trade_id, exit_order in unfilled_exits:
+                        converted = await convert_exit_to_market(exit_order, self.ib, self.trade_logger)
+                        if converted:
+                            self.active_exit_orders[trade_id] = converted
+                        else:
+                            logger.error(f"{exit_order.symbol}: Failed to convert to market order - MANUAL CLOSE REQUIRED")
 
             # CRITICAL: Also check for orphaned "exiting" positions in DB
             # These are positions where exit orders were placed but daemon restarted

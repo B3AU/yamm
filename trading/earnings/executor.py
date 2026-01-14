@@ -349,10 +349,8 @@ class Phase0Executor:
                     if combo_order.placement_time:
                         fill_latency_seconds = (fill_time - combo_order.placement_time).total_seconds()
 
-                    logger.info(
-                        f"{combo_order.symbol}: Straddle filled @ ${combo_order.fill_price:.2f}"
-                        f" (latency: {fill_latency_seconds:.0f}s)" if fill_latency_seconds else ""
-                    )
+                    latency_str = f" (latency: {fill_latency_seconds:.0f}s)" if fill_latency_seconds else ""
+                    logger.info(f"{combo_order.symbol}: Straddle filled @ ${combo_order.fill_price:.2f}{latency_str}")
 
                     # Update trade log with fill details and timing
                     self.logger.update_trade(
@@ -947,7 +945,9 @@ async def check_exit_fills(
                 trade_id,
                 status='exited',
                 exit_fill_price=exit_order.fill_price,
-                exit_slippage=exit_order.fill_price - combined_limit if combined_limit else None,
+                # Exit slippage: limit - fill (positive = sold below limit = bad)
+                # Consistent with entry: positive slippage = worse execution
+                exit_slippage=combined_limit - exit_order.fill_price if combined_limit else None,
                 exit_pnl=exit_pnl,
                 exit_pnl_pct=exit_pnl_pct,
                 spot_at_exit=spot_at_exit,

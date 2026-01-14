@@ -224,29 +224,58 @@ class EarningsPredictor:
             prices_df = prices_df.sort_values('date')
 
             # Compute moves for each past earnings
+            # Must match training data logic from 0.2c_infer_earnings_timing.ipynb:
+            # - BMO: earnings_date = exit day, move = Close_T / Close_T-1 - 1
+            # - AMC: earnings_date = entry day, move = Close_T+1 / Close_T - 1
+            # Timing is inferred from gap ratio (gap_T / gap_T+1)
             moves = []
             gap_moves = []
 
             for _, row in past_earnings.iterrows():
                 earn_date = row['date']
 
-                # Get close before earnings and close after
-                before = prices_df[prices_df['date'] < earn_date].tail(1)
-                after = prices_df[prices_df['date'] >= earn_date].head(1)
+                # Get T-1, T, T+1 prices
+                t_minus_1 = prices_df[prices_df['date'] < earn_date].tail(1)
+                t = prices_df[prices_df['date'] >= earn_date].head(1)
 
-                if len(before) == 0 or len(after) == 0:
+                if len(t_minus_1) == 0 or len(t) == 0:
                     continue
 
-                close_before = before['adjClose'].values[0]
-                close_after = after['adjClose'].values[0]
-                open_after = after['open'].values[0] if 'open' in after.columns else close_after
+                # Get T+1 for AMC timing detection
+                t_plus_1 = prices_df[prices_df['date'] > t['date'].values[0]].head(1)
+                if len(t_plus_1) == 0:
+                    continue
 
-                # Overnight move (close to close)
-                overnight_move = abs(close_after / close_before - 1)
-                moves.append(overnight_move)
+                close_t_minus_1 = t_minus_1['adjClose'].values[0]
+                open_t = t['open'].values[0] if 'open' in t.columns else t['adjClose'].values[0]
+                close_t = t['adjClose'].values[0]
+                open_t_plus_1 = t_plus_1['open'].values[0] if 'open' in t_plus_1.columns else t_plus_1['adjClose'].values[0]
+                close_t_plus_1 = t_plus_1['adjClose'].values[0]
 
-                # Gap move (close to open)
-                gap_move = abs(open_after / close_before - 1)
+                # Infer timing from gap ratios (matching training notebook)
+                # gap_T = overnight gap on earnings day, gap_T+1 = overnight gap day after
+                gap_t = abs(open_t / close_t_minus_1 - 1) if close_t_minus_1 > 0 else 0
+                gap_t_plus_1 = abs(open_t_plus_1 / close_t - 1) if close_t > 0 else 0
+
+                # gap_ratio > 2.0 -> BMO (large gap on T)
+                # gap_ratio < 0.5 -> AMC (large gap on T+1)
+                eps = 0.001  # Avoid division by zero
+                gap_ratio = gap_t / (gap_t_plus_1 + eps)
+
+                if gap_ratio > 2.0:
+                    # BMO: move = Close_T / Close_T-1 - 1
+                    move = abs(close_t / close_t_minus_1 - 1)
+                    gap_move = gap_t
+                elif gap_ratio < 0.5:
+                    # AMC: move = Close_T+1 / Close_T - 1
+                    move = abs(close_t_plus_1 / close_t - 1)
+                    gap_move = gap_t_plus_1
+                else:
+                    # Unknown timing: use 2-day window (robust to timing uncertainty)
+                    move = abs(close_t_plus_1 / close_t_minus_1 - 1)
+                    gap_move = max(gap_t, gap_t_plus_1)
+
+                moves.append(move)
                 gap_moves.append(gap_move)
 
             if len(moves) < 1:
@@ -264,7 +293,7 @@ class EarningsPredictor:
                 'hist_move_cv': float(np.std(moves) / np.mean(moves)) if np.mean(moves) > 0 else 0.0,
                 'recent_move_mean': float(np.mean(moves[-2:])) if len(moves) >= 2 else float(np.mean(moves)),
                 'move_trend': float(moves[-1] - moves[0]) if len(moves) >= 2 else 0.0,
-                'gap_continuation_ratio': float(np.mean(moves) / np.mean(gap_moves)) if np.mean(gap_moves) > 0 else 1.0,
+                'gap_continuation_ratio': float(np.mean(moves) / np.mean(gap_moves)) if len(gap_moves) > 0 and np.mean(gap_moves) > 0 else 1.0,
                 'n_past_earnings': len(moves),
             }
 

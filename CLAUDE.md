@@ -453,6 +453,45 @@ PAPER_MAX_DAILY_TRADES=10
 
 **Why "overnight_move" still works:** The `Close_T-1 → Close_T+1` move captures the full window for both BMO and AMC, making it robust to timing uncertainty. However, the gap/full moves needed correction for proper feature engineering.
 
+### Trading Timeline Examples
+
+#### AMC Example (Earnings Tuesday After Close)
+
+| Day | Time (ET) | Event |
+|-----|-----------|-------|
+| **Tuesday** | 14:15 | Buy straddle (earnings_date = Tuesday) |
+| **Tuesday** | ~17:00 | Earnings released after market close |
+| **Wednesday** | 09:30 | Market opens with gap (earnings reaction) |
+| **Wednesday** | 14:00 | Sell straddle |
+
+**P&L window:** Close_Tuesday → Close_Wednesday
+
+#### BMO Example (Earnings Wednesday Before Open)
+
+| Day | Time (ET) | Event |
+|-----|-----------|-------|
+| **Tuesday** | 14:15 | Buy straddle (earnings_date = Wednesday) |
+| **Wednesday** | ~07:00 | Earnings released before market open |
+| **Wednesday** | 09:30 | Market opens with gap (earnings reaction) |
+| **Wednesday** | 14:00 | Sell straddle |
+
+**P&L window:** Close_Tuesday → Close_Wednesday
+
+#### Key Insight
+
+Both timings have ~24h hold capturing overnight gap + intraday. The difference:
+- **AMC:** earnings_date = entry day (enter same day as announcement)
+- **BMO:** earnings_date = exit day (enter day before announcement)
+
+#### Historical Move Computation (must match for train/inference consistency)
+
+| Timing | Entry Price | Exit Price | Move Formula |
+|--------|-------------|------------|--------------|
+| **AMC** | Close_T | Close_T+1 | `abs(Close_T+1 / Close_T - 1)` |
+| **BMO** | Close_T-1 | Close_T | `abs(Close_T / Close_T-1 - 1)` |
+
+Where T = earnings_date in both cases.
+
 ### Backtest Analysis Summary
 
 The calibration notebook (`notebooks/1.2 calibration_analysis.ipynb`) includes comprehensive analysis:

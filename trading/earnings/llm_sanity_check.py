@@ -5,6 +5,7 @@ Validates that there are no red flags before placing a trade.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -277,12 +278,12 @@ async def check_with_llm(
     )
 
     try:
-        # Step 1: Web search
+        # Step 1: Web search (blocking I/O - run in thread)
         earnings_date = packet.get("event", {}).get("earnings_date", "")
-        queries, search_results = _search_tavily(ticker, earnings_date)
+        queries, search_results = await asyncio.to_thread(_search_tavily, ticker, earnings_date)
 
-        # Step 2: LLM analysis
-        llm_response = _call_openrouter(packet, search_results)
+        # Step 2: LLM analysis (blocking I/O - run in thread)
+        llm_response = await asyncio.to_thread(_call_openrouter, packet, search_results)
 
         latency_ms = int((time.time() - start_time) * 1000)
 

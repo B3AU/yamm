@@ -197,6 +197,29 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] Dashboard: position age indicator
 - [x] Dashboard: BMO vs AMC timing breakdown
 - [x] Dashboard: upcoming candidates preview
+- [x] Code review fixes (Jan 2026) - see below
+
+---
+
+### Code Review Fixes (Jan 2026)
+
+Critical bugs fixed from extensive code review:
+
+1. **Screener expiry selection** (`screener.py:593`) - Changed `>` to `>=` to include same-day expirations. Previously would select wrong expiry if earnings was on expiration day.
+
+2. **Premium calculation** (`executor.py:364`) - Use `totalQuantity` not `filled_qty` for premium/max loss calculation. Partial fills were showing incorrect P&L.
+
+3. **Feature medians config key** (`ml_predictor.py:88`) - Fixed key mismatch: code looked for `news_feature_medians` but config had `feature_medians`. Was returning empty dict.
+
+4. **Feature defaults** (`ml_predictor.py:761`) - Missing features now use training medians from `feature_config.json` instead of zeros. Prevents distribution shift in live inference.
+
+5. **SQL injection prevention** (`logging.py:439`) - Added column whitelist validation to `log_trade()` matching existing `update_trade()` security.
+
+6. **LLM JSON extraction** (`llm_sanity_check.py:230`) - Safer markdown parsing that handles malformed LLM responses without crashing.
+
+7. **Daemon race conditions** (`daemon.py:483,627`) - Added proper `_exit_orders_lock` usage when accessing `active_exit_orders` dict to prevent concurrent modification.
+
+8. **Exception logging** (`backfill_earnings_data.py`) - Previously silent `except: pass` blocks now log warnings for visibility.
 
 ---
 
@@ -487,12 +510,12 @@ BMO/AMC timing thresholds (gap_ratio > 2.0 for BMO, < 0.5 for AMC) were tuned on
 
 **Mitigation:** Monitor BMO vs AMC performance divergence in paper trading.
 
-#### 3. News Feature Defaults - FIXED
+#### 3. Feature Defaults - FIXED
 **Location:** `trading/earnings/ml_predictor.py`
 
-~~When news is unavailable, all 10 PCA components defaulted to 0.0 instead of training median.~~
+~~When features are missing, they defaulted to 0.0 instead of training medians.~~
 
-**Status:** Fixed - now uses training medians from `models/feature_config.json`.
+**Status:** Fixed (Jan 2026) - All missing features now use training medians from `models/feature_config.json`. Also fixed config key mismatch (`feature_medians` not `news_feature_medians`).
 
 #### Recommended Validation Before Live
 

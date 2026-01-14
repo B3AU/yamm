@@ -561,26 +561,29 @@ def extract_metrics(oos_path: Path = None, do_bootstrap: bool = False) -> dict:
         metrics["yearly_breakdown_6pct_1.3x"] = compute_yearly_breakdown(trades_6pct)
         metrics["monthly_breakdown_6pct_1.3x"] = compute_monthly_breakdown(trades_6pct)
 
-    # Kelly position sizing metrics
-    kelly_configs = [
-        ("fixed_2pct", 0.02, 0.0),       # Fixed 2% (no Kelly)
-        ("quarter_kelly", 0.02, 0.25),   # Quarter Kelly
-        ("half_kelly", 0.02, 0.50),      # Half Kelly (recommended)
-        ("full_kelly", 0.02, 1.0),       # Full Kelly
-        ("half_kelly_3pct", 0.03, 0.50), # Half Kelly, higher base
+    # Kelly position sizing metrics - compare across thresholds
+    kelly_thresholds = [0.05, 0.06, 0.07, 0.08]
+    kelly_fractions = [
+        ("fixed", 0.0),
+        ("half_kelly", 0.5),
+        ("full_kelly", 1.0),
     ]
 
     metrics["kelly_sizing"] = {}
-    for name, base_risk, kelly_frac in kelly_configs:
-        result = simulate_kelly_strategy(
-            oos,
-            edge_threshold=0.06,
-            implied_move_multiplier=1.3,
-            base_risk_pct=base_risk,
-            kelly_fraction=kelly_frac,
-        )
-        if result:
-            metrics["kelly_sizing"][name] = result
+    for threshold in kelly_thresholds:
+        thresh_key = f"{int(threshold*100)}pct"
+        metrics["kelly_sizing"][thresh_key] = {}
+
+        for name, kelly_frac in kelly_fractions:
+            result = simulate_kelly_strategy(
+                oos,
+                edge_threshold=threshold,
+                implied_move_multiplier=1.3,
+                base_risk_pct=0.02,
+                kelly_fraction=kelly_frac,
+            )
+            if result:
+                metrics["kelly_sizing"][thresh_key][name] = result
 
     return metrics
 
@@ -672,17 +675,22 @@ def print_metrics(metrics: dict):
             print(f"    {year}: {data['trades']} trades, {data['total_pnl']:+.1%} total, "
                   f"{data['win_rate']:.1%} win, {data['max_drawdown']:+.1%} DD")
 
-    # Kelly position sizing
+    # Kelly position sizing comparison across thresholds
     if 'kelly_sizing' in metrics and metrics['kelly_sizing']:
-        print(f"\nKelly Position Sizing (6% threshold, 1.3x):")
-        print(f"  {'Strategy':<18} {'Return':<10} {'CAGR':<8} {'MaxDD':<9} {'Sharpe':<8} "
-              f"{'Sortino':<8} {'AvgPos':<8}")
-        print(f"  {'-'*70}")
+        print(f"\nKelly Position Sizing Comparison (1.3x realistic):")
+        print(f"  {'Threshold':<10} {'Strategy':<14} {'Trades':<8} {'Return':<10} {'MaxDD':<9} {'Sharpe':<8}")
+        print(f"  {'-'*65}")
 
-        for name, data in metrics['kelly_sizing'].items():
-            print(f"  {name:<18} {data['total_return']:+7.1%}   {data['cagr']:+5.1%}  "
-                  f"{data['max_drawdown']:+7.1%}  {data['sharpe']:<8.2f} "
-                  f"{data['sortino']:<8.2f} {data['avg_position_size']:.1%}")
+        for thresh_key in ['5pct', '6pct', '7pct', '8pct']:
+            thresh_data = metrics['kelly_sizing'].get(thresh_key, {})
+            for strat_name in ['fixed', 'half_kelly', 'full_kelly']:
+                data = thresh_data.get(strat_name)
+                if data:
+                    print(f"  {thresh_key:<10} {strat_name:<14} {data['trades']:<8} "
+                          f"{data['total_return']:+7.1%}   {data['max_drawdown']:+7.1%}  "
+                          f"{data['sharpe']:.2f}")
+            if thresh_data:
+                print()  # blank line between thresholds
 
     print("\n" + "=" * 70)
 

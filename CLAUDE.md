@@ -1,6 +1,5 @@
-# Claude rules
+# Project Rules
 - python command is "python3"
-- don't mention claude in git commits
 
 
 ---
@@ -132,7 +131,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 
 1. **Combined screen + place orders** - Originally separate (15:00 screen, 15:30 place). Now combined at **14:00 ET** for maximum fill time before close.
 
-2. **Exit time** - Exit moved to **14:45 ET** to avoid position conflicts with new orders.
+2. **Exit time** - Exits run at **14:00 ET**, before screening (14:15 ET), to free up capital first.
 
 3. **Data Sources** - Earnings calendar uses **Nasdaq API** instead of FMP (better accuracy).
 
@@ -420,8 +419,8 @@ PAPER_MAX_DAILY_TRADES=10
 
 ### Training Data
 
-- **Period:** 2021-02-16 to 2025-12-18 (~4 years)
-- **Samples:** 69,783 earnings events, 4,228 symbols (after filtering)
+- **Period:** 2021-02-19 to 2024-08-08 (~3.5 years training window)
+- **Samples:** 47,576 training samples (from 69,783 total earnings events, 4,228 symbols)
 - **Walk-forward validation:** 5 time-based folds, expanding window
 
 ### BMO/AMC Timing Alignment Fix (Critical)
@@ -463,52 +462,41 @@ The calibration notebook (`notebooks/1.2 calibration_analysis.ipynb`) includes c
 - **Commission costs**: $1.30/contract IBKR commissions included
 - **Spread costs**: 3% round-trip spread modeled
 
-#### Key Results (1.3x realistic multiplier)
-| Threshold | Trades | Mean P&L | Sharpe |
-|-----------|--------|----------|--------|
-| 6% | 950 | +1.13% | 1.37 |
-| 8% | 281 | +3.01% | 1.76 |
-| 10% | 68 | +7.49% | 1.47 |
+#### Key Results (1.3x realistic multiplier, 58k OOS samples)
+| Threshold | Trades | Mean P&L | Win Rate | Sharpe |
+|-----------|--------|----------|----------|--------|
+| 5% | 1482 | +0.35% | 41.2% | 0.65 |
+| 6% | 909 | +0.74% | 42.4% | 1.04 |
+| 7% | 536 | +1.45% | 44.6% | 1.46 |
+| 8% | 283 | +2.63% | 50.9% | **1.84** |
+| 10% | 66 | +5.06% | 60.6% | 1.52 |
 
-**Recommendation:** 8% edge threshold under realistic assumptions (vs 7% with optimistic 1.0x).
+**Recommendation:** 8% edge threshold has best Sharpe (1.84) but fewer trades. 6-7% offers more opportunities with decent risk-adjusted returns.
+
+**Calibration:** q75 exceedance is 28.4% (vs expected 25%), indicating slight under-prediction of large moves.
 
 ### Position Sizing Analysis
 
 **Notebook:** `notebooks/1.4 kelly_position_sizing.ipynb`
 
-Analyzed Kelly criterion and variants for position sizing (950 trades, 6% edge threshold):
+Kelly position sizing comparison across thresholds (1.3x realistic, 2% base risk):
 
-| Strategy | Return | CAGR | Max DD | Sharpe | Avg Position |
-|----------|--------|------|--------|--------|--------------|
-| Fixed (2%) | 23.8% | 5.6% | -3.4% | 1.31 | 2.3% |
-| Edge Linear | 41.0% | 9.2% | -3.7% | 1.46 | 3.1% |
-| **Half Kelly** | 28.2% | 6.6% | **-2.2%** | **1.56** | 1.8% |
-| Quarter Kelly | 14.1% | 3.4% | -1.6% | 1.45 | 1.1% |
-| Tiered | 41.5% | 9.3% | -3.3% | 1.51 | 2.9% |
+| Threshold | Fixed Sharpe | Half Kelly | Full Kelly |
+|-----------|--------------|------------|------------|
+| 5% | 0.65 | 0.75 | 0.96 |
+| 6% | 1.04 | 1.12 | 1.25 |
+| 7% | 1.46 | 1.52 | 1.59 |
+| 8% | **1.84** | 1.86 | 1.86 |
 
 **Key findings:**
-- Half Kelly (0.5) has best Sharpe (1.56) and return/drawdown ratio
-- Optimal Kelly fraction: 0.50-0.75 range
-- Tiered sizing is practical alternative with similar Sharpe
+- Kelly sizing helps most at lower thresholds (5-6%): adds ~0.2-0.3 Sharpe
+- At 8% threshold, Kelly barely matters (1.84 fixed vs 1.86 Kelly)
+- **Best Sharpe is at 8% threshold regardless of position sizing**
+- Trade-off: 8% has only 283 trades vs 909 at 6%
 
-**Kelly Formula Calibration:**
-The `compute_kelly_multiplier` function uses a `/2.0` divisor to convert raw Kelly fractions into practical position multipliers. This is **not arbitrary** - it's calibrated so that Half Kelly at typical edge/variance produces ~1x base position:
-- Raw Kelly = edge / variance (can be very large, e.g., 0.07/0.01 = 7.0)
-- Fractional Kelly = raw × kelly_mult (e.g., 7.0 × 0.5 = 3.5)
-- Multiplier = fractional / 2.0 (e.g., 3.5 / 2 = 1.75x)
-- Position = 2% base × 1.75 = 3.5% of bankroll
+**Implementation:** Kelly sizing uses edge-specific variance computed from historical P&L by edge bucket. Position multiplier is capped between 0.5x and 3x base position.
 
-Without this divisor, position sizes explode to 10-15% per trade, causing 8x worse drawdowns and lower Sharpe despite higher raw returns.
-
-**Tiered Sizing Rules (for implementation after validation):**
-| Edge | Multiplier | Position Size |
-|------|------------|---------------|
-| 6-8% | 1.0x | 2% of bankroll |
-| 8-10% | 1.25x | 2.5% of bankroll |
-| 10-15% | 1.5x | 3% of bankroll |
-| 15%+ | 2.0x | 4% of bankroll |
-
-**Note:** Start with fixed sizing during paper trading. Implement tiered sizing once edge is validated with 30+ trades.
+**Recommendation:** Start with fixed 2% sizing during paper trading. Kelly sizing provides marginal improvement at best, and threshold selection matters more than position sizing.
 
 ### Known Remaining Issues
 

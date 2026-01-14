@@ -47,8 +47,8 @@ class EdgePrediction:
     pred_q90: float
     pred_q95: float
     hist_move_mean: float
-    edge_q75: float  # pred_q75 - hist_move_mean
-    edge_q90: float  # pred_q90 - hist_move_mean
+    edge_q75: float  # pred_q75 - hist_move_mean (NOT trading edge - see daemon.py)
+    edge_q90: float  # pred_q90 - hist_move_mean (trading edge is vs implied_move)
     news_count: int = 0  # number of FMP news articles found
     headlines: list = None  # raw headline data for LLM sanity check
 
@@ -85,7 +85,7 @@ class EarningsPredictor:
 
         self.feature_cols = config['feature_cols']
         self.quantiles = config['quantiles']
-        self.news_feature_medians = config.get('news_feature_medians', {})
+        self.feature_medians = config.get('feature_medians', {})
 
         for q in self.quantiles:
             model_path = self.model_dir / f'earnings_q{int(q*100)}.txt'
@@ -482,11 +482,11 @@ class EarningsPredictor:
         """
         # Use training medians as defaults instead of zeros
         defaults = {
-            'pre_earnings_news_count': self.news_feature_medians.get('pre_earnings_news_count', 1.0),
+            'pre_earnings_news_count': self.feature_medians.get('pre_earnings_news_count', 1.0),
             'headlines': []
         }
         for i in range(10):
-            defaults[f'news_pca_{i}'] = self.news_feature_medians.get(f'news_pca_{i}', 0.0)
+            defaults[f'news_pca_{i}'] = self.feature_medians.get(f'news_pca_{i}', 0.0)
 
         if not LIVE_DATA_ENABLED or self.news_pca is None:
             return defaults
@@ -629,11 +629,11 @@ class EarningsPredictor:
         """Compute news PCA features from live FMP data only (no stale parquet fallback)."""
         # Use training medians as defaults instead of zeros (prevents feature discontinuity)
         defaults = {
-            'pre_earnings_news_count': self.news_feature_medians.get('pre_earnings_news_count', 1.0),
+            'pre_earnings_news_count': self.feature_medians.get('pre_earnings_news_count', 1.0),
             'headlines': []
         }
         for i in range(10):
-            defaults[f'news_pca_{i}'] = self.news_feature_medians.get(f'news_pca_{i}', 0.0)
+            defaults[f'news_pca_{i}'] = self.feature_medians.get(f'news_pca_{i}', 0.0)
 
         if self.news_pca is None:
             return defaults
@@ -698,10 +698,15 @@ class EarningsPredictor:
                 logger.error(f"{symbol}: Error fetching news features: {e}")
                 news_features = {}
 
-        # Check required data
+        # Check required data - log warning (not debug) for visibility
         if hist_features is None:
-            logger.debug(f"{symbol}: No historical earnings data available")
+            logger.warning(f"{symbol}: FEATURE FAIL - No historical earnings data (checked FMP + parquet)")
             return None
+
+        # Log feature computation summary for debugging
+        fund_filled = sum(1 for v in fund_data.values() if v != 0.0) if fund_data else 0
+        news_count = news_features.get('pre_earnings_news_count', 0) if news_features else 0
+        logger.debug(f"{symbol}: Features computed - hist={hist_features.get('n_past_earnings', 0)} events, fund={fund_filled}/16, news={news_count}")
 
         # Build feature dict
         features = {}
@@ -744,9 +749,22 @@ class EarningsPredictor:
         if features is None:
             return None
 
-        # Build feature vector in correct order
+        # Build feature vector in correct order with type-aware defaults
+        # Integer columns should default to 0, float columns to 0.0
+        INTEGER_COLS = {
+            'n_past_earnings', 'surprise_streak', 'day_of_week', 'month',
+            'quarter', 'is_earnings_season', 'pre_earnings_news_count', 'timing_encoded'
+        }
         try:
-            feature_vector = np.array([[features.get(col, 0.0) for col in self.feature_cols]])
+            feature_values = []
+            for col in self.feature_cols:
+                if col in features:
+                    feature_values.append(features[col])
+                else:
+                    # Use training median as default, fall back to 0 if not available
+                    fallback = 0 if col in INTEGER_COLS else 0.0
+                    feature_values.append(self.feature_medians.get(col, fallback))
+            feature_vector = np.array([feature_values])
         except Exception as e:
             logger.error(f"{symbol}: Feature vector error: {e}")
             return None

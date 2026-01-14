@@ -226,13 +226,24 @@ Analyze and respond with JSON only."""
 
     logger.debug(f"Raw LLM response: {content[:200]}...")
 
-    # Parse JSON from response (handle markdown code blocks)
+    # Parse JSON from response (handle markdown code blocks safely)
+    json_content = content
     if "```json" in content:
-        content = content.split("```json")[1].split("```")[0]
+        parts = content.split("```json")
+        if len(parts) > 1:
+            inner_parts = parts[1].split("```")
+            if len(inner_parts) > 0:
+                json_content = inner_parts[0]
     elif "```" in content:
-        content = content.split("```")[1].split("```")[0]
+        parts = content.split("```")
+        if len(parts) > 2:
+            json_content = parts[1]
 
-    return json.loads(content.strip())
+    try:
+        return json.loads(json_content.strip())
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse failed. Raw content: {content[:500]}")
+        raise  # Re-raise to be caught by outer handler with json_parse_error flag
 
 
 async def check_with_llm(
@@ -330,6 +341,12 @@ async def check_with_llm(
         logger.error(f"{ticker}: LLM response not valid JSON: {e}")
         default_result.reasons = [f"LLM response parse error: {e}", "Trade blocked for safety"]
         default_result.risk_flags = ["api_failure", "json_parse_error"]
+        return default_result
+
+    except requests.Timeout as e:
+        logger.error(f"{ticker}: LLM API timeout after 30s: {e}")
+        default_result.reasons = [f"LLM API timeout: {e}", "Trade blocked for safety"]
+        default_result.risk_flags = ["api_failure", "timeout"]
         return default_result
 
     except requests.RequestException as e:

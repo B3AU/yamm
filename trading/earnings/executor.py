@@ -306,6 +306,11 @@ class Phase0Executor:
                 if not combo_order.trade:
                     continue
 
+                # Defensive null check for trade.orderStatus
+                if not combo_order.trade.orderStatus:
+                    logger.warning(f"Trade object missing orderStatus for {combo_order.symbol}")
+                    continue
+
                 status = combo_order.trade.orderStatus.status
                 filled_qty = combo_order.trade.orderStatus.filled
                 total_qty = combo_order.trade.order.totalQuantity
@@ -356,7 +361,7 @@ class Phase0Executor:
                         entry_fill_price=combo_order.fill_price,
                         entry_fill_time=fill_time.isoformat(),
                         entry_slippage=combo_order.fill_price - combo_order.trade.order.lmtPrice,
-                        premium_paid=combo_order.fill_price * filled_qty * 100,  # Use actual filled quantity
+                        premium_paid=combo_order.fill_price * total_qty * 100,  # Use ordered quantity for max loss
                         fill_latency_seconds=fill_latency_seconds,
                     )
 

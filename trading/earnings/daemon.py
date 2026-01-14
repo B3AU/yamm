@@ -355,22 +355,28 @@ class TradingDaemon:
                     candidate.pred_q90 = prediction.pred_q90
                     candidate.pred_q95 = prediction.pred_q95
                     candidate.hist_move_mean = prediction.hist_move_mean
-                    candidate.edge_q75 = prediction.edge_q75
-                    candidate.edge_q90 = prediction.edge_q90
                     candidate.news_count = prediction.news_count
 
-                    if prediction.edge_q75 >= edge_threshold:
+                    # Calculate edge vs implied move (not historical average!)
+                    # implied_move_pct is percentage (e.g., 7.5), pred_q75 is decimal (e.g., 0.075)
+                    implied_move = candidate.implied_move_pct / 100
+                    edge_q75 = prediction.pred_q75 - implied_move
+                    edge_q90 = prediction.pred_q90 - implied_move
+                    candidate.edge_q75 = edge_q75
+                    candidate.edge_q90 = edge_q90
+
+                    if edge_q75 >= edge_threshold:
                         candidate.passes_edge = True
                         ml_passed.append(candidate)
                         logger.info(
-                            f"  {candidate.symbol}: PASS edge={prediction.edge_q75:.1%} "
-                            f"(pred_q75={prediction.pred_q75:.1%}, hist={prediction.hist_move_mean:.1%})"
+                            f"  {candidate.symbol}: PASS edge={edge_q75:.1%} "
+                            f"(pred_q75={prediction.pred_q75:.1%}, impl={implied_move:.1%})"
                         )
                     else:
-                        candidate.rejection_reason = f"Edge {prediction.edge_q75:.1%} < {edge_threshold:.0%}"
+                        candidate.rejection_reason = f"Edge {edge_q75:.1%} < {edge_threshold:.0%}"
                         self.executor.log_non_trade(candidate)
                         logger.info(
-                            f"  {candidate.symbol}: FAIL edge={prediction.edge_q75:.1%} < {edge_threshold:.0%}"
+                            f"  {candidate.symbol}: FAIL edge={edge_q75:.1%} < {edge_threshold:.0%}"
                         )
 
                 passed = ml_passed
@@ -471,27 +477,40 @@ class TradingDaemon:
             for candidate in self.todays_candidates:
                 # Double check we haven't already traded this symbol today
                 # (Paranoid check for duplicate trades)
-                # Parse ticker from trade_id to avoid substring matches (e.g. GO vs GOOG)
-                if any(t.split('_')[0] == candidate.symbol for t in self.todays_trades):
-                    logger.warning(f"Skipping {candidate.symbol} - already traded today")
-                    continue
+                # Use locks for entire check-and-place operation to prevent race conditions
+                # Always acquire locks in consistent order: trades_lock first, then exit_orders_lock
+                async with self._trades_lock:
+                    # Parse ticker from trade_id to avoid substring matches (e.g. GO vs GOOG)
+                    if any(t.split('_')[0] == candidate.symbol for t in self.todays_trades):
+                        logger.warning(f"Skipping {candidate.symbol} - already traded today")
+                        continue
 
-                logger.info(f"Placing order for {candidate.symbol}...")
+                    # Check for overlapping exit - don't enter if position still being exited
+                    async with self._exit_orders_lock:
+                        exit_pending = False
+                        for tid, exit_order in self.active_exit_orders.items():
+                            if exit_order.symbol == candidate.symbol and exit_order.status in ('pending', 'retrying'):
+                                logger.warning(f"Skipping {candidate.symbol} - exit still pending (trade_id={tid})")
+                                exit_pending = True
+                                break
+                    if exit_pending:
+                        continue
 
-                # Use async place_straddle with position sizing config
-                order_pair = await self.executor.place_straddle(
-                    candidate,
-                    target_entry_amount=CONFIG['target_entry_amount'],
-                    min_contracts=CONFIG['min_contracts'],
-                    max_contracts=CONFIG['max_contracts'],
-                )
+                    logger.info(f"Placing order for {candidate.symbol}...")
 
-                if order_pair:
-                    async with self._trades_lock:
+                    # Use async place_straddle with position sizing config
+                    order_pair = await self.executor.place_straddle(
+                        candidate,
+                        target_entry_amount=CONFIG['target_entry_amount'],
+                        min_contracts=CONFIG['min_contracts'],
+                        max_contracts=CONFIG['max_contracts'],
+                    )
+
+                    if order_pair:
                         self.todays_trades.append(order_pair.trade_id)
-                    logger.info(f"  Order placed: {order_pair.trade_id}")
-                else:
-                    logger.error(f"  Order failed for {candidate.symbol}")
+                        logger.info(f"  Order placed: {order_pair.trade_id}")
+                    else:
+                        logger.error(f"  Order failed for {candidate.symbol}")
 
                 await asyncio.sleep(1)
 
@@ -612,10 +631,12 @@ class TradingDaemon:
             except Exception as e:
                 logger.error(f"Monitor entry fills failed: {e}")
 
-        # Monitor exit fills
-        if self.active_exit_orders:
+        # Monitor exit fills (use lock to safely access active_exit_orders)
+        async with self._exit_orders_lock:
+            exit_orders_snapshot = dict(self.active_exit_orders) if self.active_exit_orders else {}
+        if exit_orders_snapshot:
             try:
-                exit_filled = await check_exit_fills(self.active_exit_orders, self.trade_logger, self.ib)
+                exit_filled = await check_exit_fills(exit_orders_snapshot, self.trade_logger, self.ib)
                 if exit_filled:
                     logger.info(f"Exit fills detected: {[e.trade_id for e in exit_filled]}")
             except Exception as e:
@@ -1077,11 +1098,32 @@ class TradingDaemon:
             logger.exception(f"Evening disconnect failed: {e}")
 
     def _cleanup_stale_orders(self):
-        """Clean up stale unfilled orders."""
+        """Clean up stale unfilled orders in DB and in-memory tracking."""
         try:
             cancelled = self.trade_logger.cleanup_stale_orders(max_age_hours=24)
             if cancelled:
                 logger.warning(f"Cleaned up {len(cancelled)} stale orders")
+
+            # Also cleanup in-memory active_exit_orders that are stale (>24h old)
+            stale_exits = []
+            now = datetime.now(ET)
+            for trade_id, exit_order in list(self.active_exit_orders.items()):
+                # Check if order is stale (no progress for >24 hours)
+                trade = self.trade_logger.get_trade(trade_id)
+                if trade and trade.exit_datetime:
+                    try:
+                        exit_time = datetime.fromisoformat(trade.exit_datetime)
+                        if exit_time.tzinfo is None:
+                            exit_time = ET.localize(exit_time)
+                        age_hours = (now - exit_time).total_seconds() / 3600
+                        if age_hours > 24:
+                            stale_exits.append(trade_id)
+                    except Exception:
+                        pass
+
+            for trade_id in stale_exits:
+                del self.active_exit_orders[trade_id]
+                logger.warning(f"Removed stale exit order from tracking: {trade_id}")
         except Exception as e:
             logger.error(f"Failed to cleanup stale orders: {e}")
 
@@ -1106,16 +1148,22 @@ class TradingDaemon:
                 continue
 
             if entry_date <= yesterday and not trade.exit_datetime:
-                # Safe strike parsing
+                # Safe strike parsing with validation
                 strike = 0.0
                 try:
                     import json
                     if trade.strikes:
                         strikes_list = json.loads(trade.strikes)
-                        if strikes_list:
-                            strike = float(strikes_list[0])
-                except Exception as e:
-                    logger.error(f"Error parsing strikes for {trade.ticker}: {e}")
+                        if not isinstance(strikes_list, list):
+                            raise ValueError(f"Strikes not a list: {type(strikes_list)}")
+                        if not strikes_list:
+                            raise ValueError("Empty strikes list")
+                        strike = float(strikes_list[0])
+                        if strike <= 0:
+                            raise ValueError(f"Invalid strike value: {strike}")
+                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                    logger.error(f"{trade.ticker}: Invalid strikes format '{trade.strikes}': {e}")
+                    continue  # Skip this position - invalid data
 
                 contracts = trade.contracts
                 entry_fill_price = trade.entry_fill_price

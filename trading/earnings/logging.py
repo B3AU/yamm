@@ -436,6 +436,10 @@ class TradeLogger:
         """Log a trade entry. Returns trade_id."""
         with sqlite3.connect(self.db_path) as conn:
             data = asdict(trade)
+            # Validate column names against whitelist (security)
+            invalid_cols = set(data.keys()) - TRADE_COLUMNS
+            if invalid_cols:
+                raise ValueError(f"Invalid column names for trades: {invalid_cols}")
             columns = ", ".join(data.keys())
             placeholders = ", ".join(["?" for _ in data])
             conn.execute(

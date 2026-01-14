@@ -58,6 +58,7 @@ def fetch_fmp_prices(symbol: str, start_date: str, end_date: str) -> pd.DataFram
         df['date'] = pd.to_datetime(df['date'])
         return df[['symbol', 'date', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
+        print(f"  Warning: Failed to fetch prices for {symbol}: {e}", file=sys.stderr)
         return pd.DataFrame()
 
 
@@ -82,7 +83,7 @@ def fetch_nasdaq_earnings(from_date: datetime, to_date: datetime, existing_symbo
                         row['date'] = date_str
                         all_rows.append(row)
         except Exception as e:
-            pass
+            print(f"  Warning: Failed to fetch earnings for {date_str}: {e}", file=sys.stderr)
 
         current_date += timedelta(days=1)
         time.sleep(0.1)
@@ -146,7 +147,8 @@ def compute_earnings_moves(symbol: str, earnings_dates: list, prices_df: pd.Data
                 'overnight_move': overnight_move,
                 'overnight_move_abs': abs(overnight_move),
             })
-        except Exception:
+        except Exception as e:
+            print(f"  Warning: Failed to compute moves for {symbol} on {earn_date}: {e}", file=sys.stderr)
             continue
 
     return moves

@@ -24,16 +24,17 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-def is_valid_price(p) -> bool:
+def is_valid_price(p, max_value: float = 100000) -> bool:
     """Check if price is a valid positive number.
 
-    Handles None, NaN, and non-numeric values safely.
+    Handles None, NaN, inf, and non-numeric values safely.
+    Also rejects unreasonably large values (likely data errors).
     """
     if p is None:
         return False
     try:
         f = float(p)
-        return not math.isnan(f) and f > 0
+        return not math.isnan(f) and not math.isinf(f) and 0 < f < max_value
     except (TypeError, ValueError):
         return False
 
@@ -589,7 +590,7 @@ async def screen_candidate_ibkr(
     target_expiry = None
     for exp in expiries:
         exp_date = datetime.strptime(exp, '%Y%m%d').date()
-        if exp_date > earnings_date:
+        if exp_date >= earnings_date:
             target_expiry = exp
             break
 
@@ -626,9 +627,15 @@ async def screen_candidate_ibkr(
                 break
             await asyncio.sleep(0.1)
 
-        # Extract bid/ask
+        # Extract bid/ask - handle None, NaN, and inf
         def _valid(p) -> float:
-            return 0.0 if (p is None or math.isnan(p)) else float(p)
+            if p is None:
+                return 0.0
+            try:
+                f = float(p)
+                return 0.0 if (math.isnan(f) or math.isinf(f)) else f
+            except (TypeError, ValueError):
+                return 0.0
 
         call_bid = _valid(call_ticker.bid)
         call_ask = _valid(call_ticker.ask)
@@ -661,13 +668,29 @@ async def screen_candidate_ibkr(
             call_bid=call_bid, call_ask=call_ask, put_bid=put_bid, put_ask=put_ask
         )
 
-    # Calculate metrics
+    # Calculate metrics with defensive division checks
     call_mid = (call_bid + call_ask) / 2
     put_mid = (put_bid + put_ask) / 2
     straddle_mid = call_mid + put_mid
     straddle_spread = (call_ask - call_bid) + (put_ask - put_bid)
-    spread_pct = (straddle_spread / straddle_mid * 100) if straddle_mid > 0 else 100
-    implied_move_pct = (straddle_mid / spot * 100) if spot > 0 else 0
+
+    # Defensive checks for invalid values
+    if straddle_mid <= 0 or not is_valid_price(straddle_mid):
+        return _rejected_candidate(
+            symbol, earnings_date, timing, f"Invalid straddle mid: {straddle_mid}",
+            spot_price=spot, expiry=target_expiry, atm_strike=atm_strike,
+            call_bid=call_bid, call_ask=call_ask, put_bid=put_bid, put_ask=put_ask
+        )
+
+    if spot <= 0 or not is_valid_price(spot):
+        return _rejected_candidate(
+            symbol, earnings_date, timing, f"Invalid spot price: {spot}",
+            spot_price=spot, expiry=target_expiry, atm_strike=atm_strike,
+            call_bid=call_bid, call_ask=call_ask, put_bid=put_bid, put_ask=put_ask
+        )
+
+    spread_pct = (straddle_spread / straddle_mid * 100)
+    implied_move_pct = (straddle_mid / spot * 100)
 
     # Check liquidity gate
     passes = spread_pct <= spread_threshold

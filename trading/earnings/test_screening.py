@@ -32,17 +32,44 @@ async def main():
         earnings_date = datetime.strptime(args.earnings_date, '%Y-%m-%d').date()
         events = [EarningsEvent(symbol=t, earnings_date=earnings_date, timing=args.timing) for t in args.ticker]
     else:
-        # Fetch from Nasdaq
-        from trading.earnings.screener import fetch_upcoming_earnings
-        events = fetch_upcoming_earnings(days_ahead=args.days_ahead)
+        # Fetch tradeable candidates: Today AMC + Tomorrow BMO
+        from trading.earnings.screener import get_tradeable_candidates
+        import pytz
+        ET = pytz.timezone('US/Eastern')
+        today = datetime.now(ET).date()
+        
+        bmo_tomorrow, amc_today = get_tradeable_candidates(
+            days_ahead=args.days_ahead,
+            fill_timing=True,
+            verify_dates=False,  # Skip FMP verification for faster testing
+        )
+        
+        # Combine: we trade both today AMC and tomorrow BMO in same session
+        events = amc_today + bmo_tomorrow
+        
         if args.ticker:
             events = [e for e in events if e.symbol in args.ticker]
 
-    logger.info(f"Found {len(events)} earnings events")
-    for e in events[:10]:
-        logger.info(f"  {e.symbol}: {e.earnings_date} ({e.timing})")
-    if len(events) > 10:
-        logger.info(f"  ... and {len(events) - 10} more")
+    logger.info(f"Found {len(events)} tradeable earnings events")
+    
+    # Show breakdown by timing
+    from datetime import timedelta
+    import pytz
+    ET = pytz.timezone('US/Eastern')
+    today = datetime.now(ET).date()
+    tomorrow = today + timedelta(days=1)
+    
+    amc_today_syms = [e for e in events if e.earnings_date == today and e.timing == 'AMC']
+    bmo_tomorrow_syms = [e for e in events if e.earnings_date == tomorrow and e.timing == 'BMO']
+    
+    if amc_today_syms:
+        logger.info(f"  Today AMC ({today}): {', '.join(e.symbol for e in amc_today_syms[:10])}")
+        if len(amc_today_syms) > 10:
+            logger.info(f"    ... and {len(amc_today_syms) - 10} more")
+    if bmo_tomorrow_syms:
+        logger.info(f"  Tomorrow BMO ({tomorrow}): {', '.join(e.symbol for e in bmo_tomorrow_syms[:10])}")
+        if len(bmo_tomorrow_syms) > 10:
+            logger.info(f"    ... and {len(bmo_tomorrow_syms) - 10} more")
 
     # Step 2: IBKR screening (if enabled)
     candidates = []
@@ -63,10 +90,8 @@ async def main():
             candidates = passed
 
             logger.info(f"\nScreening: {len(passed)} passed, {len(rejected)} rejected")
-            for r in rejected[:5]:
+            for r in rejected:
                 logger.info(f"  REJECTED {r.symbol}: {r.rejection_reason}")
-            if len(rejected) > 5:
-                logger.info(f"  ... and {len(rejected) - 5} more rejections")
         finally:
             ib.disconnect()
     else:

@@ -18,6 +18,8 @@ import sys
 from datetime import datetime
 import argparse
 
+from extract_metrics import extract_metrics, print_metrics, save_metrics
+
 NOTEBOOKS_DIR = Path(__file__).parent.parent / "notebooks"
 OUTPUT_DIR = Path(__file__).parent.parent / "notebooks" / "runs"
 
@@ -43,13 +45,15 @@ def list_pipeline():
     print(f"Total: {len(PIPELINE)} notebooks")
 
 
-def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = True):
+def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = True,
+                 skip_metrics: bool = False):
     """Run the ML pipeline notebooks in order.
 
     Args:
         start_from: Index of notebook to start from (0-indexed)
         dry_run: If True, only print what would be run
         use_cache: If True, use cached data; if False, refetch from APIs
+        skip_metrics: If True, skip metrics extraction at end
     """
     if start_from >= len(PIPELINE):
         print(f"Error: start_from ({start_from}) >= number of notebooks ({len(PIPELINE)})")
@@ -112,6 +116,19 @@ def run_pipeline(start_from: int = 0, dry_run: bool = False, use_cache: bool = T
     else:
         print("Pipeline complete!")
         print(f"Outputs saved to: {run_dir}")
+
+        # Extract and save metrics
+        if not skip_metrics:
+            print(f"\n{'=' * 60}")
+            print("Extracting metrics...")
+            print(f"{'=' * 60}")
+            try:
+                metrics = extract_metrics()
+                print_metrics(metrics)
+                save_metrics(metrics)
+            except Exception as e:
+                print(f"Warning: Failed to extract metrics: {e}")
+
     print(f"{'=' * 60}")
 
 
@@ -150,6 +167,11 @@ Examples:
         action="store_true",
         help="Refetch data from APIs instead of using cache"
     )
+    parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        help="Skip metrics extraction at end of pipeline"
+    )
 
     args = parser.parse_args()
 
@@ -160,6 +182,7 @@ Examples:
             start_from=args.start_from,
             dry_run=args.dry_run,
             use_cache=not args.refetch,
+            skip_metrics=args.no_metrics,
         )
 
 

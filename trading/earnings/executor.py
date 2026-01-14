@@ -1092,7 +1092,7 @@ async def reprice_exit_to_bid(
             exit_limit_price=straddle_bid,
         )
 
-        # Return updated ExitComboOrder
+        # Return updated ExitComboOrder (preserve conIds from original)
         return ExitComboOrder(
             trade_id=exit_order.trade_id,
             symbol=symbol,
@@ -1102,6 +1102,8 @@ async def reprice_exit_to_bid(
             order_id=call_trade.order.orderId,
             trade=call_trade,
             put_trade=put_trade,
+            call_conId=exit_order.call_conId,
+            put_conId=exit_order.put_conId,
             entry_fill_price=exit_order.entry_fill_price,
             spot_at_entry=exit_order.spot_at_entry,
             status='pending',
@@ -1166,7 +1168,7 @@ async def convert_exit_to_market(
             notes="Converted to market order at close",
         )
 
-        # Return updated ExitComboOrder
+        # Return updated ExitComboOrder (preserve conIds from original)
         return ExitComboOrder(
             trade_id=exit_order.trade_id,
             symbol=symbol,
@@ -1176,6 +1178,8 @@ async def convert_exit_to_market(
             order_id=call_trade.order.orderId,
             trade=call_trade,
             put_trade=put_trade,
+            call_conId=exit_order.call_conId,
+            put_conId=exit_order.put_conId,
             entry_fill_price=exit_order.entry_fill_price,
             spot_at_entry=exit_order.spot_at_entry,
             status='pending',

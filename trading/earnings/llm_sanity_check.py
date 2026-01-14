@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,6 +28,26 @@ TAVILY_API_KEY = os.getenv('TAVILY_API_KEY', '')
 
 # Default model (can be overridden via env)
 DEFAULT_MODEL = os.getenv('LLM_SANITY_MODEL', 'anthropic/claude-3.5-sonnet')
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BACKOFF_FACTOR = 1.0  # 1s, 2s, 4s exponential backoff
+
+
+def _get_retry_session() -> requests.Session:
+    """Create a requests session with retry logic and exponential backoff."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=RETRY_BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,  # Don't raise, let us handle it
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 @dataclass
@@ -107,9 +129,10 @@ def _search_tavily(ticker: str, earnings_date: str) -> tuple[list[str], list[dic
 
     all_results = []
 
+    session = _get_retry_session()
     for query in queries:
         try:
-            response = requests.post(
+            response = session.post(
                 "https://api.tavily.com/search",
                 json={
                     "api_key": TAVILY_API_KEY,
@@ -185,7 +208,8 @@ Analyze and respond with JSON only."""
 
     logger.info(f"Calling OpenRouter with model: {DEFAULT_MODEL}")
 
-    response = requests.post(
+    session = _get_retry_session()
+    response = session.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",

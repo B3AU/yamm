@@ -12,6 +12,7 @@ import logging
 from datetime import date, timedelta
 from typing import Optional
 
+import pytz
 import requests
 from dotenv import load_dotenv
 
@@ -22,6 +23,18 @@ load_dotenv()
 FMP_API_KEY = os.getenv('FMP_API_KEY', '')
 
 logger = logging.getLogger(__name__)
+
+# Timezone for market hours
+ET = pytz.timezone('US/Eastern')
+
+
+def today_et() -> date:
+    """Get today's date in Eastern Time.
+
+    Important for after-hours comparisons when UTC is already next day.
+    """
+    from datetime import datetime
+    return datetime.now(ET).date()
 
 
 def fetch_realized_move(
@@ -236,12 +249,15 @@ def backfill_counterfactuals(
         # Skip if earnings reaction hasn't happened yet
         # BMO: reaction is same day, need exit_date = earnings_date
         # AMC: reaction is next day, need exit_date = earnings_date + 1
-        if non_trade.earnings_timing == 'BMO':
+        # Unknown: treat as AMC (conservative - wait extra day)
+        timing = non_trade.earnings_timing
+        if timing == 'BMO':
             exit_date = earnings_date
-        else:  # AMC
+        else:  # AMC or unknown
             exit_date = earnings_date + timedelta(days=1)
 
-        if exit_date > date.today():
+        # Use ET date to avoid UTC midnight issues
+        if exit_date > today_et():
             skipped += 1
             logger.debug(f"{non_trade.ticker}: Skipping - exit date {exit_date} is in the future")
             continue

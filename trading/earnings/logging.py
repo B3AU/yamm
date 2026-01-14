@@ -202,6 +202,10 @@ class ExecutionMetrics:
 class TradeLogger:
     """SQLite-backed trade logger."""
 
+    # Default timeout for SQLite connections (seconds)
+    # Higher than default 5s to handle concurrent access from daemon
+    DB_TIMEOUT = 30.0
+
     def __init__(self, db_path: Path | str = "data/earnings_trades.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,7 +213,7 @@ class TradeLogger:
 
     def _init_db(self):
         """Initialize database tables."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             # Trades table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
@@ -434,7 +438,7 @@ class TradeLogger:
 
     def log_trade(self, trade: TradeLog) -> str:
         """Log a trade entry. Returns trade_id."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             data = asdict(trade)
             # Validate column names against whitelist (security)
             invalid_cols = set(data.keys()) - TRADE_COLUMNS
@@ -462,7 +466,7 @@ class TradeLogger:
         updates["updated_at"] = datetime.now().isoformat()
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             cursor = conn.execute(
                 f"UPDATE trades SET {set_clause} WHERE trade_id = ?",
                 list(updates.values()) + [trade_id]
@@ -472,8 +476,12 @@ class TradeLogger:
 
     def log_non_trade(self, non_trade: NonTradeLog) -> str:
         """Log a rejected candidate. Returns log_id."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             data = asdict(non_trade)
+            # Validate column names against whitelist (security)
+            invalid_cols = set(data.keys()) - NON_TRADE_COLUMNS
+            if invalid_cols:
+                raise ValueError(f"Invalid column names for non_trades: {invalid_cols}")
             columns = ", ".join(data.keys())
             placeholders = ", ".join(["?" for _ in data])
             conn.execute(
@@ -495,7 +503,7 @@ class TradeLogger:
 
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             cursor = conn.execute(
                 f"UPDATE non_trades SET {set_clause} WHERE log_id = ?",
                 list(updates.values()) + [log_id]
@@ -521,7 +529,7 @@ class TradeLogger:
         ts = datetime.now().isoformat()
         details_json = json.dumps(details) if details else None
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.execute("""
                 INSERT INTO order_events (
                     trade_id, ib_order_id, ts, event, status,
@@ -537,7 +545,7 @@ class TradeLogger:
 
     def log_snapshot(self, snapshot: SnapshotLog) -> None:
         """Log an intraday price snapshot for a position."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.execute("""
                 INSERT INTO price_snapshots (
                     trade_id, ts, minutes_since_open, straddle_mid,
@@ -566,7 +574,7 @@ class TradeLogger:
         trade_id: str = None,
     ) -> None:
         """Log an LLM sanity check result."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.execute("""
                 INSERT INTO llm_checks (
                     ts, ticker, trade_id, decision, risk_flags, reasons,
@@ -603,7 +611,7 @@ class TradeLogger:
         if hasattr(earnings_date, 'isoformat'):
             earnings_date = earnings_date.isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO earnings_calendar (
                     symbol, earnings_date, timing, eps_estimate, revenue_estimate,
@@ -622,7 +630,7 @@ class TradeLogger:
 
     def get_earnings_calendar(self, from_date=None, to_date=None, source: str = None) -> list[dict]:
         """Get earnings calendar entries, optionally filtered by date range and source."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
 
             query = "SELECT * FROM earnings_calendar WHERE 1=1"
@@ -651,7 +659,7 @@ class TradeLogger:
 
     def get_snapshots(self, trade_id: str) -> list[SnapshotLog]:
         """Get all snapshots for a trade, ordered by time."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM price_snapshots WHERE trade_id = ? ORDER BY ts",
@@ -674,7 +682,7 @@ class TradeLogger:
 
     def get_latest_order_event(self, trade_id: str) -> Optional[dict]:
         """Get the latest order event for a trade."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM order_events WHERE trade_id = ? ORDER BY event_id DESC LIMIT 1",
@@ -697,7 +705,7 @@ class TradeLogger:
             except (ValueError, TypeError):
                 pass  # Keep original if parsing fails
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("""
                 SELECT * FROM llm_checks
@@ -727,7 +735,7 @@ class TradeLogger:
             AND counterfactual_realized_move IS NULL
             ORDER BY log_datetime DESC
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, (earnings_date,)).fetchall()
             results = []
@@ -739,7 +747,7 @@ class TradeLogger:
 
     def get_trade(self, trade_id: str) -> Optional[TradeLog]:
         """Get a trade by ID."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM trades WHERE trade_id = ?", (trade_id,)
@@ -781,7 +789,7 @@ class TradeLogger:
 
         query += " ORDER BY entry_datetime DESC"
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, params).fetchall()
             results = []
@@ -829,7 +837,7 @@ class TradeLogger:
 
         query += " ORDER BY log_datetime DESC"
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, params).fetchall()
             results = []
@@ -851,7 +859,7 @@ class TradeLogger:
             AND (call_order_id IS NOT NULL OR put_order_id IS NOT NULL)
             ORDER BY entry_datetime DESC
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query).fetchall()
             results = []
@@ -892,7 +900,7 @@ class TradeLogger:
         """
 
         cancelled_ids = []
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, (cutoff,)).fetchall()
 
@@ -952,7 +960,7 @@ class TradeLogger:
 
     def get_summary_stats(self) -> dict:
         """Get summary statistics for dashboard."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT) as conn:
             trades_count = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
             non_trades_count = conn.execute("SELECT COUNT(*) FROM non_trades").fetchone()[0]
 

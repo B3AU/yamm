@@ -7,12 +7,6 @@ from trading.earnings.logging import (
     generate_trade_id,
     generate_log_id,
 )
-from trading.earnings.ib_options import (
-    IBOptionsClient,
-    OptionQuote,
-    StraddleQuote,
-    OptionOrder,
-)
 from trading.earnings.screener import (
     EarningsEvent,
     ScreenedCandidate,
@@ -45,11 +39,6 @@ __all__ = [
     "TradeLogger",
     "generate_trade_id",
     "generate_log_id",
-    # IB Client
-    "IBOptionsClient",
-    "OptionQuote",
-    "StraddleQuote",
-    "OptionOrder",
     # Screener
     "EarningsEvent",
     "ScreenedCandidate",

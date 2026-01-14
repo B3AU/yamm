@@ -132,17 +132,19 @@ def get_market_status() -> tuple[str, str]:
 def format_time_until(target_dt: datetime, now: datetime = None) -> str:
     """Format time until a target datetime."""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
-    # Ensure consistent timezone awareness
-    if target_dt.tzinfo and not now.tzinfo:
-        target_dt = target_dt.replace(tzinfo=None)
-    elif not target_dt.tzinfo and now.tzinfo:
-        now = now.replace(tzinfo=None)
-    elif target_dt.tzinfo != now.tzinfo:
-        # Convert target to now's timezone if practical, or strip both
-        target_dt = target_dt.replace(tzinfo=None)
-        now = now.replace(tzinfo=None)
+    # Normalize both to UTC for comparison
+    if target_dt.tzinfo is None:
+        # Assume naive datetime is in local time, convert via UTC
+        target_dt = target_dt.replace(tzinfo=timezone.utc)
+    else:
+        target_dt = target_dt.astimezone(timezone.utc)
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
 
     diff = target_dt - now
     total_seconds = diff.total_seconds()
@@ -408,26 +410,26 @@ async def get_live_option_price_async(ib, symbol: str, expiry: str, strike: floa
             return {'error': 'contract not found'}
 
         ticker = ib.reqMktData(opt, '', False, False)
+        try:
+            # Wait longer for data, check incrementally
+            for _ in range(20): # 2 seconds max
+                if ticker.bid and ticker.bid > 0:
+                    break
+                await asyncio.sleep(0.1)
 
-        # Wait longer for data, check incrementally
-        for _ in range(20): # 2 seconds max
-            if ticker.bid and ticker.bid > 0:
-                break
-            await asyncio.sleep(0.1)
+            # IBKR returns -1.0 when no quote is available (market closed, no liquidity)
+            # Also check for NaN
+            def valid_price(p):
+                return p is not None and not math.isnan(p) and p > 0
 
-        # IBKR returns -1.0 when no quote is available (market closed, no liquidity)
-        # Also check for NaN
-        def valid_price(p):
-            return p is not None and not math.isnan(p) and p > 0
-
-        result = {
-            'bid': ticker.bid if valid_price(ticker.bid) else None,
-            'ask': ticker.ask if valid_price(ticker.ask) else None,
-            'last': ticker.last if valid_price(ticker.last) else None,
-        }
-
-        ib.cancelMktData(opt)
-        return result
+            result = {
+                'bid': ticker.bid if valid_price(ticker.bid) else None,
+                'ask': ticker.ask if valid_price(ticker.ask) else None,
+                'last': ticker.last if valid_price(ticker.last) else None,
+            }
+            return result
+        finally:
+            ib.cancelMktData(opt)
     except Exception as e:
         return {'error': str(e)}
 
@@ -865,7 +867,8 @@ def render_dashboard(
     # === Candidate Preview ===
     try:
         # Determine screening date perspective based on market hours
-        et_now = now.astimezone(ET)
+        # Use datetime.now(ET) instead of now.astimezone() to avoid naive datetime issues
+        et_now = datetime.now(ET)
         market_closed = et_now.hour >= 16
 
         # After market close, show NEXT screening session's targets (tomorrow's perspective)

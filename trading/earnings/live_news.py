@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -17,6 +18,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+# Rate limiting for FMP API (5 calls per second max)
+_last_fmp_call_time: float = 0.0
+FMP_MIN_INTERVAL = 0.2  # 200ms between calls (5 calls/sec)
 
 # FMP API (same as training data source)
 FMP_API_KEY = os.getenv('FMP_API_KEY', '')
@@ -82,6 +87,17 @@ def _get_anonymizer():
     return _anonymizer
 
 
+def _rate_limit_fmp():
+    """Enforce rate limiting for FMP API calls."""
+    global _last_fmp_call_time
+    now = time.time()
+    elapsed = now - _last_fmp_call_time
+    if elapsed < FMP_MIN_INTERVAL:
+        sleep_time = FMP_MIN_INTERVAL - elapsed
+        time.sleep(sleep_time)
+    _last_fmp_call_time = time.time()
+
+
 def fetch_fmp_news(
     symbol: str,
     from_date: date,
@@ -110,6 +126,9 @@ def fetch_fmp_news(
         'limit': limit,
         'apikey': FMP_API_KEY,
     }
+
+    # Apply rate limiting before making request
+    _rate_limit_fmp()
 
     try:
         r = requests.get(FMP_NEWS_URL, params=params, timeout=10)
@@ -241,6 +260,16 @@ def get_live_news_pca_features(
     mean_emb = anonymize_and_embed(articles, symbol)
 
     if mean_emb is None:
+        if return_headlines:
+            return len(articles), default_features, headlines
+        return len(articles), default_features
+
+    # Validate embedding dimension before PCA (model expects 768-dim)
+    expected_dim = 768  # BGE-base embedding dimension
+    if mean_emb.shape[0] != expected_dim:
+        logger.error(
+            f"{symbol}: Embedding dimension mismatch - got {mean_emb.shape[0]}, expected {expected_dim}"
+        )
         if return_headlines:
             return len(articles), default_features, headlines
         return len(articles), default_features

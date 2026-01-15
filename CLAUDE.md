@@ -116,6 +116,8 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - Returns decision: `PASS`, `WARN`, or `NO_TRADE`
 - Configurable threshold via environment variable
 - All results logged to `llm_checks` table for analysis
+- **Retry logic** for transient errors (429, 500, 502, 503, 504, 529) with exponential backoff
+- **Timeouts:** 90s per request, 300s overall to prevent indefinite hangs
 
 #### Test Screening (`trading/earnings/test_screening.py`)
 - Standalone script to test ML + LLM pipeline outside daemon
@@ -195,6 +197,7 @@ Exploit volatility mispricing around earnings in semi-illiquid US equities. Use 
 - [x] rvol_percentile feature (alternative to IV percentile)
 - [x] Model retraining pipeline (manual via `scripts/run_ml_pipeline.py`)
 - [x] Code review fixes (Jan 2026) - see below
+- [x] LLM retry logic for app-level errors (OpenRouter 500s in JSON body)
 
 ---
 
@@ -434,6 +437,36 @@ PAPER_MAX_DAILY_TRADES=10
 | **Theta Data** | ~$30-100/mo | Unknown | Popular retail option |
 
 **Current approach:** Synthetic backtest using stock prices + estimated IV (free). ORATS at $99/mo recommended if real options data needed.
+
+### Future Research: ORATS Data Integration
+
+**Priority:** Low (V2+)
+
+**Website:** https://orats.com ($99/month)
+
+**Potential improvements to current long vol strategy:**
+
+1. **Replace synthetic implied move with real IV**
+   - Current: `implied_move = hist_move_mean * 1.3` (fixed multiplier guess)
+   - With ORATS: `implied_move = atm_iv * sqrt(DTE/365)` (actual market-implied)
+   - Impact: More accurate edge calculation, fewer false positive/negative trades
+
+2. **Add IV percentile as ML feature**
+   - Current: Only have `rvol_percentile` (realized vol rank)
+   - With ORATS: Add `iv_percentile` (current IV vs historical IV for symbol)
+   - Impact: Potential +0.1-0.3 Sharpe improvement (hypothesis, needs testing)
+
+3. **Backtest with actual historical option prices**
+   - Current: Synthetic P&L = `actual_move - implied_move - spread`
+   - With ORATS: Use real ATM straddle prices at entry/exit
+   - Impact: More reliable Sharpe/drawdown estimates
+
+**Cost-benefit:** $99/month. Break-even at ~$50k AUM with 2% edge improvement.
+
+**Recommendation:** Not needed for V1 paper trading (use live IBKR data). Consider for V2 if:
+- Backtest accuracy becomes a concern
+- Want to add IV percentile feature
+- Revisiting short vol / iron butterfly strategies
 
 ### Training Data
 

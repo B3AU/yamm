@@ -132,8 +132,11 @@ def setup_logging():
             logging.StreamHandler(),
         ]
     )
-    # Silence ib_insync noise
+    # Silence noisy third-party loggers
     logging.getLogger('ib_insync').setLevel(logging.WARNING)
+    logging.getLogger('yfinance').setLevel(logging.WARNING)
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('peewee').setLevel(logging.WARNING)
     return logging.getLogger('earnings_daemon')
 
 logger = setup_logging()
@@ -305,6 +308,19 @@ class TradingDaemon:
 
             if not relevant_events:
                 logger.info("No earnings events requiring entry today")
+                return
+
+            # Filter out symbols we already traded today (before expensive screening/ML/LLM)
+            already_traded_symbols = {t.split('_')[0] for t in self.todays_trades}
+            if already_traded_symbols:
+                before_count = len(relevant_events)
+                relevant_events = [e for e in relevant_events if e.symbol not in already_traded_symbols]
+                skipped = before_count - len(relevant_events)
+                if skipped > 0:
+                    logger.info(f"Skipped {skipped} symbols already traded today: {already_traded_symbols}")
+
+            if not relevant_events:
+                logger.info("No new earnings events to screen (all already traded)")
                 return
 
             # Screen candidates (Async)

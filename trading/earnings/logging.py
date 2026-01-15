@@ -934,6 +934,8 @@ class TradeLogger:
         filled = [t for t in trades if t.status in ("filled", "exited")]
         partial = [t for t in trades if t.status == "partial"]
         cancelled = [t for t in trades if t.status == "cancelled"]
+        # Exclude cancelled from fill rate calculation (they weren't real order attempts)
+        attempted = [t for t in trades if t.status != "cancelled"]
 
         # Slippage calculations (in basis points)
         slippages = []
@@ -943,11 +945,11 @@ class TradeLogger:
                 slippages.append(slippage_bps)
 
         metrics = ExecutionMetrics(
-            total_orders=len(trades),
+            total_orders=len(attempted),
             filled_orders=len(filled),
             partial_fills=len(partial),
             cancelled_orders=len(cancelled),
-            fill_rate=len(filled) / len(trades) if trades else 0,
+            fill_rate=len(filled) / len(attempted) if attempted else 0,
         )
 
         if slippages:

@@ -933,7 +933,7 @@ def render_dashboard(
     if metrics.total_orders >= 1:
         slip_str = f" | Slip: {metrics.avg_slippage_bps:.0f}bps" if metrics.avg_slippage_bps != 0 else ""
         if metrics.total_orders >= 5:
-            recent_trades = [t for t in all_trades if t.status in ('filled', 'exited', 'cancelled')][-10:]
+            recent_trades = [t for t in all_trades if t.status in ('filled', 'exited')][-10:]
             if recent_trades:
                 recent_fills = sum(1 for t in recent_trades if t.status in ('filled', 'exited'))
                 recent_fill_rate = recent_fills / len(recent_trades) * 100

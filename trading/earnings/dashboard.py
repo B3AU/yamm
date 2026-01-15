@@ -464,16 +464,20 @@ async def get_position_live_value_async(ib, trade) -> Optional[dict]:
         if call_data and put_data:
             call_mid = None
             put_mid = None
+            call_used_last = False
+            put_used_last = False
 
             if call_data.get('bid') and call_data.get('ask'):
                 call_mid = (call_data['bid'] + call_data['ask']) / 2
             elif call_data.get('last'):
                 call_mid = call_data['last']
+                call_used_last = True
 
             if put_data.get('bid') and put_data.get('ask'):
                 put_mid = (put_data['bid'] + put_data['ask']) / 2
             elif put_data.get('last'):
                 put_mid = put_data['last']
+                put_used_last = True
 
             if call_mid and put_mid:
                 current_value = (call_mid + put_mid) * trade.contracts * 100
@@ -487,6 +491,7 @@ async def get_position_live_value_async(ib, trade) -> Optional[dict]:
                     'entry_value': entry_value,
                     'unrealized_pnl': current_value - entry_value if entry_value else None,
                     'pnl_pct': ((call_mid + put_mid) / trade.entry_quoted_mid - 1) * 100 if trade.entry_quoted_mid else None,
+                    'used_last': call_used_last or put_used_last,
                 }
             else:
                 # No valid prices
@@ -617,7 +622,11 @@ def render_dashboard(
                     else:
                         has_live_data = True
                         current_price = f"${live_data['straddle_mid']:.2f}"
-                        current_price_short = f"${live_data['straddle_mid']:.2f}"
+                        # Yellow if using 'last' price fallback (no live bid/ask)
+                        if live_data.get('used_last'):
+                            current_price_short = f"\033[93m${live_data['straddle_mid']:.2f}\033[0m"
+                        else:
+                            current_price_short = f"${live_data['straddle_mid']:.2f}"
 
                         if live_data['pnl_pct'] is not None:
                             pnl_pct = live_data['pnl_pct']

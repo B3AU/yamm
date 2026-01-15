@@ -693,8 +693,8 @@ class TradingDaemon:
             call_ticker = self.ib.reqMktData(call, '', False, False)
             put_ticker = self.ib.reqMktData(put, '', False, False)
 
-            # Wait for data
-            for _ in range(20):
+            # Wait for data (4 seconds max for illiquid options)
+            for _ in range(40):
                 if (call_ticker.bid > 0 and call_ticker.ask > 0 and
                     put_ticker.bid > 0 and put_ticker.ask > 0):
                     break
@@ -822,6 +822,7 @@ class TradingDaemon:
                 )
 
                 if not straddle_mid:
+                    logger.warning(f"No quote for {pos['symbol']} - skipping snapshot")
                     continue
 
                 # Calculate unrealized P&L

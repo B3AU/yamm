@@ -1244,7 +1244,9 @@ async def close_position_market(
             ib_order_id=call_trade.order.orderId,
             event='placed',
             status=call_trade.orderStatus.status,
+            filled=0,
             remaining=call_trade.orderStatus.remaining,
+            avg_fill_price=0.0,
             limit_price=0,  # Market order
         )
         trade_logger.log_order_event(
@@ -1252,8 +1254,10 @@ async def close_position_market(
             ib_order_id=put_trade.order.orderId,
             event='placed',
             status=put_trade.orderStatus.status,
+            filled=0,
             remaining=put_trade.orderStatus.remaining,
-            limit_price=0,
+            avg_fill_price=0.0,
+            limit_price=0,  # Market order
         )
 
         return ExitComboOrder(

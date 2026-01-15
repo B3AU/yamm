@@ -238,6 +238,8 @@ Critical bugs fixed from extensive code review:
 
 17. **Dead code cleanup** - Deleted unused `ib_options.py` (488 lines) and `test_ib_options.py` (528 lines), removed exports from `__init__.py`.
 
+18. **Market exit logging** (`executor.py:1242-1257`) - `close_position_market()` was missing required `filled` and `avg_fill_price` arguments to `log_order_event()`, causing force-exit to fail with exception.
+
 ---
 
 ### Analysis Queries (When More Data Available)

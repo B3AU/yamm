@@ -125,7 +125,7 @@ def setup_logging():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper()),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(CONFIG['log_path']),

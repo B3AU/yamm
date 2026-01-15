@@ -648,6 +648,95 @@ class TradingDaemon:
             except Exception as e:
                 logger.error(f"Monitor exit fills failed: {e}")
 
+        # Retry failed exits (runs every minute)
+        try:
+            await self._retry_failed_exits()
+        except Exception as e:
+            logger.error(f"Retry failed exits error: {e}")
+
+    async def _retry_failed_exits(self):
+        """Retry exit orders for positions that don't have one yet.
+        
+        Called every minute from task_monitor_fills() to handle positions
+        where initial exit failed due to no quotes.
+        """
+        import json
+        
+        # Get positions with status='filled' that should be exiting today
+        filled_positions = self.trade_logger.get_trades(status='filled')
+        
+        if not filled_positions:
+            return
+        
+        # Filter to only positions that should exit today
+        today = today_et()
+        positions_needing_exit = []
+        for trade in filled_positions:
+            # Should exit if earnings was yesterday (AMC) or today (BMO)
+            try:
+                earnings_date = datetime.strptime(trade.earnings_date, '%Y-%m-%d').date()
+            except (ValueError, TypeError):
+                continue
+                
+            timing = trade.earnings_timing
+            
+            should_exit_today = False
+            if timing == 'AMC' and earnings_date == today - timedelta(days=1):
+                should_exit_today = True
+            elif timing == 'BMO' and earnings_date == today:
+                should_exit_today = True
+            # Handle weekend edge case: Friday AMC exits Monday
+            elif timing == 'AMC' and today.weekday() == 0:  # Monday
+                # Check if earnings was Friday (3 days ago)
+                if earnings_date == today - timedelta(days=3):
+                    should_exit_today = True
+                    
+            if should_exit_today:
+                positions_needing_exit.append(trade)
+        
+        if not positions_needing_exit:
+            return
+        
+        # Filter out positions already being tracked
+        async with self._exit_orders_lock:
+            already_tracking = set(self.active_exit_orders.keys())
+        
+        for trade in positions_needing_exit:
+            if trade.trade_id in already_tracking:
+                continue
+            
+            logger.debug(f"Retrying exit for {trade.ticker}...")
+            
+            # Parse strike from JSON
+            try:
+                strikes = json.loads(trade.strikes) if trade.strikes else []
+                strike = strikes[0] if strikes else None
+            except (json.JSONDecodeError, TypeError):
+                continue
+            
+            if not strike or not trade.expiration:
+                continue
+            
+            exit_pair = await close_position(
+                self.ib,
+                self.trade_logger,
+                trade_id=trade.trade_id,
+                symbol=trade.ticker,
+                expiry=trade.expiration,
+                strike=strike,
+                contracts=trade.contracts,
+                limit_aggression=CONFIG['limit_aggression'],
+                entry_fill_price=trade.entry_fill_price,
+                spot_at_entry=trade.spot_at_entry,
+            )
+            
+            if exit_pair:
+                logger.info(f"Retry exit succeeded for {trade.ticker}")
+                async with self._exit_orders_lock:
+                    self.active_exit_orders[trade.trade_id] = exit_pair
+            
+            await asyncio.sleep(0.5)  # Brief pause between retries
+
     def _schedule_markouts(self, order):
         """Schedule 1m, 5m, 30m markout checks for a filled order."""
         for delay_m in [1, 5, 30]:

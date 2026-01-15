@@ -33,6 +33,13 @@ DEFAULT_MODEL = os.getenv('LLM_SANITY_MODEL', 'anthropic/claude-3.5-sonnet')
 MAX_RETRIES = 3
 RETRY_BACKOFF_FACTOR = 1.0  # 1s, 2s, 4s exponential backoff
 
+# Timeouts
+OPENROUTER_TIMEOUT = 90  # seconds per LLM request
+OVERALL_LLM_TIMEOUT = 300  # seconds total for check_with_llm()
+
+# App-level error codes that should be retried (OpenRouter returns 200 with error in body)
+RETRYABLE_ERROR_CODES = {429, 500, 502, 503, 504, 529}  # 429=rate limit, 529=overloaded
+
 
 def _get_retry_session() -> requests.Session:
     """Create a requests session with retry logic and exponential backoff."""
@@ -163,6 +170,7 @@ def _call_openrouter(packet: dict, search_results: list[dict]) -> dict:
     """Call OpenRouter LLM with the sanity check prompt.
 
     Returns parsed JSON response or raises exception.
+    Retries on transient app-level errors (500, 502, 503, 504, 429, 529).
     """
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY not set")
@@ -206,75 +214,96 @@ WEB SEARCH RESULTS:
 
 Analyze and respond with JSON only."""
 
-    logger.info(f"Calling OpenRouter with model: {DEFAULT_MODEL}")
-
     session = _get_retry_session()
-    response = session.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": DEFAULT_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "temperature": 0.1,  # Low temperature for consistent output
-            "max_tokens": 5000,  # Enough for reasoning models + response
-        },
-        timeout=30,
-    )
 
-    # Log response status for debugging
-    if not response.ok:
-        logger.error(f"OpenRouter API error: {response.status_code} - {response.text[:500]}")
-    response.raise_for_status()
+    for attempt in range(MAX_RETRIES + 1):
+        attempt_label = f" (attempt {attempt + 1}/{MAX_RETRIES + 1})" if attempt > 0 else ""
+        logger.info(f"Calling OpenRouter with model: {DEFAULT_MODEL}{attempt_label}")
 
-    data = response.json()
+        response = session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": DEFAULT_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                "temperature": 0.1,  # Low temperature for consistent output
+                "max_tokens": 5000,  # Enough for reasoning models + response
+            },
+            timeout=OPENROUTER_TIMEOUT,
+        )
 
-    # Check for API-level errors
-    if "error" in data:
-        raise ValueError(f"OpenRouter error: {data['error']}")
+        # Log response status for debugging
+        if not response.ok:
+            logger.error(f"OpenRouter API error: {response.status_code} - {response.text[:500]}")
+        response.raise_for_status()
 
-    # Extract content
-    if "choices" not in data or not data["choices"]:
-        logger.error(f"Unexpected OpenRouter response: {data}")
-        raise ValueError("No choices in OpenRouter response")
+        data = response.json()
 
-    content = data["choices"][0]["message"]["content"]
+        # Check for app-level errors (OpenRouter sometimes returns 200 with error in body)
+        if "error" in data:
+            error_info = data["error"]
+            error_code = error_info.get("code", 0) if isinstance(error_info, dict) else 0
+            error_msg = error_info.get("message", str(error_info)) if isinstance(error_info, dict) else str(error_info)
 
-    if not content:
-        logger.error(f"Empty content in OpenRouter response: {data}")
-        raise ValueError("Empty content from LLM")
+            # Check if this error is retryable
+            if error_code in RETRYABLE_ERROR_CODES and attempt < MAX_RETRIES:
+                delay = RETRY_BACKOFF_FACTOR * (2 ** attempt)
+                logger.warning(
+                    f"OpenRouter app-level error{attempt_label}, "
+                    f"retrying in {delay:.1f}s: [{error_code}] {error_msg}"
+                )
+                time.sleep(delay)
+                continue
 
-    logger.debug(f"Raw LLM response: {content[:200]}...")
+            # Non-retryable or exhausted retries
+            raise ValueError(f"OpenRouter error: {error_info}")
 
-    # Parse JSON from response (handle markdown code blocks safely)
-    json_content = content
-    if "```json" in content:
-        parts = content.split("```json")
-        if len(parts) > 1:
-            inner_parts = parts[1].split("```")
-            if len(inner_parts) > 0:
-                json_content = inner_parts[0]
-    elif "```" in content:
-        parts = content.split("```")
-        if len(parts) > 2:
-            json_content = parts[1]
+        # Extract content
+        if "choices" not in data or not data["choices"]:
+            logger.error(f"Unexpected OpenRouter response: {data}")
+            raise ValueError("No choices in OpenRouter response")
 
-    try:
-        return json.loads(json_content.strip())
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse failed. Raw content: {content[:500]}")
-        raise  # Re-raise to be caught by outer handler with json_parse_error flag
+        content = data["choices"][0]["message"]["content"]
+
+        if not content:
+            logger.error(f"Empty content in OpenRouter response: {data}")
+            raise ValueError("Empty content from LLM")
+
+        logger.debug(f"Raw LLM response: {content[:200]}...")
+
+        # Parse JSON from response (handle markdown code blocks safely)
+        json_content = content
+        if "```json" in content:
+            parts = content.split("```json")
+            if len(parts) > 1:
+                inner_parts = parts[1].split("```")
+                if len(inner_parts) > 0:
+                    json_content = inner_parts[0]
+        elif "```" in content:
+            parts = content.split("```")
+            if len(parts) > 2:
+                json_content = parts[1]
+
+        try:
+            return json.loads(json_content.strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse failed. Raw content: {content[:500]}")
+            raise  # Re-raise to be caught by outer handler with json_parse_error flag
+
+    # Should never reach here, but just in case
+    raise ValueError("OpenRouter failed after all retries")
 
 
 async def check_with_llm(
     packet: dict,
     trade_logger=None,  # TradeLogger for logging results
-    ticker: str = None,
+    ticker: Optional[str] = None,
 ) -> SanityResult:
     """Run LLM sanity check on a trade packet.
 
@@ -292,6 +321,53 @@ async def check_with_llm(
     # Default result for errors - fail-closed for safety
     default_result = SanityResult(
         decision="NO_TRADE",  # Fail closed - block trades on LLM errors to prevent trading halted stocks etc.
+        risk_flags=["api_failure"],
+        reasons=["LLM check failed, blocking trade for safety"],
+        search_queries=[],
+        search_results=[],
+        model=DEFAULT_MODEL,
+        latency_ms=0,
+        raw_response={},
+    )
+
+    try:
+        # Wrap in overall timeout to prevent indefinite hangs
+        return await asyncio.wait_for(
+            _check_with_llm_inner(packet, trade_logger, ticker, start_time),
+            timeout=OVERALL_LLM_TIMEOUT,
+        )
+
+    except asyncio.TimeoutError:
+        elapsed = int(time.time() - start_time)
+        logger.error(f"{ticker}: LLM check timed out after {elapsed}s (limit: {OVERALL_LLM_TIMEOUT}s)")
+        default_result.reasons = [f"Overall timeout after {elapsed}s", "Trade blocked for safety"]
+        default_result.risk_flags = ["api_failure", "overall_timeout"]
+        default_result.latency_ms = elapsed * 1000
+        return default_result
+
+    except Exception as e:
+        # Catch-all for any unexpected errors not handled by inner function
+        logger.exception(f"{ticker}: Unexpected error in LLM sanity check: {e}")
+        default_result.reasons = [f"Unexpected error: {e}", "Trade blocked for safety"]
+        default_result.risk_flags = ["api_failure", "unexpected_error"]
+        default_result.latency_ms = int((time.time() - start_time) * 1000)
+        return default_result
+
+
+async def _check_with_llm_inner(
+    packet: dict,
+    trade_logger,
+    ticker: str,
+    start_time: float,
+) -> SanityResult:
+    """Inner implementation of check_with_llm (extracted for timeout wrapper).
+
+    This function contains the actual LLM check logic. It's separated to allow
+    the outer function to wrap it with asyncio.wait_for() for overall timeout.
+    """
+    # Default result for errors - fail-closed for safety
+    default_result = SanityResult(
+        decision="NO_TRADE",
         risk_flags=["api_failure"],
         reasons=["LLM check failed, blocking trade for safety"],
         search_queries=[],
@@ -369,8 +445,8 @@ async def check_with_llm(
         return default_result
 
     except requests.Timeout as e:
-        logger.error(f"{ticker}: LLM API timeout after 30s: {e}")
-        default_result.reasons = [f"LLM API timeout: {e}", "Trade blocked for safety"]
+        logger.error(f"{ticker}: LLM API timeout after {OPENROUTER_TIMEOUT}s: {e}")
+        default_result.reasons = [f"LLM API timeout after {OPENROUTER_TIMEOUT}s: {e}", "Trade blocked for safety"]
         default_result.risk_flags = ["api_failure", "timeout"]
         return default_result
 

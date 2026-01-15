@@ -41,6 +41,7 @@ load_dotenv(PROJECT_ROOT / '.env')
 
 from trading.earnings.logging import TradeLogger
 from trading.earnings.screener import get_tradeable_candidates
+from trading.earnings.utils import should_exit_today
 
 DB_PATH = PROJECT_ROOT / 'data' / 'earnings_trades.db'
 LOG_PATH = PROJECT_ROOT / 'logs' / 'daemon.log'
@@ -642,6 +643,15 @@ def render_dashboard(
                 status_display = "PARTIAL!"
             elif trade.status == 'exiting':
                 status_display = "EXIT"
+            elif trade.status == 'filled':
+                # Check if should be exiting today but no exit order placed (stuck)
+                try:
+                    earnings_date = datetime.strptime(trade.earnings_date, '%Y-%m-%d').date()
+                    if should_exit_today(earnings_date, trade.earnings_timing):
+                        status_display = "STUCK"
+                        status_color = '\033[91m'  # Red for urgency
+                except (ValueError, TypeError):
+                    pass
 
             if compact:
                 # Compact: single line with key info

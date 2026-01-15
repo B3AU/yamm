@@ -62,17 +62,13 @@ from trading.earnings.executor import (
 from trading.earnings.logging import TradeLogger, SnapshotLog
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
 from trading.earnings.counterfactual import backfill_counterfactuals
+from trading.earnings.utils import today_et, should_exit_today
 
 # Load environment
 load_dotenv(PROJECT_ROOT / '.env')
 
 # Timezone
 ET = pytz.timezone('US/Eastern')
-
-
-def today_et() -> date:
-    """Get today's date in Eastern Time."""
-    return datetime.now(ET).date()
 
 # Check if paper trading mode
 PAPER_MODE = os.getenv('PAPER_MODE', 'true').lower() == 'true'
@@ -688,26 +684,12 @@ class TradingDaemon:
         today = today_et()
         positions_needing_exit = []
         for trade in filled_positions:
-            # Should exit if earnings was yesterday (AMC) or today (BMO)
             try:
                 earnings_date = datetime.strptime(trade.earnings_date, '%Y-%m-%d').date()
             except (ValueError, TypeError):
                 continue
-                
-            timing = trade.earnings_timing
             
-            should_exit_today = False
-            if timing == 'AMC' and earnings_date == today - timedelta(days=1):
-                should_exit_today = True
-            elif timing == 'BMO' and earnings_date == today:
-                should_exit_today = True
-            # Handle weekend edge case: Friday AMC exits Monday
-            elif timing == 'AMC' and today.weekday() == 0:  # Monday
-                # Check if earnings was Friday (3 days ago)
-                if earnings_date == today - timedelta(days=3):
-                    should_exit_today = True
-                    
-            if should_exit_today:
+            if should_exit_today(earnings_date, trade.earnings_timing, today):
                 positions_needing_exit.append(trade)
         
         if not positions_needing_exit:
@@ -1134,7 +1116,7 @@ class TradingDaemon:
             logger.exception(f"Force exit failed: {e}")
 
     async def _force_exit_orphaned_positions(self):
-        """Force exit positions that are stuck in 'exiting' status."""
+        """Force exit positions that are stuck in 'exiting' or 'filled' status."""
         import json
 
         try:
@@ -1164,34 +1146,65 @@ class TradingDaemon:
                     continue
 
                 # Position exists but we're not tracking it - force exit with market order
-                logger.warning(f"{trade.ticker}: Orphaned position found - forcing market exit")
+                logger.warning(f"{trade.ticker}: Orphaned 'exiting' position - forcing market exit")
 
-                # Parse strike
-                strike = 0.0
+                await self._force_exit_trade(trade, json)
+
+            # Also force-exit 'filled' positions that should have exited today
+            # (these never got an exit order due to no quotes all day)
+            filled_trades = self.trade_logger.get_trades(status='filled')
+            today = today_et()
+
+            for trade in filled_trades:
+                # Skip if already tracking
+                if trade.trade_id in self.active_exit_orders:
+                    continue
+
+                # Check if should exit today
                 try:
-                    if trade.strikes:
-                        strikes_list = json.loads(trade.strikes)
-                        if strikes_list:
-                            strike = float(strikes_list[0])
-                except Exception:
-                    pass
+                    earnings_date = datetime.strptime(trade.earnings_date, '%Y-%m-%d').date()
+                except (ValueError, TypeError):
+                    continue
 
-                # Use market order exit (no quotes needed)
-                exit_order = await close_position_market(
-                    self.ib, self.trade_logger, trade.trade_id,
-                    trade.ticker, trade.expiration, strike, trade.contracts,
-                    entry_fill_price=trade.entry_fill_price,
-                    spot_at_entry=trade.spot_at_entry
-                )
+                if not should_exit_today(earnings_date, trade.earnings_timing, today):
+                    continue
 
-                if exit_order:
-                    self.active_exit_orders[trade.trade_id] = exit_order
-                    logger.info(f"{trade.ticker}: Market exit order placed")
-                else:
-                    logger.error(f"{trade.ticker}: FAILED to place market exit - MANUAL CLOSE REQUIRED")
+                # Check if position actually exists in IBKR
+                if trade.ticker not in position_symbols:
+                    continue
+
+                logger.warning(f"{trade.ticker}: Never got exit order (no quotes all day) - forcing market exit")
+
+                await self._force_exit_trade(trade, json)
 
         except Exception as e:
             logger.error(f"Failed to force exit orphaned positions: {e}")
+
+    async def _force_exit_trade(self, trade, json_module):
+        """Helper to force exit a single trade with market order."""
+        # Parse strike
+        strike = 0.0
+        try:
+            if trade.strikes:
+                strikes_list = json_module.loads(trade.strikes)
+                if strikes_list:
+                    strike = float(strikes_list[0])
+        except Exception:
+            pass
+
+        # Use market order exit (no quotes needed)
+        exit_order = await close_position_market(
+            self.ib, self.trade_logger, trade.trade_id,
+            trade.ticker, trade.expiration, strike, trade.contracts,
+            entry_fill_price=trade.entry_fill_price,
+            spot_at_entry=trade.spot_at_entry
+        )
+
+        if exit_order:
+            self.active_exit_orders[trade.trade_id] = exit_order
+            logger.info(f"{trade.ticker}: Market exit order placed")
+        else:
+            logger.error(f"{trade.ticker}: FAILED to place market exit - MANUAL CLOSE REQUIRED")
 
     async def task_evening_disconnect(self):
         """4:05 PM ET - Disconnect."""

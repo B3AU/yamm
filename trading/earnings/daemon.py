@@ -1772,15 +1772,15 @@ class TradingDaemon:
 
         now = datetime.now(ET)
 
-        # Original schedule: screen at 14:00.
-        # But we'll allow catch-up if restarted between 14:00 and 21:00 (market hours + after hours)
+        # Scheduled screening is at 14:15 ET (after 14:00 exits).
+        # Allow catch-up if restarted between 14:15 and 21:00 (market hours + after hours)
         # to ensure we don't miss anything if daemon crashes.
         # CRITICAL: Must rely on _load_todays_activity() to prevent duplicates!
 
-        start = now.replace(hour=14, minute=0, second=0)
+        start = now.replace(hour=14, minute=15, second=0)
         end = now.replace(hour=21, minute=0, second=0)
 
-        # If between 14:00 and 21:00 ET on a weekday
+        # If between 14:15 and 21:00 ET on a weekday
         if now.weekday() < 5 and start <= now < end:
             # Check for existing trades loaded from DB
             if self.todays_trades:
@@ -1796,7 +1796,7 @@ class TradingDaemon:
             # Ideally we check if we already have non_trades for this earnings date too.
             # For now, relying on todays_trades matches + logic in task_screen_candidates is better.
 
-            logger.info(f"STARTUP: Running screening (missed 14:00 scheduled time)")
+            logger.info(f"STARTUP: Running screening (missed 14:15 scheduled time)")
             await self.task_screen_candidates()
         else:
             logger.info("STARTUP: Outside screening window (14:00-21:00 ET), waiting for next schedule.")

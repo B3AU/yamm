@@ -998,12 +998,12 @@ def render_dashboard(
     if non_trades:
         with_cf = [nt for nt in non_trades if nt.counterfactual_pnl is not None]
         if with_cf:
-            total_cf_pnl = sum(nt.counterfactual_pnl for nt in with_cf)
-            profitable_cf = sum(1 for nt in with_cf if nt.counterfactual_pnl > 0)
+            total_cf_pnl = sum(float(nt.counterfactual_pnl or 0) for nt in with_cf)
+            profitable_cf = sum(1 for nt in with_cf if float(nt.counterfactual_pnl or 0) > 0)
             cf_win_rate = profitable_cf / len(with_cf) * 100
             cf_color = '\033[92m' if total_cf_pnl >= 0 else '\033[91m'
             with_spread = [nt for nt in non_trades if nt.counterfactual_pnl_with_spread is not None]
-            spread_pnl = sum(nt.counterfactual_pnl_with_spread for nt in with_spread) if with_spread else 0
+            spread_pnl = sum(float(nt.counterfactual_pnl_with_spread or 0) for nt in with_spread) if with_spread else 0
             spread_color = '\033[92m' if spread_pnl >= 0 else '\033[91m'
             from collections import Counter
             recent_reasons = Counter(nt.rejection_reason for nt in non_trades[:20] if nt.rejection_reason)

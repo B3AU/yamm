@@ -410,9 +410,8 @@ class TestBackfillCounterfactuals:
         )
 
         # Set exit date to past so it's processed
-        with patch('trading.earnings.counterfactual.date') as mock_date:
-            mock_date.today.return_value = date(2026, 2, 15)
-            mock_date.side_effect = lambda *args, **kwargs: date(*args, **kwargs)
+        with patch('trading.earnings.counterfactual.today_et') as mock_today_et:
+            mock_today_et.return_value = date(2026, 2, 15)
 
             result = backfill_counterfactuals(mock_logger, date(2026, 1, 30))
 
@@ -429,9 +428,8 @@ class TestBackfillCounterfactuals:
         mock_logger.get_non_trades_pending_counterfactual.return_value = [mock_non_trade]
 
         # Exit date is in future
-        with patch('trading.earnings.counterfactual.date') as mock_date:
-            mock_date.today.return_value = date(2026, 1, 30)  # Same as earnings
-            mock_date.side_effect = lambda *args, **kwargs: date(*args, **kwargs)
+        with patch('trading.earnings.counterfactual.today_et') as mock_today_et:
+            mock_today_et.return_value = date(2026, 1, 30)  # Same as earnings
 
             result = backfill_counterfactuals(mock_logger, date(2026, 1, 30))
 

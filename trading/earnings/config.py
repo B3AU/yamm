@@ -22,7 +22,7 @@ BACKFILL_TIME_ET = os.getenv('BACKFILL_TIME_ET', '16:30')
 
 # Hour ranges for recurring jobs
 SNAPSHOT_START_HOUR = int(os.getenv('SNAPSHOT_START_HOUR', '9'))
-SNAPSHOT_END_HOUR = int(os.getenv('SNAPSHOT_END_HOUR', '15'))
+SNAPSHOT_END_HOUR = int(os.getenv('SNAPSHOT_END_HOUR', '16'))
 MONITOR_FILLS_START_HOUR = int(os.getenv('MONITOR_FILLS_START_HOUR', '14'))
 MONITOR_FILLS_END_HOUR = int(os.getenv('MONITOR_FILLS_END_HOUR', '16'))
 

@@ -833,8 +833,8 @@ def render_dashboard(
         print(bold("  EXITING POSITIONS"))
 
         if compact:
-            print(f"  {'Sym':<6}{'Status':<8}{'C Exit':<10}{'P Exit':<10}{'Realized':<10}{'Unreal':<8}{'Est P&L':<10}{'Exp'}")
-            print("  " + "-" * 70)
+            print(f"  {'Sym':<6}{'Status':<8}{'C Exit':<10}{'P Exit':<10}{'Realized':<10}{'Unreal':<12}{'Est P&L':<10}{'Exp'}")
+            print("  " + "-" * 74)
         else:
             print(f"  {'Symbol':<8} {'Status':<12} {'Call Exit':<12} {'Put Exit':<12} {'Realized':<12} {'Unrealized':<10}")
             print("  " + "-" * 80)
@@ -981,7 +981,7 @@ def render_dashboard(
                 line += call_padded
                 line += put_padded
                 line += f"{realized_color if has_realized else ''}{realized_str:<10}{reset_color()}"
-                line += f"{unrealized_str:<8}"
+                line += f"{unrealized_str:<12}"
                 line += f"{est_pnl_color}{est_pnl_str:<10}{reset_color()}"
                 line += exp_str
                 print(line)

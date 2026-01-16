@@ -547,13 +547,42 @@ class Phase0Executor:
 
                 # Check fills history before assuming the order is truly gone
                 fills = self.ib.fills()
-                order_filled = any(f.execution.orderId == order_id for f in fills)
+                order_fills = [f for f in fills if f.execution.orderId == order_id]
 
-                if order_filled:
-                    logger.info(f"{trade.ticker}: Order {order_id} found in fills, marking as filled")
+                if order_fills:
+                    # Extract fill details from fills history
+                    total_shares = sum(f.execution.shares for f in order_fills)
+                    if total_shares > 0:
+                        avg_fill_price = sum(f.execution.shares * f.execution.price for f in order_fills) / total_shares
+                    else:
+                        avg_fill_price = order_fills[0].execution.price if order_fills else 0
+
+                    # Extract per-leg prices
+                    call_fill_price = None
+                    put_fill_price = None
+                    for f in order_fills:
+                        if f.contract.right == 'C':
+                            call_fill_price = f.execution.price
+                        elif f.contract.right == 'P':
+                            put_fill_price = f.execution.price
+
+                    # Get fill time from first fill
+                    fill_time = order_fills[0].execution.time if order_fills else None
+                    fill_time_str = fill_time.isoformat() if hasattr(fill_time, 'isoformat') else str(fill_time) if fill_time else datetime.now().isoformat()
+
+                    # Calculate premium_paid
+                    contracts = trade.contracts or 1
+                    premium_paid = avg_fill_price * contracts * 100
+
+                    logger.info(f"{trade.ticker}: Order {order_id} recovered from fills @ ${avg_fill_price:.2f}")
                     self.logger.update_trade(
                         trade.trade_id,
                         status='filled',
+                        entry_fill_price=avg_fill_price,
+                        call_entry_fill_price=call_fill_price,
+                        put_entry_fill_price=put_fill_price,
+                        entry_fill_time=fill_time_str,
+                        premium_paid=premium_paid,
                         notes='Recovered from fills history'
                     )
                     continue
@@ -589,18 +618,37 @@ class Phase0Executor:
             # Get fill price if available
             if order_status == 'filled':
                 combo_order.fill_price = ib_trade.orderStatus.avgFillPrice
+                avg_fill_price = ib_trade.orderStatus.avgFillPrice
 
                 # Extract per-leg fill prices if available
                 call_fill_price = None
                 put_fill_price = None
+                fill_time = None
                 for fill in ib_trade.fills:
                     if fill.contract.right == 'C':
                         call_fill_price = fill.execution.price
                     elif fill.contract.right == 'P':
                         put_fill_price = fill.execution.price
+                    if fill_time is None:
+                        fill_time = fill.execution.time
 
-                # Update DB with per-leg prices if we got them and they're not already set
-                if (call_fill_price or put_fill_price) and trade.call_entry_fill_price is None:
+                # Update DB with fill details if not already set
+                if trade.entry_fill_price is None or trade.premium_paid is None or trade.premium_paid == 0:
+                    contracts = trade.contracts or 1
+                    premium_paid = avg_fill_price * contracts * 100
+                    fill_time_str = fill_time.isoformat() if hasattr(fill_time, 'isoformat') else str(fill_time) if fill_time else datetime.now().isoformat()
+
+                    self.logger.update_trade(
+                        trade.trade_id,
+                        entry_fill_price=avg_fill_price,
+                        call_entry_fill_price=call_fill_price,
+                        put_entry_fill_price=put_fill_price,
+                        entry_fill_time=fill_time_str,
+                        premium_paid=premium_paid,
+                    )
+                    logger.info(f"{trade.ticker}: Updated entry fill details from recovered order @ ${avg_fill_price:.2f}")
+                elif (call_fill_price or put_fill_price) and trade.call_entry_fill_price is None:
+                    # Just update per-leg prices if main fields already set
                     self.logger.update_trade(
                         trade.trade_id,
                         call_entry_fill_price=call_fill_price,

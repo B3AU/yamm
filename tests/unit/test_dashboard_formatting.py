@@ -12,7 +12,6 @@ from trading.earnings.dashboard import (
     get_market_status,
     make_sparkline,
     format_time_until,
-    format_time_since,
     get_status_color,
     reset_color,
     bold,
@@ -257,56 +256,6 @@ class TestFormatTimeUntil:
         result = format_time_until(target, now)
 
         assert result == "passed"
-
-
-class TestFormatTimeSince:
-    """Tests for format_time_since function."""
-
-    def test_hours_ago(self):
-        """Should format hours ago."""
-        now = datetime(2026, 1, 28, 14, 0, 0, tzinfo=timezone.utc)
-        past = datetime(2026, 1, 28, 10, 0, 0, tzinfo=timezone.utc)
-
-        result = format_time_since(past, now)
-
-        assert "4h" in result
-        assert "ago" in result
-
-    def test_minutes_ago(self):
-        """Should format minutes when less than hour."""
-        now = datetime(2026, 1, 28, 10, 30, 0, tzinfo=timezone.utc)
-        past = datetime(2026, 1, 28, 10, 15, 0, tzinfo=timezone.utc)
-
-        result = format_time_since(past, now)
-
-        assert "15m" in result
-        assert "ago" in result
-
-    def test_days_ago(self):
-        """Should show days for long periods."""
-        now = datetime(2026, 1, 31, 10, 0, 0, tzinfo=timezone.utc)
-        past = datetime(2026, 1, 28, 10, 0, 0, tzinfo=timezone.utc)
-
-        result = format_time_since(past, now)
-
-        assert "3d" in result
-
-    def test_string_datetime_input(self):
-        """Should handle ISO string input."""
-        now = datetime(2026, 1, 28, 14, 0, 0, tzinfo=timezone.utc)
-
-        result = format_time_since("2026-01-28T10:00:00", now)
-
-        assert "ago" in result
-
-    def test_future_time(self):
-        """Should return 'future' for future time."""
-        now = datetime(2026, 1, 28, 10, 0, 0, tzinfo=timezone.utc)
-        past = datetime(2026, 1, 28, 14, 0, 0, tzinfo=timezone.utc)
-
-        result = format_time_since(past, now)
-
-        assert result == "future"
 
 
 class TestGetStatusColor:

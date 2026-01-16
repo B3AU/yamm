@@ -171,43 +171,6 @@ def format_time_until(target_dt: datetime, now: datetime = None) -> str:
         return f"in {minutes}m"
 
 
-def format_time_since(past_dt: datetime, now: datetime = None) -> str:
-    """Format time since a past datetime."""
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    if isinstance(past_dt, str):
-        past_dt = datetime.fromisoformat(past_dt)
-
-    # Convert both to UTC for proper comparison
-    if past_dt.tzinfo:
-        past_dt = past_dt.astimezone(timezone.utc)
-    else:
-        past_dt = past_dt.replace(tzinfo=timezone.utc)
-
-    if now.tzinfo:
-        now = now.astimezone(timezone.utc)
-    else:
-        now = now.replace(tzinfo=timezone.utc)
-
-    diff = now - past_dt
-    total_seconds = diff.total_seconds()
-
-    if total_seconds < 0:
-        return "future"
-
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-
-    if hours > 24:
-        days = hours // 24
-        return f"{days}d ago"
-    elif hours > 0:
-        return f"{hours}h {minutes}m ago"
-    else:
-        return f"{minutes}m ago"
-
-
 def format_age_compact(past_dt: datetime, now: datetime = None) -> str:
     """Format age as compact string (e.g., '12h', '1.5d')."""
     if past_dt is None:
@@ -520,7 +483,6 @@ def render_dashboard(
     logger: TradeLogger,
     show_all: bool = False,
     live: bool = False,
-    compact: bool = False,
     live_data_map: Dict[str, Any] = None
 ):
     """Render the dashboard.
@@ -529,7 +491,6 @@ def render_dashboard(
         logger: TradeLogger instance
         show_all: If True, show all trades including completed
         live: If True, indicates live mode enabled (passed for info)
-        compact: If True, show condensed 1-line per position format
         live_data_map: Optional dict mapping trade_id to live data dict
     """
     now = datetime.now()
@@ -618,55 +579,41 @@ def render_dashboard(
     has_live_data = False
 
     if open_trades:
-        if compact:
-            # Compact format: 1 line per position
-            print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<4}")
-            print("  " + "-" * 94)
-        else:
-            print(f"  {'Symbol':<8} {'Earnings':<12} {'Age':<6} {'Status':<10} {'Entry':<10} {'Current':<10} {'P&L':<10} {'LLM':<4}")
-            print("  " + "-" * 88)
+        print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<4}")
+        print("  " + "-" * 94)
 
         for trade in open_trades:
             status_color = get_status_color(trade.status)
 
             # Parse entry info
-            entry_price = "N/A"
             entry_price_short = "N/A"
             if trade.entry_fill_price:
-                entry_price = format_currency(trade.entry_fill_price)
                 entry_price_short = f"${trade.entry_fill_price:.2f}"
             elif trade.entry_quoted_mid:
-                entry_price = f"${trade.entry_quoted_mid:.2f}"
                 entry_price_short = f"${trade.entry_quoted_mid:.2f}"
 
             # Get live prices if available
-            current_price = "N/A"
             current_price_short = "N/A"
             pnl_str = "N/A"
             pnl_color = reset_color()
-            live_error = None
 
             if live_data_map and trade.trade_id in live_data_map:
                 live_data = live_data_map[trade.trade_id]
-                if live_data:
-                    if 'error' in live_data:
-                        live_error = live_data['error']
+                if live_data and 'error' not in live_data:
+                    has_live_data = True
+                    # Yellow if using 'last' price fallback (no live bid/ask)
+                    if live_data.get('used_last'):
+                        current_price_short = f"\033[93m${live_data['straddle_mid']:.2f}\033[0m"
                     else:
-                        has_live_data = True
-                        current_price = f"${live_data['straddle_mid']:.2f}"
-                        # Yellow if using 'last' price fallback (no live bid/ask)
-                        if live_data.get('used_last'):
-                            current_price_short = f"\033[93m${live_data['straddle_mid']:.2f}\033[0m"
-                        else:
-                            current_price_short = f"${live_data['straddle_mid']:.2f}"
+                        current_price_short = f"${live_data['straddle_mid']:.2f}"
 
-                        if live_data['pnl_pct'] is not None:
-                            pnl_pct = live_data['pnl_pct']
-                            pnl_color = '\033[92m' if pnl_pct >= 0 else '\033[91m'
-                            pnl_str = f"{pnl_pct:+.1f}%"
+                    if live_data['pnl_pct'] is not None:
+                        pnl_pct = live_data['pnl_pct']
+                        pnl_color = '\033[92m' if pnl_pct >= 0 else '\033[91m'
+                        pnl_str = f"{pnl_pct:+.1f}%"
 
-                            if live_data['unrealized_pnl'] is not None:
-                                total_unrealized_pnl += live_data['unrealized_pnl']
+                        if live_data['unrealized_pnl'] is not None:
+                            total_unrealized_pnl += live_data['unrealized_pnl']
 
             # Add warning indicator for partial fills and exiting status
             status_display = trade.status
@@ -674,143 +621,51 @@ def render_dashboard(
                 status_display = "PARTIAL!"
             elif trade.status == 'exiting':
                 status_display = "EXIT"
-            # 'filled' just shows as 'filled' - expiration date indicates when it exits
-            # Positions move to EXITING section after 14:00 ET on exit day
 
-            if compact:
-                # Compact: single line with key info
-                import json
-                try:
-                    strikes = json.loads(trade.strikes) if trade.strikes else []
-                except (json.JSONDecodeError, TypeError):
-                    strikes = []
-                strike_str = f"{strikes[0]:.0f}" if strikes else "?"
-                expiry_short = trade.expiration[5:] if trade.expiration else "?"  # MM-DD
-                age_str = format_age_compact(trade.entry_datetime, now)
-                edge_str = f"{trade.edge_q75*100:.0f}%" if trade.edge_q75 else "."
-                impl_str = f"{trade.implied_move*100:.0f}%" if trade.implied_move else "."
+            # Parse strike and expiry
+            import json
+            try:
+                strikes = json.loads(trade.strikes) if trade.strikes else []
+            except (json.JSONDecodeError, TypeError):
+                strikes = []
+            strike_str = f"{strikes[0]:.0f}" if strikes else "?"
+            expiry_short = trade.expiration[4:6] + trade.expiration[6:] if trade.expiration else "?"  # MMDD
+            age_str = format_age_compact(trade.entry_datetime, now)
+            edge_str = f"{trade.edge_q75*100:.0f}%" if trade.edge_q75 else "."
+            impl_str = f"{trade.implied_move*100:.0f}%" if trade.implied_move else "."
 
-                # Entry spread %
-                if trade.entry_quoted_bid and trade.entry_quoted_ask and trade.entry_quoted_mid:
-                    spread = trade.entry_quoted_ask - trade.entry_quoted_bid
-                    spread_pct = (spread / trade.entry_quoted_mid) * 100
-                    sprd_str = f"{spread_pct:.0f}%"
-                else:
-                    sprd_str = "."
-
-                # LLM check result with color
-                llm_check = llm_check_map.get(trade.trade_id)
-                if llm_check:
-                    llm_decision = llm_check['decision']
-                    llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
-                    llm_color = llm_colors.get(llm_decision, '')
-                    llm_str = f"{llm_color}{llm_decision[:4]}{reset_color()}"
-                else:
-                    llm_str = "."
-
-                # Truncate symbol if too long
-                sym = trade.ticker[:5]
-
-                print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
-                      f"{age_str:<5} {strike_str:<7} {expiry_short:<5} "
-                      f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
-                      f"{edge_str:<5} {impl_str:<5} {sprd_str:<5} {llm_str:<4}")
-
-
-                # Only show errors/warnings on second line if critical
-                if trade.status == 'partial' and trade.notes:
-                    print(f"         \033[91m^ {trade.notes}\033[0m")
+            # Entry spread %
+            if trade.entry_quoted_bid and trade.entry_quoted_ask and trade.entry_quoted_mid:
+                spread = trade.entry_quoted_ask - trade.entry_quoted_bid
+                spread_pct = (spread / trade.entry_quoted_mid) * 100
+                sprd_str = f"{spread_pct:.0f}%"
             else:
-                # Full format: multiple lines per position
-                # LLM check result with color
-                llm_check = llm_check_map.get(trade.trade_id)
-                if llm_check:
-                    llm_decision = llm_check['decision']
-                    llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
-                    llm_color = llm_colors.get(llm_decision, '')
-                    llm_str = f"{llm_color}{llm_decision[:4]}{reset_color()}"
-                else:
-                    llm_str = "."
+                sprd_str = "."
 
-                age_str = format_age_compact(trade.entry_datetime, now)
-                print(f"  {trade.ticker:<8} {trade.earnings_date:<12} "
-                      f"{age_str:<6} {status_color}{status_display:<10}{reset_color()} "
-                      f"{entry_price:<10} {current_price:<10} {pnl_color}{pnl_str:<10}{reset_color()} {llm_str:<4}")
+            # LLM check result with color
+            llm_check = llm_check_map.get(trade.trade_id)
+            if llm_check:
+                llm_decision = llm_check['decision']
+                llm_colors = {'PASS': '\033[92m', 'WARN': '\033[93m', 'NO_TRADE': '\033[91m'}
+                llm_color = llm_colors.get(llm_decision, '')
+                llm_str = f"{llm_color}{llm_decision[:4]}{reset_color()}"
+            else:
+                llm_str = "."
 
-                # Show partial fill warning with details
-                if trade.status == 'partial' and trade.notes:
-                    print(f"           \033[91mWARNING: {trade.notes}\033[0m")
+            # Truncate symbol if too long
+            sym = trade.ticker[:5]
 
-                # Show live data error if any
-                if live_error:
-                    print(f"           \033[93m[No quote: {live_error}]\033[0m")
+            print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
+                  f"{age_str:<5} {strike_str:<7} {expiry_short:<5} "
+                  f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
+                  f"{edge_str:<5} {impl_str:<5} {sprd_str:<5} {llm_str:<4}")
 
-                # Show exit order info for exiting positions
-                if trade.status == 'exiting' and trade.exit_limit_price:
-                    exit_info = f"Exit limit: ${trade.exit_limit_price:.2f}"
-                    if trade.exit_quoted_mid:
-                        exit_info += f" (mid: ${trade.exit_quoted_mid:.2f})"
-                    print(f"           \033[96m{exit_info}\033[0m")
-
-                # Show order details on second line
-                if trade.structure:
-                    timing = trade.earnings_timing or "?"
-                    strikes = trade.strikes or "?"
-                    expiry = trade.expiration or "?"
-
-                    # Time context
-                    time_info = ""
-                    if trade.entry_datetime:
-                        time_info = f" | Placed: {format_time_since(trade.entry_datetime, now)}"
-
-                    # Time until earnings
-                    if trade.earnings_date and trade.earnings_timing:
-                        try:
-                            earn_date = datetime.strptime(trade.earnings_date, "%Y-%m-%d")
-                            if trade.earnings_timing == 'BMO':
-                                # BMO: earnings at ~8 AM ET
-                                earn_dt = earn_date.replace(hour=8, minute=0)
-                            else:
-                                # AMC: earnings at ~4:30 PM ET
-                                earn_dt = earn_date.replace(hour=16, minute=30)
-                            time_info += f" | Earnings: {format_time_until(earn_dt, now)}"
-                        except:
-                            pass
-
-                    print(f"           {trade.structure} | Strike: {strikes} | Exp: {expiry} | {timing}{time_info}")
-
-                # Show edge, implied move, and spread
-                spread_str = ""
-                if trade.entry_quoted_bid and trade.entry_quoted_ask and trade.entry_quoted_mid:
-                    spread = trade.entry_quoted_ask - trade.entry_quoted_bid
-                    spread_pct = (spread / trade.entry_quoted_mid) * 100
-                    spread_str = f" | Spread: {spread_pct:.1f}%"
-
-                if trade.edge_q75 is not None:
-                    print(f"           Edge: {format_pct(trade.edge_q75)} | "
-                          f"Pred Q75: {format_pct(trade.predicted_q75)} | "
-                          f"Implied: {format_pct(trade.implied_move)}{spread_str}")
-                elif trade.implied_move is not None:
-                    print(f"           Implied Move: {format_pct(trade.implied_move)}{spread_str}")
-
-                # Show intraday sparkline if snapshots available
-                try:
-                    snapshots = logger.get_snapshots(trade.trade_id)
-                    if snapshots and len(snapshots) >= 2:
-                        values = [s.straddle_mid for s in snapshots if s.straddle_mid]
-                        if len(values) >= 2:
-                            sparkline = make_sparkline(values, width=20)
-                            start_val = values[0]
-                            end_val = values[-1]
-                            change_pct = (end_val / start_val - 1) * 100 if start_val else 0
-                            change_color = '\033[92m' if change_pct >= 0 else '\033[91m'
-                            print(f"           Intraday: {sparkline} {change_color}{change_pct:+.1f}%{reset_color()} ({len(values)} pts)")
-                except Exception:
-                    pass  # Don't fail if snapshots unavailable
-                print()
+            # Only show errors/warnings on second line if critical
+            if trade.status == 'partial' and trade.notes:
+                print(f"         \033[91m^ {trade.notes}\033[0m")
 
         # Show total unrealized P&L and risk summary
-        print("  " + "-" * 88)
+        print("  " + "-" * 94)
 
         # Calculate total capital at risk (= max loss for long straddles)
         total_at_risk = sum(t.premium_paid or 0 for t in open_trades)
@@ -831,12 +686,8 @@ def render_dashboard(
     if exiting_trades:
         print(bold("  EXITING POSITIONS"))
 
-        if compact:
-            print(f"  {'Sym':<6}{'Status':<8}{'C Exit':<10}{'P Exit':<10}{'Realized':<10}{'Unreal':<12}{'Est P&L':<10}{'Exp'}")
-            print("  " + "-" * 74)
-        else:
-            print(f"  {'Symbol':<8} {'Status':<12} {'Call Exit':<12} {'Put Exit':<12} {'Realized':<12} {'Unrealized':<10}")
-            print("  " + "-" * 80)
+        print(f"  {'Sym':<6}{'Status':<8}{'C Exit':<10}{'P Exit':<10}{'Realized':<10}{'Unreal':<12}{'Est P&L':<10}{'Exp'}")
+        print("  " + "-" * 74)
 
         for trade in exiting_trades:
             # Determine status display and color
@@ -969,31 +820,20 @@ def render_dashboard(
                 except (ValueError, TypeError):
                     pass
 
-            if compact:
-                sym = trade.ticker[:5]
-                # Pad strings manually to account for ANSI codes in checkmarks
-                call_padded = call_str + ' ' * max(0, 10 - call_str_len)
-                put_padded = put_str + ' ' * max(0, 10 - put_str_len)
-                # Build line with consistent spacing
-                line = f"  {sym:<6}"
-                line += f"{status_color}{status_display:<8}{reset_color()}"
-                line += call_padded
-                line += put_padded
-                line += f"{realized_color if has_realized else ''}{realized_str:<10}{reset_color()}"
-                line += f"{unrealized_str:<12}"
-                line += f"{est_pnl_color}{est_pnl_str:<10}{reset_color()}"
-                line += exp_str
-                print(line)
-            else:
-                call_padded = call_str + ' ' * (12 - call_str_len)
-                put_padded = put_str + ' ' * (12 - put_str_len)
-                print(f"  {trade.ticker:<8} {status_color}{status_display:<12}{reset_color()}"
-                      f"{call_padded}{put_padded}"
-                      f"{realized_color if has_realized else ''}{realized_str:<12}{reset_color()}"
-                      f"{unrealized_str:<10}")
-                # Show expiration on second line for non-compact
-                print(f"           Expiration: {trade.expiration} ({exp_str})")
-                print()
+            sym = trade.ticker[:5]
+            # Pad strings manually to account for ANSI codes in checkmarks
+            call_padded = call_str + ' ' * max(0, 10 - call_str_len)
+            put_padded = put_str + ' ' * max(0, 10 - put_str_len)
+            # Build line with consistent spacing
+            line = f"  {sym:<6}"
+            line += f"{status_color}{status_display:<8}{reset_color()}"
+            line += call_padded
+            line += put_padded
+            line += f"{realized_color if has_realized else ''}{realized_str:<10}{reset_color()}"
+            line += f"{unrealized_str:<12}"
+            line += f"{est_pnl_color}{est_pnl_str:<10}{reset_color()}"
+            line += exp_str
+            print(line)
 
         print()
 
@@ -1615,7 +1455,6 @@ def main():
     parser.add_argument('--watch', '-w', action='store_true', help='Auto-refresh every 5 seconds')
     parser.add_argument('--all', '-a', action='store_true', help='Show all trades including completed')
     parser.add_argument('--live', '-l', action='store_true', help='Connect to IBKR for live prices')
-    parser.add_argument('--compact', '-c', action='store_true', help='Compact 1-line per position format')
     parser.add_argument('--interval', '-i', type=int, default=30, help='Refresh interval in seconds (default: 30)')
     parser.add_argument('--sound', '-s', action='store_true', help='Play sound on fills (watch mode)')
     args = parser.parse_args()
@@ -1664,11 +1503,11 @@ def main():
 
                          # 3. Clear and Render
                          clear_screen()
-                         render_dashboard(logger, show_all=args.all, live=True, compact=args.compact, live_data_map=live_data_cache)
+                         render_dashboard(logger, show_all=args.all, live=True, live_data_map=live_data_cache)
 
                     else:
                         clear_screen()
-                        render_dashboard(logger, show_all=args.all, live=False, compact=args.compact)
+                        render_dashboard(logger, show_all=args.all, live=False)
 
                     # Sound alerts on state changes (fills, exits)
                     if args.sound:
@@ -1683,9 +1522,8 @@ def main():
                         prev_trade_states.update(current_states)
 
                     mode = "LIVE" if args.live else "DB only"
-                    compact_str = " | COMPACT" if args.compact else ""
                     sound_str = " | SOUND" if args.sound else ""
-                    print(f"  [{mode}{compact_str}{sound_str} | Refreshing every {args.interval}s | c=close, l=llm, r=refresh, q=quit]")
+                    print(f"  [{mode}{sound_str} | Refreshing every {args.interval}s | c=close, l=llm, r=refresh, q=quit]")
 
                     # Wait for interval...
                     start = time.time()
@@ -1726,9 +1564,9 @@ def main():
                              if not isinstance(res, Exception):
                                  live_data_cache[tasks[i][0]] = res
 
-                render_dashboard(logger, show_all=args.all, live=True, compact=args.compact, live_data_map=live_data_cache)
+                render_dashboard(logger, show_all=args.all, live=True, live_data_map=live_data_cache)
             else:
-                render_dashboard(logger, show_all=args.all, live=False, compact=args.compact)
+                render_dashboard(logger, show_all=args.all, live=False)
             disconnect_ib()
 
 

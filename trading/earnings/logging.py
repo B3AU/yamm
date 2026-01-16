@@ -36,6 +36,10 @@ class TradeLog:
     entry_fill_time: Optional[str] = None
     entry_slippage: Optional[float] = None  # fill - mid
 
+    # Per-leg entry tracking (for accurate partial exit P&L)
+    call_entry_fill_price: Optional[float] = None  # Per-share price for call leg
+    put_entry_fill_price: Optional[float] = None   # Per-share price for put leg
+
     # Advanced Execution Metrics (New)
     decision_latency_ms: Optional[float] = None  # ms between quote snapshot and order submit
     fill_latency_seconds: Optional[float] = None # Time from submit to full fill
@@ -110,7 +114,8 @@ TRADE_COLUMNS = {
     'trade_id', 'ticker', 'earnings_date', 'earnings_timing',
     'entry_datetime', 'entry_quoted_bid', 'entry_quoted_ask', 'entry_quoted_mid',
     'entry_limit_price', 'entry_combo_bid', 'entry_combo_ask', 'entry_fill_price',
-    'entry_fill_time', 'entry_slippage', 'decision_latency_ms', 'fill_latency_seconds',
+    'entry_fill_time', 'entry_slippage', 'call_entry_fill_price', 'put_entry_fill_price',
+    'decision_latency_ms', 'fill_latency_seconds',
     'spread_at_fill', 'markout_1min', 'markout_5min', 'markout_30min',
     'structure', 'strikes', 'expiration', 'contracts', 'premium_paid', 'max_loss',
     'predicted_q50', 'predicted_q75', 'predicted_q90', 'predicted_q95',
@@ -333,6 +338,13 @@ class TradeLogger:
             ]:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+            # Add per-leg entry tracking columns (for accurate partial exit P&L)
+            for col in ['call_entry_fill_price', 'put_entry_fill_price']:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
                 except sqlite3.OperationalError:
                     pass  # Column already exists
 

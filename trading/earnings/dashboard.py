@@ -42,6 +42,10 @@ load_dotenv(PROJECT_ROOT / '.env')
 from trading.earnings.logging import TradeLogger
 from trading.earnings.screener import get_tradeable_candidates
 from trading.earnings.utils import should_exit_today
+from trading.earnings.config import (
+    EXIT_TIME_ET, SCREEN_TIME_ET,
+    get_exit_time, get_screen_time,
+)
 
 DB_PATH = PROJECT_ROOT / 'data' / 'earnings_trades.db'
 LOG_PATH = PROJECT_ROOT / 'logs' / 'daemon.log'
@@ -241,12 +245,13 @@ def format_age_compact(past_dt: datetime, now: datetime = None) -> str:
 
 
 def get_next_screen_time() -> Optional[datetime]:
-    """Get next screening time (14:15 ET on weekdays)."""
+    """Get next screening time based on config."""
+    screen_hour, screen_min = get_screen_time()
     now_et = datetime.now(ET)
-    screen_time = now_et.replace(hour=14, minute=15, second=0, microsecond=0)
+    screen_time = now_et.replace(hour=screen_hour, minute=screen_min, second=0, microsecond=0)
 
-    # If past 14:15 today, next screen is tomorrow
-    if now_et.hour > 14 or (now_et.hour == 14 and now_et.minute >= 15):
+    # If past screen time today, next screen is tomorrow
+    if now_et.hour > screen_hour or (now_et.hour == screen_hour and now_et.minute >= screen_min):
         screen_time += timedelta(days=1)
 
     # Skip weekends
@@ -258,12 +263,13 @@ def get_next_screen_time() -> Optional[datetime]:
 
 
 def get_next_exit_time() -> Optional[datetime]:
-    """Get next exit time (14:00 ET on weekdays)."""
+    """Get next exit time based on config."""
+    exit_hour, exit_min = get_exit_time()
     now_et = datetime.now(ET)
-    exit_time = now_et.replace(hour=14, minute=0, second=0, microsecond=0)
+    exit_time = now_et.replace(hour=exit_hour, minute=exit_min, second=0, microsecond=0)
 
-    # If past 14:00 today, next exit is tomorrow
-    if now_et.hour >= 14:
+    # If past exit time today, next exit is tomorrow
+    if now_et.hour > exit_hour or (now_et.hour == exit_hour and now_et.minute >= exit_min):
         exit_time += timedelta(days=1)
 
     # Skip weekends
@@ -867,32 +873,81 @@ def render_dashboard(
                 put_str = "-"
                 put_str_len = 1
 
-            # Realized P&L (from filled legs only)
-            realized_value = trade.exit_value_realized or 0
-            realized_pnl = realized_value - (trade.premium_paid or 0) if realized_value > 0 else 0
-            realized_str = format_currency(realized_pnl) if realized_value > 0 else "-"
+            # Get per-leg entry prices (use 50/50 split as fallback)
+            call_entry = trade.call_entry_fill_price
+            put_entry = trade.put_entry_fill_price
+            if call_entry is None or put_entry is None:
+                # Fallback: 50/50 split of total entry price
+                if trade.entry_fill_price:
+                    call_entry = trade.entry_fill_price / 2
+                    put_entry = trade.entry_fill_price / 2
+                else:
+                    call_entry = None
+                    put_entry = None
+
+            contracts = trade.contracts or 1
+
+            # Realized P&L (from filled exit legs)
+            realized_pnl = 0
+            has_realized = False
+
+            if trade.call_exit_fill_price is not None and call_entry is not None:
+                call_exit_value = trade.call_exit_fill_price * contracts * 100
+                call_entry_value = call_entry * contracts * 100
+                realized_pnl += call_exit_value - call_entry_value
+                has_realized = True
+
+            if trade.put_exit_fill_price is not None and put_entry is not None:
+                put_exit_value = trade.put_exit_fill_price * contracts * 100
+                put_entry_value = put_entry * contracts * 100
+                realized_pnl += put_exit_value - put_entry_value
+                has_realized = True
+
+            realized_str = format_currency(realized_pnl) if has_realized else "-"
             realized_color = '\033[92m' if realized_pnl >= 0 else '\033[91m'
 
-            # Unrealized estimate (from live quotes if available)
+            # Unrealized estimate (unfilled legs)
+            unrealized_pnl = 0
             unrealized_str = "?"
-            unrealized_value = 0
+            has_unrealized = False
+
+            # Get live data for estimates
+            live_data = None
             if live_data_map and trade.trade_id in live_data_map:
                 live_data = live_data_map.get(trade.trade_id)
-                if live_data and 'error' not in live_data:
-                    # Get value of unfilled leg(s)
-                    if trade.call_exit_fill_price is None and live_data.get('call_mid'):
-                        unrealized_value += live_data['call_mid'] * (trade.contracts or 1) * 100
-                    if trade.put_exit_fill_price is None and live_data.get('put_mid'):
-                        unrealized_value += live_data['put_mid'] * (trade.contracts or 1) * 100
-                    if unrealized_value > 0:
-                        unrealized_str = f"~${unrealized_value:.0f}"
-                    elif trade.call_exit_fill_price is not None or trade.put_exit_fill_price is not None:
-                        # One leg filled, other has no quote - probably worthless
-                        unrealized_str = "~$0"
+                if live_data and 'error' in live_data:
+                    live_data = None
+
+            # Check call leg (if not exited)
+            if trade.call_exit_fill_price is None and call_entry is not None:
+                call_entry_value = call_entry * contracts * 100
+                if live_data and live_data.get('call_mid'):
+                    call_current_value = live_data['call_mid'] * contracts * 100
+                    unrealized_pnl += call_current_value - call_entry_value
+                    has_unrealized = True
+                elif trade.put_exit_fill_price is not None:
+                    # Put filled, call has no quote - assume worthless (deep OTM)
+                    unrealized_pnl += 0 - call_entry_value
+                    has_unrealized = True
+
+            # Check put leg (if not exited)
+            if trade.put_exit_fill_price is None and put_entry is not None:
+                put_entry_value = put_entry * contracts * 100
+                if live_data and live_data.get('put_mid'):
+                    put_current_value = live_data['put_mid'] * contracts * 100
+                    unrealized_pnl += put_current_value - put_entry_value
+                    has_unrealized = True
+                elif trade.call_exit_fill_price is not None:
+                    # Call filled, put has no quote - assume worthless (deep OTM)
+                    unrealized_pnl += 0 - put_entry_value
+                    has_unrealized = True
+
+            if has_unrealized:
+                unrealized_str = f"~{format_currency(unrealized_pnl)}"
 
             # Estimated total P&L
-            if realized_value > 0 or unrealized_value > 0:
-                est_total = (realized_value + unrealized_value) - (trade.premium_paid or 0)
+            if has_realized or has_unrealized:
+                est_total = realized_pnl + unrealized_pnl
                 est_pnl_str = format_currency(est_total)
                 est_pnl_color = '\033[92m' if est_total >= 0 else '\033[91m'
             else:
@@ -925,7 +980,7 @@ def render_dashboard(
                 line += f"{status_color}{status_display:<8}{reset_color()}"
                 line += call_padded
                 line += put_padded
-                line += f"{realized_color if realized_value > 0 else ''}{realized_str:<10}{reset_color()}"
+                line += f"{realized_color if has_realized else ''}{realized_str:<10}{reset_color()}"
                 line += f"{unrealized_str:<8}"
                 line += f"{est_pnl_color}{est_pnl_str:<10}{reset_color()}"
                 line += exp_str
@@ -935,7 +990,7 @@ def render_dashboard(
                 put_padded = put_str + ' ' * (12 - put_str_len)
                 print(f"  {trade.ticker:<8} {status_color}{status_display:<12}{reset_color()}"
                       f"{call_padded}{put_padded}"
-                      f"{realized_color if realized_value > 0 else ''}{realized_str:<12}{reset_color()}"
+                      f"{realized_color if has_realized else ''}{realized_str:<12}{reset_color()}"
                       f"{unrealized_str:<10}")
                 # Show expiration on second line for non-compact
                 print(f"           Expiration: {trade.expiration} ({exp_str})")

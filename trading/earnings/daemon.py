@@ -3,16 +3,16 @@
 
 Automated earnings volatility trading with scheduled execution.
 
-Schedule (all times ET):
-- 09:25: Connect to IB Gateway, load positions to exit
-- 14:00: Exit positions from previous day (free up capital first)
-- 14:15: Screen upcoming earnings AND place new orders
-- 14:25-14:55: Price improvements (every 10 min)
-- 15:55: Final fill check, reprice unfilled exits to bid
-- 15:58: Cancel unfilled entry orders, force exit with market orders
-- 16:05: Disconnect (after market close)
-
-Exit positions are handled the next trading day at 14:00.
+Schedule times are configurable via environment variables (see config.py).
+Default schedule (all times ET):
+- MORNING_CONNECT_TIME_ET (09:25): Connect to IB Gateway
+- EXIT_TIME_ET (14:00): Exit positions from previous day
+- SCREEN_TIME_ET (14:15): Screen candidates and place orders
+- PRICE_IMPROVE_START_ET (14:25): Start price improvements (4 rounds)
+- FINAL_CHECK_TIME_ET (15:55): Final fill check
+- FORCE_EXIT_TIME_ET (15:58): Force exit with market orders
+- DISCONNECT_TIME_ET (16:05): Disconnect from IB Gateway
+- BACKFILL_TIME_ET (16:30): Backfill counterfactuals
 
 Usage:
     python -m trading.earnings.daemon
@@ -63,6 +63,14 @@ from trading.earnings.logging import TradeLogger, SnapshotLog
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
 from trading.earnings.counterfactual import backfill_counterfactuals
 from trading.earnings.utils import today_et, should_exit_today
+from trading.earnings.config import (
+    MORNING_CONNECT_TIME_ET, EXIT_TIME_ET, SCREEN_TIME_ET,
+    PRICE_IMPROVE_START_ET, FINAL_CHECK_TIME_ET, FORCE_EXIT_TIME_ET,
+    DISCONNECT_TIME_ET, BACKFILL_TIME_ET,
+    SNAPSHOT_START_HOUR, SNAPSHOT_END_HOUR,
+    MONITOR_FILLS_START_HOUR, MONITOR_FILLS_END_HOUR,
+    parse_time_et, get_exit_time, get_screen_time, get_price_improve_times,
+)
 
 # Load environment
 load_dotenv(PROJECT_ROOT / '.env')
@@ -1345,25 +1353,43 @@ class TradingDaemon:
         """Finalize a partial exit where the position is gone (expired or manually closed).
 
         Assumes unfilled legs are worth $0 (expired worthless or closed at negligible value).
+        Uses per-leg entry prices for accurate P&L calculation, with 50/50 fallback.
         """
-        # Determine what we have
-        call_value = (trade.call_exit_fill_price or 0) * trade.contracts * 100
-        put_value = (trade.put_exit_fill_price or 0) * trade.contracts * 100
-        total_exit_value = call_value + put_value
+        contracts = trade.contracts or 1
 
-        # Calculate P&L
-        exit_pnl = total_exit_value - (trade.premium_paid or 0)
-        exit_pnl_pct = exit_pnl / trade.premium_paid if trade.premium_paid else None
+        # Get per-leg entry prices (50/50 fallback)
+        call_entry = trade.call_entry_fill_price
+        put_entry = trade.put_entry_fill_price
+        if call_entry is None or put_entry is None:
+            if trade.entry_fill_price:
+                call_entry = trade.entry_fill_price / 2
+                put_entry = trade.entry_fill_price / 2
+            else:
+                call_entry = 0
+                put_entry = 0
 
-        # Determine exit fill price per share
-        exit_fill_price = total_exit_value / (trade.contracts * 100) if trade.contracts else 0
+        # Get exit prices (0 for unfilled legs)
+        call_exit = trade.call_exit_fill_price or 0
+        put_exit = trade.put_exit_fill_price or 0
+
+        # Calculate per-leg P&L
+        call_pnl = (call_exit - call_entry) * contracts * 100
+        put_pnl = (put_exit - put_entry) * contracts * 100
+        exit_pnl = call_pnl + put_pnl
+
+        # Total exit value for record keeping
+        total_exit_value = (call_exit + put_exit) * contracts * 100
+        exit_pnl_pct = exit_pnl / (trade.premium_paid or 1) if trade.premium_paid else None
+
+        # Determine exit fill price per share (combined)
+        exit_fill_price = (call_exit + put_exit) if contracts else 0
 
         # Build notes
         notes_parts = [trade.notes or '']
         if trade.call_exit_fill_price is None:
-            notes_parts.append('call expired/closed @ $0')
+            notes_parts.append(f'call expired @ $0 (entry ${call_entry:.2f})')
         if trade.put_exit_fill_price is None:
-            notes_parts.append('put expired/closed @ $0')
+            notes_parts.append(f'put expired @ $0 (entry ${put_entry:.2f})')
         notes = '; '.join(filter(None, notes_parts))
 
         # Update DB
@@ -1386,7 +1412,7 @@ class TradingDaemon:
             update_kwargs['put_exit_fill_time'] = datetime.now().isoformat()
 
         self.trade_logger.update_trade(trade.trade_id, **update_kwargs)
-        logger.info(f"{trade.ticker}: Partial exit finalized - P&L: ${exit_pnl:.2f}")
+        logger.info(f"{trade.ticker}: Partial exit finalized - P&L: ${exit_pnl:.2f} (call: ${call_pnl:.2f}, put: ${put_pnl:.2f})")
 
     def _finalize_expired_partial_exits(self):
         """Check for partial exits with expired options and finalize them.
@@ -1853,86 +1879,109 @@ class TradingDaemon:
         logger.info(f"  SPY: bid={ticker.bid}, type={getattr(ticker, 'marketDataType', '?')}")
 
     def setup_schedule(self):
-        """Configure the job schedule (Timezone Aware)."""
-
-        # NOTE: When timezone=ET is set on the scheduler, triggers should use ET hours.
-        # 09:25 ET = 9, 25
-        # 14:00 ET = 14, 0
-
+        """Configure the job schedule (Timezone Aware).
+        
+        All schedule times are configurable via environment variables.
+        See trading/earnings/config.py for defaults.
+        """
+        # Morning connect
+        h, m = parse_time_et(MORNING_CONNECT_TIME_ET)
         self.scheduler.add_job(
             self.task_morning_connect,
-            CronTrigger(day_of_week='mon-fri', hour=9, minute=25, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='morning_connect',
-            name='Morning Connect (09:25 ET)',
+            name=f'Morning Connect ({MORNING_CONNECT_TIME_ET} ET)',
         )
 
+        # Exit positions
+        h, m = get_exit_time()
         self.scheduler.add_job(
             self.task_exit_positions,
-            CronTrigger(day_of_week='mon-fri', hour=14, minute=0, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='exit_positions',
-            name='Exit Positions (14:00 ET)',
+            name=f'Exit Positions ({EXIT_TIME_ET} ET)',
         )
 
+        # Screen candidates and place orders
+        h, m = get_screen_time()
         self.scheduler.add_job(
             self.task_screen_candidates,
-            CronTrigger(day_of_week='mon-fri', hour=14, minute=15, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='screen_and_place',
-            name='Screen & Place Orders (14:15 ET)',
+            name=f'Screen & Place Orders ({SCREEN_TIME_ET} ET)',
         )
 
+        # Monitor fills (hour range from config)
         self.scheduler.add_job(
             self.task_monitor_fills,
-            CronTrigger(day_of_week='mon-fri', hour='14-16', minute='*', timezone=ET),
+            CronTrigger(
+                day_of_week='mon-fri',
+                hour=f'{MONITOR_FILLS_START_HOUR}-{MONITOR_FILLS_END_HOUR}',
+                minute='*',
+                timezone=ET
+            ),
             id='monitor_fills',
-            name='Monitor Fills (Every min)',
-            misfire_grace_time=30,  # Allow 30s delay, skip if too late
-            coalesce=True,  # Combine missed jobs into one
+            name=f'Monitor Fills ({MONITOR_FILLS_START_HOUR}:00-{MONITOR_FILLS_END_HOUR}:00 ET)',
+            misfire_grace_time=30,
+            coalesce=True,
         )
 
-        # Position snapshots every 5 minutes from 9:30-16:00 for intraday P&L tracking
+        # Position snapshots (hour range from config)
         self.scheduler.add_job(
             self.task_snapshot_positions,
-            CronTrigger(day_of_week='mon-fri', hour='9-15', minute='*/5', timezone=ET),
+            CronTrigger(
+                day_of_week='mon-fri',
+                hour=f'{SNAPSHOT_START_HOUR}-{SNAPSHOT_END_HOUR}',
+                minute='*/5',
+                timezone=ET
+            ),
             id='snapshot_positions',
-            name='Snapshot Positions (Every 5min)',
+            name=f'Snapshot Positions ({SNAPSHOT_START_HOUR}:00-{SNAPSHOT_END_HOUR}:00 ET, every 5min)',
         )
 
-        # Price improvements 14:25 - 14:55 (after 14:15 order placement)
-        for m, agg in [(25, 0.4), (35, 0.5), (45, 0.6), (55, 0.7)]:
+        # Price improvements (dynamic times from config)
+        for h, m, agg in get_price_improve_times():
             self.scheduler.add_job(
                 partial(self.task_improve_prices, agg),
-                CronTrigger(day_of_week='mon-fri', hour=14, minute=m, timezone=ET),
-                id=f'improve_{m}',
-                name=f'Price Improvement (14:{m:02d} ET)',
+                CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
+                id=f'improve_{h}_{m}',
+                name=f'Price Improvement ({h}:{m:02d} ET, {agg:.0%})',
             )
 
-        self.scheduler.add_job(
-            self.task_cancel_unfilled,
-            CronTrigger(day_of_week='mon-fri', hour=15, minute=58, timezone=ET),
-            id='cancel_unfilled',
-            name='Cancel Unfilled (15:58 ET)',
-        )
-
+        # Final check - reprice unfilled exits to bid
+        h, m = parse_time_et(FINAL_CHECK_TIME_ET)
         self.scheduler.add_job(
             self.task_check_fills,
-            CronTrigger(day_of_week='mon-fri', hour=15, minute=55, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='check_fills',
-            name='Check Fills (15:55 ET)',
+            name=f'Check Fills ({FINAL_CHECK_TIME_ET} ET)',
         )
 
+        # Force exit - cancel unfilled entries, market exit remaining
+        h, m = parse_time_et(FORCE_EXIT_TIME_ET)
+        self.scheduler.add_job(
+            self.task_cancel_unfilled,
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
+            id='cancel_unfilled',
+            name=f'Force Exit ({FORCE_EXIT_TIME_ET} ET)',
+        )
+
+        # Disconnect from IB Gateway
+        h, m = parse_time_et(DISCONNECT_TIME_ET)
         self.scheduler.add_job(
             self.task_evening_disconnect,
-            CronTrigger(day_of_week='mon-fri', hour=16, minute=5, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='disconnect',
-            name='Disconnect (16:05 ET)',
+            name=f'Disconnect ({DISCONNECT_TIME_ET} ET)',
         )
 
-        # Backfill - 16:30 ET
+        # Backfill counterfactuals
+        h, m = parse_time_et(BACKFILL_TIME_ET)
         self.scheduler.add_job(
             self.run_backfill_task,
-            CronTrigger(day_of_week='mon-fri', hour=16, minute=30, timezone=ET),
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='backfill',
-            name='Backfill (16:30 ET)',
+            name=f'Backfill ({BACKFILL_TIME_ET} ET)',
         )
 
     async def run_backfill_task(self):
@@ -2023,15 +2072,15 @@ class TradingDaemon:
 
         now = datetime.now(ET)
 
-        # Scheduled screening is at 14:15 ET (after 14:00 exits).
-        # Allow catch-up if restarted between 14:15 and 21:00 (market hours + after hours)
+        # Allow catch-up if restarted between screen time and 21:00 (market hours + after hours)
         # to ensure we don't miss anything if daemon crashes.
         # CRITICAL: Must rely on _load_todays_activity() to prevent duplicates!
 
-        start = now.replace(hour=14, minute=15, second=0)
-        end = now.replace(hour=21, minute=0, second=0)
+        screen_h, screen_m = get_screen_time()
+        start = now.replace(hour=screen_h, minute=screen_m, second=0, microsecond=0)
+        end = now.replace(hour=21, minute=0, second=0, microsecond=0)
 
-        # If between 14:15 and 21:00 ET on a weekday
+        # If between screen time and 21:00 ET on a weekday
         if now.weekday() < 5 and start <= now < end:
             # Check for existing trades loaded from DB
             if self.todays_trades:
@@ -2047,10 +2096,10 @@ class TradingDaemon:
             # Ideally we check if we already have non_trades for this earnings date too.
             # For now, relying on todays_trades matches + logic in task_screen_candidates is better.
 
-            logger.info(f"STARTUP: Running screening (missed 14:15 scheduled time)")
+            logger.info(f"STARTUP: Running screening (missed {SCREEN_TIME_ET} scheduled time)")
             await self.task_screen_candidates()
         else:
-            logger.info("STARTUP: Outside screening window (14:00-21:00 ET), waiting for next schedule.")
+            logger.info(f"STARTUP: Outside screening window ({SCREEN_TIME_ET}-21:00 ET), waiting for next schedule.")
 
     def run(self):
         """Entry point."""

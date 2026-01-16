@@ -343,6 +343,15 @@ class Phase0Executor:
                     combo_order.status = 'filled'
                     filled.append(combo_order)
 
+                    # Extract per-leg fill prices from combo fills
+                    call_fill_price = None
+                    put_fill_price = None
+                    for fill in combo_order.trade.fills:
+                        if fill.contract.right == 'C':
+                            call_fill_price = fill.execution.price
+                        elif fill.contract.right == 'P':
+                            put_fill_price = fill.execution.price
+
                     # Calculate fill latency
                     fill_time = datetime.now()
                     fill_latency_seconds = None
@@ -350,13 +359,18 @@ class Phase0Executor:
                         fill_latency_seconds = (fill_time - combo_order.placement_time).total_seconds()
 
                     latency_str = f" (latency: {fill_latency_seconds:.0f}s)" if fill_latency_seconds else ""
-                    logger.info(f"{combo_order.symbol}: Straddle filled @ ${combo_order.fill_price:.2f}{latency_str}")
+                    leg_str = ""
+                    if call_fill_price and put_fill_price:
+                        leg_str = f" (call=${call_fill_price:.2f}, put=${put_fill_price:.2f})"
+                    logger.info(f"{combo_order.symbol}: Straddle filled @ ${combo_order.fill_price:.2f}{leg_str}{latency_str}")
 
                     # Update trade log with fill details and timing
                     self.logger.update_trade(
                         trade_id,
                         status='filled',
                         entry_fill_price=combo_order.fill_price,
+                        call_entry_fill_price=call_fill_price,
+                        put_entry_fill_price=put_fill_price,
                         entry_fill_time=fill_time.isoformat(),
                         entry_slippage=combo_order.fill_price - combo_order.trade.order.lmtPrice,
                         premium_paid=combo_order.fill_price * total_qty * 100,  # Use ordered quantity for max loss
@@ -575,6 +589,24 @@ class Phase0Executor:
             # Get fill price if available
             if order_status == 'filled':
                 combo_order.fill_price = ib_trade.orderStatus.avgFillPrice
+
+                # Extract per-leg fill prices if available
+                call_fill_price = None
+                put_fill_price = None
+                for fill in ib_trade.fills:
+                    if fill.contract.right == 'C':
+                        call_fill_price = fill.execution.price
+                    elif fill.contract.right == 'P':
+                        put_fill_price = fill.execution.price
+
+                # Update DB with per-leg prices if we got them and they're not already set
+                if (call_fill_price or put_fill_price) and trade.call_entry_fill_price is None:
+                    self.logger.update_trade(
+                        trade.trade_id,
+                        call_entry_fill_price=call_fill_price,
+                        put_entry_fill_price=put_fill_price,
+                    )
+                    logger.info(f"{trade.ticker}: Updated per-leg entry prices from recovered fills")
 
             self.active_orders[trade.trade_id] = combo_order
             recovered += 1

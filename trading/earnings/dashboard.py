@@ -812,16 +812,15 @@ def render_dashboard(
         # Show total unrealized P&L and risk summary
         print("  " + "-" * 88)
 
-        # Calculate total capital at risk
+        # Calculate total capital at risk (= max loss for long straddles)
         total_at_risk = sum(t.premium_paid or 0 for t in open_trades)
-        total_max_loss = sum(t.max_loss or 0 for t in open_trades)
 
         if has_live_data and total_unrealized_pnl != 0:
             pnl_color = '\033[92m' if total_unrealized_pnl >= 0 else '\033[91m'
             print(f"  {'UNREALIZED P&L:':<20} {pnl_color}{format_currency(total_unrealized_pnl)}{reset_color():<20}"
                   f"  CAPITAL AT RISK: {format_currency(total_at_risk)}")
         else:
-            print(f"  CAPITAL AT RISK: {format_currency(total_at_risk):<15} MAX LOSS: {format_currency(total_max_loss)}")
+            print(f"  CAPITAL AT RISK: {format_currency(total_at_risk)}")
 
         print()
     else:

@@ -259,6 +259,9 @@ class TradingDaemon:
             # Load positions that need to be exited today (blocking I/O - run in thread)
             await asyncio.to_thread(self._load_positions_to_exit)
 
+            # Finalize any expired partial exits (options expired yesterday or earlier)
+            await asyncio.to_thread(self._finalize_expired_partial_exits)
+
             # Recover active exit orders
             if self.executor:
                 await self._recover_exit_orders()
@@ -1177,6 +1180,35 @@ class TradingDaemon:
 
                 await self._force_exit_trade(trade, json)
 
+            # Also handle partial_exit trades - only force the unfilled leg
+            partial_trades = self.trade_logger.get_trades(status='partial_exit')
+
+            for trade in partial_trades:
+                # Skip if already tracking
+                if trade.trade_id in self.active_exit_orders:
+                    continue
+
+                # Check if position actually exists in IBKR
+                if trade.ticker not in position_symbols:
+                    # Position gone - finalize the partial exit
+                    logger.info(f"{trade.ticker}: Partial exit position gone, finalizing...")
+                    self._finalize_partial_exit(trade)
+                    continue
+
+                # Determine which leg needs forcing
+                if trade.call_exit_fill_price is None and trade.put_exit_fill_price is not None:
+                    # Call unfilled
+                    logger.warning(f"{trade.ticker}: Partial exit - forcing call leg")
+                    await self._force_exit_single_leg(trade, json, 'call')
+                elif trade.put_exit_fill_price is None and trade.call_exit_fill_price is not None:
+                    # Put unfilled
+                    logger.warning(f"{trade.ticker}: Partial exit - forcing put leg")
+                    await self._force_exit_single_leg(trade, json, 'put')
+                else:
+                    # Both unfilled (shouldn't be partial_exit) or both filled (should be exited)
+                    logger.warning(f"{trade.ticker}: Partial exit in unexpected state - forcing both legs")
+                    await self._force_exit_trade(trade, json)
+
         except Exception as e:
             logger.error(f"Failed to force exit orphaned positions: {e}")
 
@@ -1205,6 +1237,186 @@ class TradingDaemon:
             logger.info(f"{trade.ticker}: Market exit order placed")
         else:
             logger.error(f"{trade.ticker}: FAILED to place market exit - MANUAL CLOSE REQUIRED")
+
+    async def _force_exit_single_leg(self, trade, json_module, leg: str):
+        """Force exit a single leg (call or put) with market order.
+
+        Args:
+            trade: Trade record from DB
+            json_module: json module reference
+            leg: 'call' or 'put'
+        """
+        from ib_insync import Option, MarketOrder
+
+        # Parse strike
+        strike = 0.0
+        try:
+            if trade.strikes:
+                strikes_list = json_module.loads(trade.strikes)
+                if strikes_list:
+                    strike = float(strikes_list[0])
+        except Exception:
+            pass
+
+        if strike == 0:
+            logger.error(f"{trade.ticker}: Cannot force {leg} exit - no strike")
+            return
+
+        # Create option contract for the unfilled leg
+        right = 'C' if leg == 'call' else 'P'
+        opt = Option(trade.ticker, trade.expiration, strike, right, 'SMART', tradingClass=trade.ticker)
+
+        try:
+            await self.ib.qualifyContractsAsync(opt)
+        except Exception as e:
+            logger.error(f"{trade.ticker}: Failed to qualify {leg} option for force exit: {e}")
+            return
+
+        # Place market order
+        order = MarketOrder('SELL', trade.contracts)
+
+        try:
+            order_trade = self.ib.placeOrder(opt, order)
+            order_id = order_trade.order.orderId
+
+            logger.warning(f"{trade.ticker}: Market {leg} exit order placed (order_id={order_id})")
+
+            # Update trade logger with new order ID
+            if leg == 'call':
+                self.trade_logger.update_trade(
+                    trade.trade_id,
+                    exit_call_order_id=order_id,
+                    notes=f"{trade.notes or ''}; forced {leg} exit",
+                )
+            else:
+                self.trade_logger.update_trade(
+                    trade.trade_id,
+                    exit_put_order_id=order_id,
+                    notes=f"{trade.notes or ''}; forced {leg} exit",
+                )
+
+            # Log order event
+            self.trade_logger.log_order_event(
+                trade_id=trade.trade_id,
+                ib_order_id=order_id,
+                event='placed',
+                status=order_trade.orderStatus.status,
+                filled=0,
+                remaining=order_trade.orderStatus.remaining,
+                avg_fill_price=0.0,
+                limit_price=0,  # Market order
+            )
+
+            # Create/update ExitComboOrder for monitoring
+            # If we already have one, update it; otherwise create new
+            if trade.trade_id in self.active_exit_orders:
+                exit_order = self.active_exit_orders[trade.trade_id]
+                if leg == 'call':
+                    exit_order.trade = order_trade
+                else:
+                    exit_order.put_trade = order_trade
+            else:
+                # Create new with just this leg
+                exit_order = ExitComboOrder(
+                    trade_id=trade.trade_id,
+                    symbol=trade.ticker,
+                    expiry=trade.expiration,
+                    strike=strike,
+                    contracts=trade.contracts,
+                    order_id=order_id if leg == 'call' else None,
+                    trade=order_trade if leg == 'call' else None,
+                    put_trade=order_trade if leg == 'put' else None,
+                    entry_fill_price=trade.entry_fill_price,
+                    spot_at_entry=trade.spot_at_entry,
+                    status='partial_exit',
+                )
+                # Pre-populate the already-filled leg
+                if trade.call_exit_fill_price is not None:
+                    exit_order.call_fill_price = trade.call_exit_fill_price
+                if trade.put_exit_fill_price is not None:
+                    exit_order.put_fill_price = trade.put_exit_fill_price
+
+                self.active_exit_orders[trade.trade_id] = exit_order
+
+        except Exception as e:
+            logger.error(f"{trade.ticker}: Failed to place market {leg} exit: {e}")
+
+    def _finalize_partial_exit(self, trade):
+        """Finalize a partial exit where the position is gone (expired or manually closed).
+
+        Assumes unfilled legs are worth $0 (expired worthless or closed at negligible value).
+        """
+        # Determine what we have
+        call_value = (trade.call_exit_fill_price or 0) * trade.contracts * 100
+        put_value = (trade.put_exit_fill_price or 0) * trade.contracts * 100
+        total_exit_value = call_value + put_value
+
+        # Calculate P&L
+        exit_pnl = total_exit_value - (trade.premium_paid or 0)
+        exit_pnl_pct = exit_pnl / trade.premium_paid if trade.premium_paid else None
+
+        # Determine exit fill price per share
+        exit_fill_price = total_exit_value / (trade.contracts * 100) if trade.contracts else 0
+
+        # Build notes
+        notes_parts = [trade.notes or '']
+        if trade.call_exit_fill_price is None:
+            notes_parts.append('call expired/closed @ $0')
+        if trade.put_exit_fill_price is None:
+            notes_parts.append('put expired/closed @ $0')
+        notes = '; '.join(filter(None, notes_parts))
+
+        # Update DB
+        update_kwargs = {
+            'status': 'exited',
+            'exit_datetime': datetime.now().isoformat(),
+            'exit_fill_price': exit_fill_price,
+            'exit_value_realized': total_exit_value,
+            'exit_pnl': exit_pnl,
+            'exit_pnl_pct': exit_pnl_pct,
+            'notes': notes,
+        }
+
+        # Mark unfilled legs as $0
+        if trade.call_exit_fill_price is None:
+            update_kwargs['call_exit_fill_price'] = 0.0
+            update_kwargs['call_exit_fill_time'] = datetime.now().isoformat()
+        if trade.put_exit_fill_price is None:
+            update_kwargs['put_exit_fill_price'] = 0.0
+            update_kwargs['put_exit_fill_time'] = datetime.now().isoformat()
+
+        self.trade_logger.update_trade(trade.trade_id, **update_kwargs)
+        logger.info(f"{trade.ticker}: Partial exit finalized - P&L: ${exit_pnl:.2f}")
+
+    def _finalize_expired_partial_exits(self):
+        """Check for partial exits with expired options and finalize them.
+
+        Called at daemon startup to clean up positions where options expired
+        while daemon was offline.
+        """
+        today_str = today_et().strftime('%Y%m%d')
+
+        # Get all partial_exit trades
+        partial_trades = self.trade_logger.get_trades(status='partial_exit')
+
+        if not partial_trades:
+            return
+
+        finalized_count = 0
+        for trade in partial_trades:
+            if not trade.expiration:
+                continue
+
+            # Check if expired (expiration is YYYYMMDD format)
+            if trade.expiration >= today_str:
+                continue  # Not expired yet
+
+            logger.info(f"{trade.ticker}: Option expired ({trade.expiration}) - finalizing partial exit")
+            self._finalize_partial_exit(trade)
+            finalized_count += 1
+
+        if finalized_count > 0:
+            logger.info(f"Finalized {finalized_count} expired partial exit(s)")
 
     async def task_evening_disconnect(self):
         """4:05 PM ET - Disconnect."""
@@ -1370,11 +1582,11 @@ class TradingDaemon:
             for trade in trades:
                 # We only care if:
                 # 1. It has an exit order ID
-                # 2. Status is 'exiting' (not yet confirmed filled)
+                # 2. Status is 'exiting' or 'partial_exit' (not yet fully exited)
                 if not trade.exit_call_order_id:
                     continue
 
-                if trade.status != 'exiting':
+                if trade.status not in ('exiting', 'partial_exit'):
                     continue
 
                 if trade.trade_id in self.active_exit_orders:
@@ -1397,6 +1609,9 @@ class TradingDaemon:
 
                 if call_ib_trade or put_ib_trade:
                     # At least one leg is still open - recover for monitoring
+                    # Preserve partial_exit status if applicable
+                    recovered_status = 'partial_exit' if trade.status == 'partial_exit' else 'pending'
+
                     exit_order = ExitComboOrder(
                         trade_id=trade.trade_id,
                         symbol=trade.ticker,
@@ -1408,11 +1623,18 @@ class TradingDaemon:
                         put_trade=put_ib_trade,
                         entry_fill_price=trade.entry_fill_price,
                         spot_at_entry=trade.spot_at_entry,
-                        status='pending'
+                        status=recovered_status,
                     )
+
+                    # Pre-populate fill prices from DB if we have them (partial exit recovery)
+                    if trade.call_exit_fill_price is not None:
+                        exit_order.call_fill_price = trade.call_exit_fill_price
+                    if trade.put_exit_fill_price is not None:
+                        exit_order.put_fill_price = trade.put_exit_fill_price
 
                     self.active_exit_orders[trade.trade_id] = exit_order
                     recovered_count += 1
+                    logger.info(f"{trade.ticker}: Recovered exit order (status={recovered_status})")
                 else:
                     # Not in open orders - check if both legs filled
                     call_fills = fills_by_order.get(call_order_id, [])

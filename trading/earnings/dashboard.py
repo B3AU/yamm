@@ -75,6 +75,8 @@ def get_status_color(status: str) -> str:
         'filled': '\033[92m',       # Green
         'partial': '\033[91m',      # Red - partial fills are warnings
         'exiting': '\033[96m',      # Cyan - exit orders placed
+        'partial_exit': '\033[93m', # Yellow - one leg exited
+        'overdue': '\033[91m',      # Red - past exit time, no exit order
         'exited': '\033[94m',       # Blue - completed
         'completed': '\033[94m',    # Blue
         'cancelled': '\033[90m',    # Gray
@@ -576,8 +578,31 @@ def render_dashboard(
             if llm_check:
                 llm_check_map[trade.trade_id] = llm_check
 
-    # Categorize trades
-    open_trades = [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
+    # Categorize trades into 3 buckets:
+    # 1. OPEN: Entry filled, not yet time to exit
+    # 2. EXITING: Currently exiting (includes partial_exit, exiting, and stuck positions)
+    # 3. COMPLETED: Fully closed
+
+    def _is_exiting_trade(t):
+        """Check if trade belongs in EXITING section."""
+        if t.status in ('exiting', 'partial_exit'):
+            return True
+        # Only include 'filled' positions AFTER 14:00 ET on exit day
+        if t.status == 'filled':
+            now_et = datetime.now(ET)
+            if now_et.hour < 14:
+                return False  # Before exit time, stay in OPEN
+            try:
+                earnings_date = datetime.strptime(t.earnings_date, '%Y-%m-%d').date()
+                return should_exit_today(earnings_date, t.earnings_timing)
+            except (ValueError, TypeError):
+                pass
+        return False
+
+    open_trades = [t for t in all_trades
+                   if t.status in ('pending', 'submitted', 'filled', 'partial')
+                   and not _is_exiting_trade(t)]
+    exiting_trades = [t for t in all_trades if _is_exiting_trade(t)]
     completed_trades = [t for t in all_trades if t.status in ('completed', 'exited')]
 
     # === Open Positions ===
@@ -643,15 +668,8 @@ def render_dashboard(
                 status_display = "PARTIAL!"
             elif trade.status == 'exiting':
                 status_display = "EXIT"
-            elif trade.status == 'filled':
-                # Check if should be exiting today but no exit order placed (stuck)
-                try:
-                    earnings_date = datetime.strptime(trade.earnings_date, '%Y-%m-%d').date()
-                    if should_exit_today(earnings_date, trade.earnings_timing):
-                        status_display = "STUCK"
-                        status_color = '\033[91m'  # Red for urgency
-                except (ValueError, TypeError):
-                    pass
+            # 'filled' just shows as 'filled' - expiration date indicates when it exits
+            # Positions move to EXITING section after 14:00 ET on exit day
 
             if compact:
                 # Compact: single line with key info
@@ -802,6 +820,127 @@ def render_dashboard(
         print()
     else:
         print("  No open positions")
+        print()
+
+    # === Exiting Positions ===
+    if exiting_trades:
+        print(bold("  EXITING POSITIONS"))
+
+        if compact:
+            print(f"  {'Sym':<6}{'Status':<8}{'C Exit':<10}{'P Exit':<10}{'Realized':<10}{'Unreal':<8}{'Est P&L':<10}{'Exp'}")
+            print("  " + "-" * 70)
+        else:
+            print(f"  {'Symbol':<8} {'Status':<12} {'Call Exit':<12} {'Put Exit':<12} {'Realized':<12} {'Unrealized':<10}")
+            print("  " + "-" * 80)
+
+        for trade in exiting_trades:
+            # Determine status display and color
+            if trade.status == 'partial_exit':
+                status_display = "partial"
+                status_color = '\033[93m'  # Yellow
+            elif trade.status == 'exiting':
+                status_display = "pending"
+                status_color = '\033[96m'  # Cyan
+            else:  # 'filled' after 14:00 ET without exit order = overdue
+                status_display = "overdue"
+                status_color = '\033[91m'  # Red
+
+            # Call exit display
+            if trade.call_exit_fill_price is not None:
+                call_str = f"${trade.call_exit_fill_price:.2f} \033[92m✓\033[0m"
+                call_str_len = len(f"${trade.call_exit_fill_price:.2f} ✓")  # Length without ANSI
+            elif trade.exit_call_order_id:
+                call_str = "pending"
+                call_str_len = 7
+            else:
+                call_str = "-"
+                call_str_len = 1
+
+            # Put exit display
+            if trade.put_exit_fill_price is not None:
+                put_str = f"${trade.put_exit_fill_price:.2f} \033[92m✓\033[0m"
+                put_str_len = len(f"${trade.put_exit_fill_price:.2f} ✓")
+            elif trade.exit_put_order_id:
+                put_str = "pending"
+                put_str_len = 7
+            else:
+                put_str = "-"
+                put_str_len = 1
+
+            # Realized P&L (from filled legs only)
+            realized_value = trade.exit_value_realized or 0
+            realized_pnl = realized_value - (trade.premium_paid or 0) if realized_value > 0 else 0
+            realized_str = format_currency(realized_pnl) if realized_value > 0 else "-"
+            realized_color = '\033[92m' if realized_pnl >= 0 else '\033[91m'
+
+            # Unrealized estimate (from live quotes if available)
+            unrealized_str = "?"
+            unrealized_value = 0
+            if live_data_map and trade.trade_id in live_data_map:
+                live_data = live_data_map.get(trade.trade_id)
+                if live_data and 'error' not in live_data:
+                    # Get value of unfilled leg(s)
+                    if trade.call_exit_fill_price is None and live_data.get('call_mid'):
+                        unrealized_value += live_data['call_mid'] * (trade.contracts or 1) * 100
+                    if trade.put_exit_fill_price is None and live_data.get('put_mid'):
+                        unrealized_value += live_data['put_mid'] * (trade.contracts or 1) * 100
+                    if unrealized_value > 0:
+                        unrealized_str = f"~${unrealized_value:.0f}"
+                    elif trade.call_exit_fill_price is not None or trade.put_exit_fill_price is not None:
+                        # One leg filled, other has no quote - probably worthless
+                        unrealized_str = "~$0"
+
+            # Estimated total P&L
+            if realized_value > 0 or unrealized_value > 0:
+                est_total = (realized_value + unrealized_value) - (trade.premium_paid or 0)
+                est_pnl_str = format_currency(est_total)
+                est_pnl_color = '\033[92m' if est_total >= 0 else '\033[91m'
+            else:
+                est_pnl_str = "?"
+                est_pnl_color = ''
+
+            # Expiration urgency
+            exp_str = "?"
+            if trade.expiration:
+                try:
+                    exp_date = datetime.strptime(trade.expiration, '%Y%m%d').date()
+                    today = date.today()
+                    days_to_exp = (exp_date - today).days
+                    if days_to_exp <= 0:
+                        exp_str = "\033[91mTODAY\033[0m"
+                    elif days_to_exp == 1:
+                        exp_str = "\033[93mtmrw\033[0m"
+                    else:
+                        exp_str = f"{days_to_exp}d"
+                except (ValueError, TypeError):
+                    pass
+
+            if compact:
+                sym = trade.ticker[:5]
+                # Pad strings manually to account for ANSI codes in checkmarks
+                call_padded = call_str + ' ' * max(0, 10 - call_str_len)
+                put_padded = put_str + ' ' * max(0, 10 - put_str_len)
+                # Build line with consistent spacing
+                line = f"  {sym:<6}"
+                line += f"{status_color}{status_display:<8}{reset_color()}"
+                line += call_padded
+                line += put_padded
+                line += f"{realized_color if realized_value > 0 else ''}{realized_str:<10}{reset_color()}"
+                line += f"{unrealized_str:<8}"
+                line += f"{est_pnl_color}{est_pnl_str:<10}{reset_color()}"
+                line += exp_str
+                print(line)
+            else:
+                call_padded = call_str + ' ' * (12 - call_str_len)
+                put_padded = put_str + ' ' * (12 - put_str_len)
+                print(f"  {trade.ticker:<8} {status_color}{status_display:<12}{reset_color()}"
+                      f"{call_padded}{put_padded}"
+                      f"{realized_color if realized_value > 0 else ''}{realized_str:<12}{reset_color()}"
+                      f"{unrealized_str:<10}")
+                # Show expiration on second line for non-compact
+                print(f"           Expiration: {trade.expiration} ({exp_str})")
+                print()
+
         print()
 
     # === Completed Trades ===
@@ -1033,7 +1172,7 @@ def render_dashboard(
 def get_open_positions(logger: TradeLogger) -> list:
     """Get open positions that can be closed."""
     all_trades = logger.get_trades()
-    return [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
+    return [t for t in all_trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting', 'partial_exit')]
 
 
 def show_llm_details_interactive(logger: TradeLogger):
@@ -1448,7 +1587,7 @@ def main():
                     if args.live:
                          # 1. Fetch data (async, parallel)
                          trades = logger.get_trades()
-                         open_trades = [t for t in trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
+                         open_trades = [t for t in trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting', 'partial_exit')]
 
                          new_live_data = {}
                          if open_trades:
@@ -1456,7 +1595,7 @@ def main():
                              if ib:
                                  tasks = []
                                  for trade in open_trades:
-                                     if trade.status not in ('filled', 'partial', 'exiting'):
+                                     if trade.status not in ('filled', 'partial', 'exiting', 'partial_exit'):
                                          continue
                                      tasks.append((trade.trade_id, get_position_live_value_async(ib, trade)))
 
@@ -1521,10 +1660,10 @@ def main():
                 live_data_cache = {}
                 if ib:
                      trades = logger.get_trades()
-                     open_trades = [t for t in trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting')]
+                     open_trades = [t for t in trades if t.status in ('pending', 'submitted', 'filled', 'partial', 'exiting', 'partial_exit')]
                      tasks = []
                      for trade in open_trades:
-                         if trade.status not in ('filled', 'partial', 'exiting'):
+                         if trade.status not in ('filled', 'partial', 'exiting', 'partial_exit'):
                              continue
                          tasks.append((trade.trade_id, get_position_live_value_async(ib, trade)))
                      if tasks:

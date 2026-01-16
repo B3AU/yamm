@@ -72,6 +72,13 @@ class TradeLog:
     exit_fill_price: Optional[float] = None
     exit_slippage: Optional[float] = None
 
+    # Per-leg exit tracking (for partial exits)
+    call_exit_fill_price: Optional[float] = None
+    call_exit_fill_time: Optional[str] = None
+    put_exit_fill_price: Optional[float] = None
+    put_exit_fill_time: Optional[str] = None
+    exit_value_realized: Optional[float] = None  # Cumulative exit proceeds
+
     # Outcomes
     exit_pnl: Optional[float] = None
     exit_pnl_pct: Optional[float] = None  # pnl / premium_paid
@@ -81,7 +88,7 @@ class TradeLog:
     spot_at_exit: Optional[float] = None
 
     # Status
-    status: str = "pending"  # pending, filled, partial, cancelled, exited
+    status: str = "pending"  # pending, filled, partial, exiting, partial_exit, exited, cancelled
     notes: str = ""
 
     # IBKR order tracking (for recovery after restart)
@@ -110,6 +117,8 @@ TRADE_COLUMNS = {
     'implied_move', 'edge_q75', 'edge_q90',
     'exit_datetime', 'exit_quoted_bid', 'exit_quoted_ask', 'exit_quoted_mid',
     'exit_limit_price', 'exit_fill_price', 'exit_slippage',
+    'call_exit_fill_price', 'call_exit_fill_time',
+    'put_exit_fill_price', 'put_exit_fill_time', 'exit_value_realized',
     'exit_pnl', 'exit_pnl_pct', 'realized_move', 'realized_move_pct',
     'spot_at_entry', 'spot_at_exit', 'status', 'notes',
     'call_order_id', 'put_order_id', 'exit_call_order_id', 'exit_put_order_id',
@@ -311,6 +320,19 @@ class TradeLogger:
             for col in ['entry_combo_bid', 'entry_combo_ask']:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+            # Add per-leg exit tracking columns (migration for partial exit support)
+            for col, col_type in [
+                ('call_exit_fill_price', 'REAL'),
+                ('call_exit_fill_time', 'TEXT'),
+                ('put_exit_fill_price', 'REAL'),
+                ('put_exit_fill_time', 'TEXT'),
+                ('exit_value_realized', 'REAL'),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass  # Column already exists
 

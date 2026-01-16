@@ -941,10 +941,18 @@ async def check_exit_fills(
                 except Exception as e:
                     logger.warning(f"{exit_order.symbol}: Failed to fetch spot at exit: {e}")
 
+            # Calculate total exit value
+            total_exit_value = exit_order.fill_price * exit_order.contracts * 100
+
             trade_logger.update_trade(
                 trade_id,
                 status='exited',
                 exit_fill_price=exit_order.fill_price,
+                call_exit_fill_price=call_avg_fill,
+                call_exit_fill_time=datetime.now().isoformat(),
+                put_exit_fill_price=put_avg_fill,
+                put_exit_fill_time=datetime.now().isoformat(),
+                exit_value_realized=total_exit_value,
                 # Exit slippage: limit - fill (positive = sold below limit = bad)
                 # Consistent with entry: positive slippage = worse execution
                 exit_slippage=combined_limit - exit_order.fill_price if combined_limit else None,
@@ -998,6 +1006,39 @@ async def check_exit_fills(
         elif call_failed and put_failed:
             exit_order.status = 'cancelled'
             logger.warning(f"{exit_order.symbol}: Exit order cancelled/inactive (call={call_status}, put={put_status})")
+
+        # Handle partial exits (one filled, one still pending)
+        # This is different from orphan (one filled, one failed)
+        call_pending = call_status in ('Submitted', 'PreSubmitted', 'PendingSubmit')
+        put_pending = put_status in ('Submitted', 'PreSubmitted', 'PendingSubmit')
+
+        if (call_filled and put_pending) or (put_filled and call_pending):
+            # Only transition to partial_exit once (not repeatedly)
+            if exit_order.status not in ('partial_exit',):
+                exit_order.status = 'partial_exit'
+
+                filled_leg = 'call' if call_filled else 'put'
+                filled_price = call_avg_fill if call_filled else put_avg_fill
+                filled_value = filled_price * exit_order.contracts * 100
+
+                logger.info(
+                    f"{exit_order.symbol}: PARTIAL EXIT - "
+                    f"{filled_leg} filled @ ${filled_price:.2f}, other leg pending"
+                )
+
+                # Update DB with partial fill info
+                update_kwargs = {
+                    'status': 'partial_exit',
+                    'exit_value_realized': filled_value,
+                }
+                if call_filled:
+                    update_kwargs['call_exit_fill_price'] = call_avg_fill
+                    update_kwargs['call_exit_fill_time'] = datetime.now().isoformat()
+                else:
+                    update_kwargs['put_exit_fill_price'] = put_avg_fill
+                    update_kwargs['put_exit_fill_time'] = datetime.now().isoformat()
+
+                trade_logger.update_trade(trade_id, **update_kwargs)
 
     return filled
 

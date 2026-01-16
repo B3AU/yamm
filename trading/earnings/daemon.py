@@ -276,6 +276,11 @@ class TradingDaemon:
 
             await self.connect_async()
 
+            # Force exit any orphaned positions (requires IBKR connection)
+            # This catches positions stuck in partial_exit, exiting, or filled states
+            # that should have exited but didn't (e.g., market orders didn't fill at close)
+            await self._force_exit_orphaned_positions()
+
         except Exception as e:
             logger.exception(f"Morning connect failed: {e}")
 

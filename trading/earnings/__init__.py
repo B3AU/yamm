@@ -30,6 +30,13 @@ from trading.earnings.counterfactual import (
     backfill_counterfactuals,
     get_recent_counterfactual_summary,
 )
+from trading.earnings.config import (
+    EXIT_TIME_ET,
+    SCREEN_TIME_ET,
+    get_exit_time,
+    get_screen_time,
+    parse_time_et,
+)
 
 __all__ = [
     # Logging
@@ -58,4 +65,10 @@ __all__ = [
     # Counterfactual
     "backfill_counterfactuals",
     "get_recent_counterfactual_summary",
+    # Config
+    "EXIT_TIME_ET",
+    "SCREEN_TIME_ET",
+    "get_exit_time",
+    "get_screen_time",
+    "parse_time_et",
 ]

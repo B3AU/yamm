@@ -421,6 +421,23 @@ MAX_CONTRACTS=5              # Maximum contract size (safety cap)
 PAPER_SPREAD_THRESHOLD=20.0
 PAPER_EDGE_THRESHOLD=0.03
 PAPER_MAX_DAILY_TRADES=10
+
+# Schedule Configuration (all times in ET, HH:MM format)
+MORNING_CONNECT_TIME_ET=09:25   # Connect to IB Gateway
+EXIT_TIME_ET=14:00              # Exit positions from previous day
+SCREEN_TIME_ET=14:15            # Screen candidates and place orders
+PRICE_IMPROVE_START_ET=14:25    # Start price improvement loop
+PRICE_IMPROVE_INTERVAL=10       # Minutes between price improvements (4 rounds)
+FINAL_CHECK_TIME_ET=15:55       # Final fill check, reprice unfilled exits
+FORCE_EXIT_TIME_ET=15:58        # Force exit with market orders
+DISCONNECT_TIME_ET=16:05        # Disconnect from IB Gateway
+BACKFILL_TIME_ET=16:30          # Backfill counterfactuals
+
+# Hour ranges for recurring jobs
+SNAPSHOT_START_HOUR=9           # Position snapshot start hour (inclusive)
+SNAPSHOT_END_HOUR=15            # Position snapshot end hour (inclusive)
+MONITOR_FILLS_START_HOUR=14     # Monitor fills start hour
+MONITOR_FILLS_END_HOUR=16       # Monitor fills end hour
 ```
 
 ---

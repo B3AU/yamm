@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -12,18 +12,82 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
+def show_preview():
+    """Show weekly earnings calendar preview (no screening)."""
+    import pytz
+    from trading.earnings.screener import fetch_upcoming_earnings
+    
+    ET = pytz.timezone('US/Eastern')
+    today = datetime.now(ET).date()
+    
+    # Fetch 10 days to cover next week fully
+    events = fetch_upcoming_earnings(days_ahead=10)
+    
+    # Group by date
+    by_date = {}
+    for e in events:
+        if e.earnings_date not in by_date:
+            by_date[e.earnings_date] = {'BMO': [], 'AMC': [], 'unknown': []}
+        timing_key = e.timing if e.timing in ('BMO', 'AMC') else 'unknown'
+        by_date[e.earnings_date][timing_key].append(e.symbol)
+    
+    # Print calendar
+    print(f"\n{'='*60}")
+    print(f"EARNINGS CALENDAR: {today} to {today + timedelta(days=10)}")
+    print(f"{'='*60}\n")
+    
+    for d in sorted(by_date.keys()):
+        if d < today:
+            continue
+        
+        day_name = d.strftime('%A')
+        bmo = by_date[d]['BMO']
+        amc = by_date[d]['AMC']
+        unknown = by_date[d]['unknown']
+        total = len(bmo) + len(amc) + len(unknown)
+        
+        # Mark today
+        marker = " (TODAY)" if d == today else ""
+        print(f"=== {day_name} {d}{marker} ({total} total) ===")
+        
+        if bmo:
+            symbols = ' '.join(bmo[:15])
+            more = f"... +{len(bmo)-15} more" if len(bmo) > 15 else ""
+            print(f"  BMO ({len(bmo):2d}): {symbols}{more}")
+        if amc:
+            symbols = ' '.join(amc[:15])
+            more = f"... +{len(amc)-15} more" if len(amc) > 15 else ""
+            print(f"  AMC ({len(amc):2d}): {symbols}{more}")
+        if unknown:
+            symbols = ' '.join(unknown[:10])
+            more = f"... +{len(unknown)-10} more" if len(unknown) > 10 else ""
+            print(f"  TBD ({len(unknown):2d}): {symbols}{more}")
+        print()
+    
+    # Summary
+    total_events = sum(len(bmo) + len(amc) + len(unknown) 
+                       for bmo, amc, unknown in [(by_date[d]['BMO'], by_date[d]['AMC'], by_date[d]['unknown']) 
+                                                  for d in by_date if d >= today])
+    print(f"Total: {total_events} earnings events in next 10 days")
+
+
 async def main():
     parser = argparse.ArgumentParser(description='Test earnings screening pipeline')
     parser.add_argument('--ticker', '-t', nargs='+', help='Specific ticker(s) to screen')
     parser.add_argument('--earnings-date', '-d', type=str, help='Earnings date (YYYY-MM-DD)')
     parser.add_argument('--timing', choices=['BMO', 'AMC'], default='AMC', help='Earnings timing')
-    parser.add_argument('--days-ahead', type=int, default=3, help='Days ahead to fetch earnings')
+    parser.add_argument('--preview', action='store_true', help='Show weekly earnings calendar (no screening)')
     parser.add_argument('--spread-threshold', type=float, default=15.0, help='Max spread %%')
     parser.add_argument('--edge-threshold', type=float, default=0.05, help='Min edge (0.05 = 5%%)')
     parser.add_argument('--no-ibkr', action='store_true', help='Skip IBKR screening')
     parser.add_argument('--no-llm', action='store_true', help='Skip LLM sanity check')
     parser.add_argument('--ibkr-port', type=int, default=4002, help='IBKR Gateway port')
     args = parser.parse_args()
+    
+    # Preview mode: just show calendar and exit
+    if args.preview:
+        show_preview()
+        return
 
     # Step 1: Get earnings events
     if args.ticker and args.earnings_date:
@@ -39,7 +103,6 @@ async def main():
         today = datetime.now(ET).date()
         
         bmo_tomorrow, amc_today = get_tradeable_candidates(
-            days_ahead=args.days_ahead,
             fill_timing=True,
             verify_dates=False,  # Skip FMP verification for faster testing
         )

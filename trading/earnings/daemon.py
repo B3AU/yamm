@@ -63,6 +63,7 @@ from trading.earnings.logging import TradeLogger, SnapshotLog
 from trading.earnings.ml_predictor import get_predictor, EarningsPredictor
 from trading.earnings.counterfactual import backfill_counterfactuals
 from trading.earnings.utils import today_et, should_exit_today
+from trading.earnings.market_calendar import is_early_close, get_close_time
 from trading.earnings.config import (
     MORNING_CONNECT_TIME_ET, EXIT_TIME_ET, SCREEN_TIME_ET,
     PRICE_IMPROVE_START_ET, FINAL_CHECK_TIME_ET, FORCE_EXIT_TIME_ET,
@@ -121,6 +122,10 @@ CONFIG = {
         'PAPER_LLM_SANITY_THRESHOLD' if PAPER_MODE else 'LLM_SANITY_THRESHOLD',
         'NO_TRADE' if PAPER_MODE else 'WARN'
     ),
+    # Dual-DTE mode: open positions at both nearest and next expiry for A/B testing
+    # When enabled, each symbol gets 2 positions (50/50 split) with different DTEs
+    # For easy revert: set DUAL_DTE_ENABLED=false
+    'dual_dte_enabled': os.environ.get('DUAL_DTE_ENABLED', 'false').lower() == 'true',
 }
 
 # Setup logging
@@ -244,6 +249,16 @@ class TradingDaemon:
         """9:25 AM ET - Connect before market open."""
         logger.info("=== MORNING CONNECT ===")
 
+        # Check for early close day
+        today = today_et()
+        if is_early_close(today):
+            close_time = get_close_time(today)
+            logger.warning("=" * 60)
+            logger.warning(f"TODAY IS EARLY CLOSE - Market closes at {close_time} ET")
+            logger.warning("Normal screening window (14:00-16:00) may be affected!")
+            logger.warning("Manual intervention may be needed for screening/exits.")
+            logger.warning("=" * 60)
+
         try:
             # Reset daily state
             self.todays_candidates = []
@@ -336,14 +351,24 @@ class TradingDaemon:
                 return
 
             # Screen candidates (Async)
-            passed, rejected = await screen_all_candidates(
-                self.ib,
-                relevant_events,
-                spread_threshold=CONFIG['spread_threshold'],
-                max_candidates=CONFIG['max_candidates_to_screen'],
-            )
-
-            logger.info(f"Liquidity screening: {len(passed)} passed, {len(rejected)} rejected")
+            # Use dual-DTE screening if enabled (returns 0-2 candidates per symbol)
+            if CONFIG['dual_dte_enabled']:
+                from trading.earnings.screener import screen_all_candidates_dual_dte
+                passed, rejected = await screen_all_candidates_dual_dte(
+                    self.ib,
+                    relevant_events,
+                    spread_threshold=CONFIG['spread_threshold'],
+                    max_candidates=CONFIG['max_candidates_to_screen'],
+                )
+                logger.info(f"Dual-DTE screening: {len(passed)} passed (may include 2 per symbol), {len(rejected)} rejected")
+            else:
+                passed, rejected = await screen_all_candidates(
+                    self.ib,
+                    relevant_events,
+                    spread_threshold=CONFIG['spread_threshold'],
+                    max_candidates=CONFIG['max_candidates_to_screen'],
+                )
+                logger.info(f"Liquidity screening: {len(passed)} passed, {len(rejected)} rejected")
 
             # Log rejected candidates
             for candidate in rejected:
@@ -504,15 +529,23 @@ class TradingDaemon:
 
         try:
             for candidate in self.todays_candidates:
-                # Double check we haven't already traded this symbol today
+                # Double check we haven't already traded this symbol+expiry today
                 # (Paranoid check for duplicate trades)
                 # Use locks for entire check-and-place operation to prevent race conditions
                 # Always acquire locks in consistent order: trades_lock first, then exit_orders_lock
                 async with self._trades_lock:
-                    # Parse ticker from trade_id to avoid substring matches (e.g. GO vs GOOG)
-                    if any(t.split('_')[0] == candidate.symbol for t in self.todays_trades):
-                        logger.warning(f"Skipping {candidate.symbol} - already traded today")
-                        continue
+                    # In dual-DTE mode, check symbol+expiry combo to allow different expiries
+                    # Trade ID format: {ticker}_{earnings_date}_{expiry}_{timestamp}
+                    if CONFIG['dual_dte_enabled']:
+                        candidate_key = f"{candidate.symbol}_{candidate.expiry}"
+                        if any(candidate_key in t for t in self.todays_trades):
+                            logger.warning(f"Skipping {candidate.symbol} {candidate.expiry} - already traded today")
+                            continue
+                    else:
+                        # Original behavior: check symbol only
+                        if any(t.split('_')[0] == candidate.symbol for t in self.todays_trades):
+                            logger.warning(f"Skipping {candidate.symbol} - already traded today")
+                            continue
 
                     # Check for overlapping exit - don't enter if position still being exited
                     async with self._exit_orders_lock:
@@ -525,12 +558,21 @@ class TradingDaemon:
                     if exit_pending:
                         continue
 
-                    logger.info(f"Placing order for {candidate.symbol}...")
+                    # Compute position fraction for dual-DTE mode (50/50 split)
+                    if CONFIG['dual_dte_enabled']:
+                        # Count how many candidates for this symbol (1 or 2)
+                        symbol_candidates = [c for c in self.todays_candidates if c.symbol == candidate.symbol]
+                        position_fraction = 1.0 / len(symbol_candidates)
+                        target_amount = CONFIG['target_entry_amount'] * position_fraction
+                        logger.info(f"Placing order for {candidate.symbol} {candidate.expiry} ({position_fraction:.0%} of target)...")
+                    else:
+                        target_amount = CONFIG['target_entry_amount']
+                        logger.info(f"Placing order for {candidate.symbol}...")
 
                     # Use async place_straddle with position sizing config
                     order_pair = await self.executor.place_straddle(
                         candidate,
-                        target_entry_amount=CONFIG['target_entry_amount'],
+                        target_entry_amount=target_amount,
                         min_contracts=CONFIG['min_contracts'],
                         max_contracts=CONFIG['max_contracts'],
                     )
@@ -1449,6 +1491,12 @@ class TradingDaemon:
         if finalized_count > 0:
             logger.info(f"Finalized {finalized_count} expired partial exit(s)")
 
+    async def task_saturday_cleanup(self):
+        """Saturday 9:30 AM ET - Clean up expired positions from Friday."""
+        logger.info("=== SATURDAY CLEANUP ===")
+        await asyncio.to_thread(self._finalize_expired_partial_exits)
+        logger.info("Saturday cleanup complete")
+
     async def task_evening_disconnect(self):
         """4:05 PM ET - Disconnect."""
         logger.info("=== EVENING DISCONNECT ===")
@@ -1614,10 +1662,11 @@ class TradingDaemon:
                 # We only care if:
                 # 1. It has an exit order ID
                 # 2. Status is 'exiting' or 'partial_exit' (not yet fully exited)
+                #    Also include 'filled' trades that have exit order IDs (market exit placed but status not updated)
                 if not trade.exit_call_order_id:
                     continue
 
-                if trade.status not in ('exiting', 'partial_exit'):
+                if trade.status not in ('exiting', 'partial_exit', 'filled'):
                     continue
 
                 if trade.trade_id in self.active_exit_orders:
@@ -1746,11 +1795,34 @@ class TradingDaemon:
                                     'orphaned': True,  # Flag for special handling
                                 })
                         else:
-                            # No position and no fills - position may have been closed manually
-                            logger.warning(
-                                f"Exit order for {trade.ticker} not found and no position exists "
-                                f"(call_id={call_order_id}, put_id={put_order_id}) - may need manual DB update"
-                            )
+                            # No position and no fills - trade was closed but fill data unavailable
+                            # Mark as exited (better than leaving as 'filled' forever)
+                            if trade.status == 'filled':
+                                logger.warning(
+                                    f"{trade.ticker}: Position closed but fills unavailable - marking as exited"
+                                )
+                                self.trade_logger.update_trade(
+                                    trade.trade_id,
+                                    status='exited',
+                                    notes=(trade.notes or '') + '; Closed via market order, fill price unavailable',
+                                )
+                                filled_count += 1
+                            else:
+                                # Status is 'exiting' or 'partial_exit' but no position/fills
+                                # Check if option expired - if so, mark as exited (expired worthless)
+                                today_str = today_et().strftime('%Y%m%d')
+                                if trade.expiration and trade.expiration < today_str:
+                                    logger.warning(
+                                        f"{trade.ticker}: Option expired ({trade.expiration}) with no fills - marking as exited"
+                                    )
+                                    # Use _finalize_partial_exit logic (treats unfilled legs as $0)
+                                    self._finalize_partial_exit(trade)
+                                    filled_count += 1
+                                else:
+                                    logger.warning(
+                                        f"Exit order for {trade.ticker} not found and no position exists "
+                                        f"(call_id={call_order_id}, put_id={put_order_id}) - may need manual DB update"
+                                    )
 
             if recovered_count > 0:
                 logger.info(f"Recovered {recovered_count} active exit orders")
@@ -1987,6 +2059,14 @@ class TradingDaemon:
             CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=ET),
             id='backfill',
             name=f'Backfill ({BACKFILL_TIME_ET} ET)',
+        )
+
+        # Saturday morning cleanup - finalize Friday expirations
+        self.scheduler.add_job(
+            self.task_saturday_cleanup,
+            CronTrigger(day_of_week='sat', hour=9, minute=30, timezone=ET),
+            id='saturday_cleanup',
+            name='Saturday Cleanup (09:30 ET)',
         )
 
     async def run_backfill_task(self):

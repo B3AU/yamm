@@ -39,16 +39,8 @@ def is_valid_price(p, max_value: float = 100000) -> bool:
         return False
 
 
-def next_trading_day(d: date) -> date:
-    """Get next trading day (skips weekends).
-    
-    Note: Does not account for market holidays.
-    """
-    next_d = d + timedelta(days=1)
-    # Skip Saturday (5) and Sunday (6)
-    while next_d.weekday() >= 5:
-        next_d += timedelta(days=1)
-    return next_d
+# Import next_trading_day from market_calendar (handles holidays + weekends)
+from trading.earnings.market_calendar import next_trading_day
 
 
 def _request_with_retry(
@@ -598,13 +590,20 @@ async def screen_candidate_ibkr(
     chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
 
     # Find expiry after earnings
+    # For AMC, need expiry strictly AFTER earnings_date to capture next-day gap
+    # (critical for Friday AMC: gap is Monday, but same-day options expire Friday)
     expiries = sorted(chain.expirations)
     target_expiry = None
     for exp in expiries:
         exp_date = datetime.strptime(exp, '%Y%m%d').date()
-        if exp_date >= earnings_date:
-            target_expiry = exp
-            break
+        if timing == 'AMC':
+            if exp_date > earnings_date:
+                target_expiry = exp
+                break
+        else:  # BMO or unknown - same day expiry is fine
+            if exp_date >= earnings_date:
+                target_expiry = exp
+                break
 
     if not target_expiry:
         return _rejected_candidate(symbol, earnings_date, timing, "No expiry after earnings")
@@ -812,4 +811,245 @@ async def screen_all_candidates(
         else:
             rejected.append(candidate)
 
+    return passed, rejected
+
+
+async def screen_candidate_dual_dte(
+    ib,  # IB connection
+    symbol: str,
+    earnings_date: date,
+    timing: str,
+    spread_threshold: float = 15.0,
+) -> list[ScreenedCandidate]:
+    """
+    Screen a single candidate for BOTH nearest and next expiry (Async).
+    
+    Returns list of 0-2 ScreenedCandidates (one per expiry that passes liquidity).
+    ML predictions are computed once and shared across both candidates.
+    
+    For easy revert: delete this function and set DUAL_DTE_ENABLED=false.
+    """
+    from ib_insync import Stock, Option
+    
+    candidates = []
+    
+    # === Get stock price (same as screen_candidate_ibkr) ===
+    stock = Stock(symbol, 'SMART', 'USD')
+    try:
+        await ib.qualifyContractsAsync(stock)
+    except Exception as e:
+        logger.warning(f"{symbol}: Could not qualify stock: {e}")
+        return []
+    
+    ticker = None
+    try:
+        ticker = ib.reqMktData(stock, '', False, False)
+        for _ in range(20):
+            if is_valid_price(ticker.last) or is_valid_price(ticker.close):
+                break
+            await asyncio.sleep(0.1)
+        spot = ticker.marketPrice()
+        if not is_valid_price(spot):
+            spot = ticker.last
+        if not is_valid_price(spot):
+            spot = ticker.close
+    finally:
+        if ticker is not None:
+            try:
+                ib.cancelMktData(stock)
+            except Exception:
+                pass
+    
+    if not is_valid_price(spot):
+        logger.warning(f"{symbol}: No spot price")
+        return []
+    
+    # === Get option chain ===
+    try:
+        chains = await ib.reqSecDefOptParamsAsync(stock.symbol, '', stock.secType, stock.conId)
+    except Exception as e:
+        logger.warning(f"{symbol}: No option chain: {e}")
+        return []
+    
+    if not chains:
+        logger.warning(f"{symbol}: No option chain returned")
+        return []
+    
+    chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+    
+    # === Find first TWO valid expiries ===
+    expiries = sorted(chain.expirations)
+    valid_expiries = []
+    for exp in expiries:
+        exp_date = datetime.strptime(exp, '%Y%m%d').date()
+        if timing == 'AMC':
+            if exp_date > earnings_date:
+                valid_expiries.append(exp)
+        else:  # BMO or unknown
+            if exp_date >= earnings_date:
+                valid_expiries.append(exp)
+        if len(valid_expiries) >= 2:
+            break
+    
+    if not valid_expiries:
+        logger.warning(f"{symbol}: No valid expiry after earnings")
+        return []
+    
+    # === Get ML predictions ONCE (shared across both expiries) ===
+    pred_q50, pred_q75, pred_q90, pred_q95 = None, None, None, None
+    hist_move_mean = None
+    news_count = None
+    try:
+        from trading.earnings.ml_predictor import EarningsPredictor
+        predictor = EarningsPredictor()
+        predictions = predictor.predict(symbol, earnings_date, timing)
+        if predictions:
+            pred_q50 = predictions.get('q50')
+            pred_q75 = predictions.get('q75')
+            pred_q90 = predictions.get('q90')
+            pred_q95 = predictions.get('q95')
+            hist_move_mean = predictions.get('hist_move_mean')
+            news_count = predictions.get('news_count')
+    except Exception as e:
+        logger.warning(f"{symbol}: ML prediction failed: {e}")
+    
+    # === Screen each expiry independently ===
+    strikes = sorted(chain.strikes)
+    atm_strike = min(strikes, key=lambda s: abs(s - spot))
+    
+    for target_expiry in valid_expiries:
+        call_ticker = None
+        put_ticker = None
+        try:
+            # Get option quotes for this expiry
+            call = Option(symbol, target_expiry, atm_strike, 'C', 'SMART', tradingClass=symbol)
+            put = Option(symbol, target_expiry, atm_strike, 'P', 'SMART', tradingClass=symbol)
+            
+            await ib.qualifyContractsAsync(call, put)
+            
+            call_ticker = ib.reqMktData(call, '', False, False)
+            put_ticker = ib.reqMktData(put, '', False, False)
+            
+            # Wait for quotes
+            for _ in range(20):
+                if (is_valid_price(call_ticker.bid) and is_valid_price(call_ticker.ask) and
+                    is_valid_price(put_ticker.bid) and is_valid_price(put_ticker.ask)):
+                    break
+                await asyncio.sleep(0.1)
+            
+            call_bid, call_ask = call_ticker.bid, call_ticker.ask
+            put_bid, put_ask = put_ticker.bid, put_ticker.ask
+            
+        except Exception as e:
+            logger.warning(f"{symbol} {target_expiry}: Error getting quotes: {e}")
+            continue
+        finally:
+            if call_ticker is not None:
+                try:
+                    ib.cancelMktData(call_ticker.contract)
+                except Exception:
+                    pass
+            if put_ticker is not None:
+                try:
+                    ib.cancelMktData(put_ticker.contract)
+                except Exception:
+                    pass
+        
+        # Validate quotes
+        if not all(is_valid_price(p) for p in [call_bid, call_ask, put_bid, put_ask]):
+            logger.info(f"{symbol} {target_expiry}: Invalid quotes, skipping this expiry")
+            continue
+        
+        # Compute metrics
+        straddle_mid = (call_bid + call_ask) / 2 + (put_bid + put_ask) / 2
+        straddle_spread = (call_ask - call_bid) + (put_ask - put_bid)
+        spread_pct = (straddle_spread / straddle_mid) * 100 if straddle_mid > 0 else 999
+        implied_move = straddle_mid / spot
+        
+        # Check liquidity gate
+        passes_liquidity = spread_pct <= spread_threshold
+        rejection_reason = None if passes_liquidity else f"Spread {spread_pct:.1f}% > {spread_threshold}%"
+        
+        # Compute edge
+        edge_q75 = (pred_q75 - implied_move) if pred_q75 else None
+        edge_q90 = (pred_q90 - implied_move) if pred_q90 else None
+        
+        candidate = ScreenedCandidate(
+            symbol=symbol,
+            earnings_date=earnings_date,
+            timing=timing,
+            spot_price=spot,
+            expiry=target_expiry,
+            atm_strike=atm_strike,
+            call_bid=call_bid,
+            call_ask=call_ask,
+            put_bid=put_bid,
+            put_ask=put_ask,
+            straddle_mid=straddle_mid,
+            straddle_spread=straddle_spread,
+            spread_pct=spread_pct,
+            implied_move_pct=implied_move,
+            pred_q50=pred_q50,
+            pred_q75=pred_q75,
+            pred_q90=pred_q90,
+            pred_q95=pred_q95,
+            hist_move_mean=hist_move_mean,
+            edge_q75=edge_q75,
+            edge_q90=edge_q90,
+            news_count=news_count,
+            passes_liquidity=passes_liquidity,
+            passes_edge=edge_q75 is not None and edge_q75 > 0,
+            rejection_reason=rejection_reason,
+        )
+        candidates.append(candidate)
+        logger.info(f"{symbol} {target_expiry}: spread={spread_pct:.1f}%, passes={passes_liquidity}")
+    
+    return candidates
+
+
+async def screen_all_candidates_dual_dte(
+    ib,
+    events: list[EarningsEvent],
+    spread_threshold: float = 15.0,
+    max_candidates: int = 50,
+    skip_symbols: set[str] = None,
+) -> tuple[list[ScreenedCandidate], list[ScreenedCandidate]]:
+    """
+    Screen all earnings events for dual-DTE mode (Async).
+    
+    Returns (passed, rejected) where passed may contain 0-2 candidates per symbol.
+    Each symbol can have up to 2 candidates (one per expiry) if both pass liquidity gates.
+    
+    For easy revert: delete this function and set DUAL_DTE_ENABLED=false.
+    """
+    skip_symbols = skip_symbols or set()
+    passed = []
+    rejected = []
+    
+    events_to_screen = events if (max_candidates is None or max_candidates <= 0) else events[:max_candidates]
+    sem = asyncio.Semaphore(10)
+    
+    async def _screen_safe(event):
+        if event.symbol in skip_symbols:
+            return []
+        async with sem:
+            logger.info(f"Screening {event.symbol} (dual-DTE)...")
+            return await screen_candidate_dual_dte(
+                ib,
+                event.symbol,
+                event.earnings_date,
+                event.timing,
+                spread_threshold=spread_threshold,
+            )
+    
+    tasks = [_screen_safe(event) for event in events_to_screen]
+    results = await asyncio.gather(*tasks)
+    
+    for candidate_list in results:
+        for candidate in candidate_list:
+            if candidate.passes_liquidity:
+                passed.append(candidate)
+            else:
+                rejected.append(candidate)
+    
     return passed, rejected

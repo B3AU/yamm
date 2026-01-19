@@ -251,7 +251,7 @@ def get_live_news_pca_features(
     ]
 
     if not articles:
-        logger.debug(f"No news found for {symbol} in {lookback_days}-day window")
+        logger.info(f"{symbol}: No FMP news found in {lookback_days}-day lookback window")
         if return_headlines:
             return 0, default_features, empty_headlines
         return 0, default_features

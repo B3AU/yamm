@@ -453,7 +453,7 @@ async def get_position_live_value_async(ib, trade) -> Optional[dict]:
 
             if call_mid and put_mid:
                 current_value = (call_mid + put_mid) * trade.contracts * 100
-                entry_value = trade.entry_quoted_mid * trade.contracts * 100 if trade.entry_quoted_mid else None
+                entry_value = trade.entry_fill_price * trade.contracts * 100 if trade.entry_fill_price else None
 
                 return {
                     'call_mid': call_mid,
@@ -462,7 +462,7 @@ async def get_position_live_value_async(ib, trade) -> Optional[dict]:
                     'current_value': current_value,
                     'entry_value': entry_value,
                     'unrealized_pnl': current_value - entry_value if entry_value else None,
-                    'pnl_pct': ((call_mid + put_mid) / trade.entry_quoted_mid - 1) * 100 if trade.entry_quoted_mid else None,
+                    'pnl_pct': ((call_mid + put_mid) / trade.entry_fill_price - 1) * 100 if trade.entry_fill_price else None,
                     'used_last': call_used_last or put_used_last,
                 }
             else:
@@ -579,8 +579,8 @@ def render_dashboard(
     has_live_data = False
 
     if open_trades:
-        print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'LLM':<4}")
-        print("  " + "-" * 94)
+        print(f"  {'Sym':<5} {'Status':<7} {'Age':<5} {'Strike':<7} {'Exp':<5} {'Entry':<8} {'Curr':<8} {'P&L':<8} {'Edge':<5} {'Impl':<5} {'Sprd':<5} {'News':<4} {'LLM':<4}")
+        print("  " + "-" * 99)
 
         for trade in open_trades:
             status_color = get_status_color(trade.status)
@@ -594,18 +594,18 @@ def render_dashboard(
 
             # Get live prices if available
             current_price_short = "N/A"
+            current_price_color = ""
             pnl_str = "N/A"
-            pnl_color = reset_color()
+            pnl_color = ""
 
             if live_data_map and trade.trade_id in live_data_map:
                 live_data = live_data_map[trade.trade_id]
                 if live_data and 'error' not in live_data:
                     has_live_data = True
+                    current_price_short = f"${live_data['straddle_mid']:.2f}"
                     # Yellow if using 'last' price fallback (no live bid/ask)
                     if live_data.get('used_last'):
-                        current_price_short = f"\033[93m${live_data['straddle_mid']:.2f}\033[0m"
-                    else:
-                        current_price_short = f"${live_data['straddle_mid']:.2f}"
+                        current_price_color = '\033[93m'
 
                     if live_data['pnl_pct'] is not None:
                         pnl_pct = live_data['pnl_pct']
@@ -642,6 +642,15 @@ def render_dashboard(
             else:
                 sprd_str = "."
 
+            # News count with color (yellow if 0, normal otherwise)
+            if trade.news_count is not None:
+                if trade.news_count == 0:
+                    news_str = f"\033[93m0\033[0m"  # Yellow for 0
+                else:
+                    news_str = str(trade.news_count)
+            else:
+                news_str = "."
+
             # LLM check result with color
             llm_check = llm_check_map.get(trade.trade_id)
             if llm_check:
@@ -657,15 +666,15 @@ def render_dashboard(
 
             print(f"  {sym:<5} {status_color}{status_display:<7}{reset_color()} "
                   f"{age_str:<5} {strike_str:<7} {expiry_short:<5} "
-                  f"{entry_price_short:<8} {current_price_short:<8} {pnl_color}{pnl_str:<8}{reset_color()} "
-                  f"{edge_str:<5} {impl_str:<5} {sprd_str:<5} {llm_str:<4}")
+                  f"{entry_price_short:<8} {current_price_color}{current_price_short:<8}{reset_color()} {pnl_color}{pnl_str:<8}{reset_color()} "
+                  f"{edge_str:<5} {impl_str:<5} {sprd_str:<5} {news_str:<4} {llm_str:<4}")
 
             # Only show errors/warnings on second line if critical
             if trade.status == 'partial' and trade.notes:
                 print(f"         \033[91m^ {trade.notes}\033[0m")
 
         # Show total unrealized P&L and risk summary
-        print("  " + "-" * 94)
+        print("  " + "-" * 99)
 
         # Calculate total capital at risk (= max loss for long straddles)
         total_at_risk = sum(t.premium_paid or 0 for t in open_trades)

@@ -201,12 +201,22 @@ class Phase0Executor:
         # Create combo contract
         combo = self._create_straddle_combo(call, put)
 
-        # Generate trade ID
-        trade_id = generate_trade_id(candidate.symbol, str(candidate.earnings_date))
+        # Generate trade ID (include expiry for dual-DTE mode uniqueness)
+        trade_id = generate_trade_id(candidate.symbol, str(candidate.earnings_date), candidate.expiry)
 
         # Capture timestamp for decision latency tracking (ET timezone)
         ET = pytz.timezone('US/Eastern')
         decision_time = datetime.now(ET)
+
+        # Compute DTE at entry
+        dte_at_entry = None
+        if candidate.expiry:
+            try:
+                exp_date = datetime.strptime(candidate.expiry, '%Y%m%d').date()
+                entry_date = decision_time.date()
+                dte_at_entry = (exp_date - entry_date).days
+            except ValueError:
+                pass
 
         # Log the trade entry with all quantiles for calibration tracking
         trade_log = TradeLog(
@@ -224,6 +234,7 @@ class Phase0Executor:
             structure='straddle_combo',
             strikes=str([candidate.atm_strike]),
             expiration=candidate.expiry,
+            dte_at_entry=dte_at_entry,
             contracts=contracts,
             premium_paid=0,  # Updated on fill
             max_loss=straddle_limit * contracts * 100,
@@ -1351,9 +1362,10 @@ async def close_position_market(
             f"(call={call_trade.order.orderId}, put={put_trade.order.orderId})"
         )
 
-        # Update trade logger with new order IDs
+        # Update trade logger with new order IDs and status
         trade_logger.update_trade(
             trade_id,
+            status='exiting',  # Mark as exiting so recovery can find it on restart
             exit_call_order_id=call_trade.order.orderId,
             exit_put_order_id=put_trade.order.orderId,
             notes="Force market exit",

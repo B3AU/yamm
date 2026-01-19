@@ -53,7 +53,8 @@ class TradeLog:
     # Structure
     structure: str = "straddle"  # "straddle" or "strangle"
     strikes: str = ""  # JSON list of strikes
-    expiration: str = ""  # YYYY-MM-DD
+    expiration: str = ""  # YYYYMMDD
+    dte_at_entry: Optional[int] = None  # Days to expiration at entry
     contracts: int = 0
     premium_paid: float = 0.0
     max_loss: float = 0.0  # = premium_paid for long vol
@@ -117,7 +118,7 @@ TRADE_COLUMNS = {
     'entry_fill_time', 'entry_slippage', 'call_entry_fill_price', 'put_entry_fill_price',
     'decision_latency_ms', 'fill_latency_seconds',
     'spread_at_fill', 'markout_1min', 'markout_5min', 'markout_30min',
-    'structure', 'strikes', 'expiration', 'contracts', 'premium_paid', 'max_loss',
+    'structure', 'strikes', 'expiration', 'dte_at_entry', 'contracts', 'premium_paid', 'max_loss',
     'predicted_q50', 'predicted_q75', 'predicted_q90', 'predicted_q95',
     'implied_move', 'edge_q75', 'edge_q90',
     'exit_datetime', 'exit_quoted_bid', 'exit_quoted_ask', 'exit_quoted_mid',
@@ -249,6 +250,7 @@ class TradeLogger:
                     structure TEXT,
                     strikes TEXT,
                     expiration TEXT,
+                    dte_at_entry INTEGER,
                     contracts INTEGER,
                     premium_paid REAL,
                     max_loss REAL,
@@ -347,6 +349,22 @@ class TradeLogger:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
                 except sqlite3.OperationalError:
                     pass  # Column already exists
+
+            # Add dte_at_entry column and backfill existing trades
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN dte_at_entry INTEGER")
+                # Backfill existing trades
+                conn.execute("""
+                    UPDATE trades 
+                    SET dte_at_entry = CAST(
+                        julianday(substr(expiration, 1, 4) || '-' || substr(expiration, 5, 2) || '-' || substr(expiration, 7, 2)) 
+                        - julianday(date(entry_datetime)) AS INTEGER
+                    )
+                    WHERE expiration != '' AND expiration IS NOT NULL 
+                    AND entry_datetime IS NOT NULL AND dte_at_entry IS NULL
+                """)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Non-trades table
             conn.execute("""
@@ -1018,9 +1036,11 @@ class TradeLogger:
         }
 
 
-def generate_trade_id(ticker: str, earnings_date: str) -> str:
-    """Generate unique trade ID."""
+def generate_trade_id(ticker: str, earnings_date: str, expiry: str = "") -> str:
+    """Generate unique trade ID. Includes expiry when provided for dual-DTE mode."""
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    if expiry:
+        return f"{ticker}_{earnings_date}_{expiry}_{timestamp}"
     return f"{ticker}_{earnings_date}_{timestamp}"
 
 

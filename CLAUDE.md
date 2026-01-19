@@ -243,6 +243,8 @@ Critical bugs fixed from extensive code review:
 
 18. **Market exit logging** (`executor.py:1242-1257`) - `close_position_market()` was missing required `filled` and `avg_fill_price` arguments to `log_order_event()`, causing force-exit to fail with exception.
 
+19. **AMC expiration selection** (`screener.py:600-607`) - For AMC earnings, expiry must be strictly AFTER earnings_date (not same-day). Critical for Friday AMC where gap is Monday but same-day options expire Friday EOD. Changed `>=` to `>` for AMC timing only.
+
 ---
 
 ### Analysis Queries (When More Data Available)
@@ -484,6 +486,16 @@ MONITOR_FILLS_END_HOUR=16       # Monitor fills end hour
 - Backtest accuracy becomes a concern
 - Want to add IV percentile feature
 - Revisiting short vol / iron butterfly strategies
+
+---
+
+### Future Research: Optimal Exit Timing with ORATS 1-Minute Data
+
+**Priority:** Medium (V2) — See [RESEARCH.md](RESEARCH.md) for full analysis.
+
+**Summary:** Live data (5 BMO trades, Jan 2026) shows straddle P&L peaks ~3 hours after open (12:00-12:30 ET) then decays due to theta. Average peak P&L was 53% vs 22% at our 14:00 exit = 31 ppts left on table. Exit time moved to 12:00 ET via env var. ORATS 1-minute historical data ($99/mo) could validate this pattern across 5+ years and enable retraining model on actual option P&L instead of stock moves.
+
+---
 
 ### Training Data
 
